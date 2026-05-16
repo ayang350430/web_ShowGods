@@ -66,6 +66,9 @@ const normalizeTargetType = (value) => {
   if (['impression', 'impressions', 'exposure'].includes(targetType)) {
     return 'impression';
   }
+  if (['like', 'likes', 'note_likes'].includes(targetType)) {
+    return 'like';
+  }
   if (targetType === 'all') {
     return 'all';
   }
@@ -306,7 +309,7 @@ const queryUserAggregates = async (db, userIds, period = 'all', targetType = 'al
 
   const orderParams = [...userIds];
   let orderWhere = `user_id IN (${placeholders})`;
-  if (targetType === 'view' || targetType === 'impression') {
+  if (targetType === 'view' || targetType === 'impression' || targetType === 'like') {
     orderWhere += ' AND target_type = ?';
     orderParams.push(targetType);
   }
@@ -315,7 +318,7 @@ const queryUserAggregates = async (db, userIds, period = 'all', targetType = 'al
   const chargeParams = [...userIds, RECORD_TYPE.orderCharge, RECORD_STATUS.success];
   let chargeJoin = '';
   let chargeWhere = `ar.user_id IN (${placeholders}) AND ar.record_type = ? AND ar.status = ?`;
-  if (targetType === 'view' || targetType === 'impression') {
+  if (targetType === 'view' || targetType === 'impression' || targetType === 'like') {
     chargeJoin = ' INNER JOIN orders o ON o.id = ar.order_id';
     chargeWhere += ' AND o.target_type = ?';
     chargeParams.push(targetType);
@@ -478,12 +481,13 @@ const getDashboardSummary = async (userId, rankingPeriod = 'all') => {
   const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
   const tomorrowStart = new Date(todayStart.getTime() + 24 * 60 * 60 * 1000);
-  const quantityWhere = isAdmin ? '' : 'WHERE user_id = ?';
+  const quantityWhere = isAdmin ? 'WHERE order_status <> ?' : 'WHERE order_status <> ? AND user_id = ?';
   const quantityParams = [
     yesterdayStart,
     todayStart,
     todayStart,
     tomorrowStart,
+    ORDER_STATUS.failed,
     ...(isAdmin ? [] : [userId]),
   ];
   const [[quantityStats]] = await db.execute(

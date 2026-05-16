@@ -1,8 +1,6 @@
 ﻿const express = require('express');// 引入express框架
 const cors = require('cors');// 引入cors中间件
 const helmet = require('helmet'); // 引入helmet中间件
-const morgan = require('morgan');// 引入morgan中间件
-
 const routes = require('./routes');
 const { requestLogger } = require('./middlewares/requestLogger');
 // 引入错误处理中间件
@@ -20,7 +18,6 @@ app.use(
 );
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 app.use(requestLogger);
 
 app.use('/api', routes);

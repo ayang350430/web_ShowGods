@@ -83,7 +83,13 @@ function formatDateTime(value?: null | string) {
 }
 
 function targetTypeLabel(type: string) {
-  return type === 'impression' ? '曝光' : '阅读';
+  if (type === 'impression') {
+    return '曝光';
+  }
+  if (type === 'like') {
+    return '点赞';
+  }
+  return '阅读';
 }
 
 function statusLabel(status: string) {

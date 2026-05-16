@@ -2,16 +2,18 @@ const crypto = require('node:crypto');
 
 const { getPool } = require('../config/database');
 
-const TARGET_TYPES = new Set(['view', 'impression']);
+const TARGET_TYPES = new Set(['view', 'impression', 'like']);
 const NOTE_BASIC_API = 'http://zl.2kpi.cn/api/v1/note/basic';
 const NOTE_ID_API = 'http://zl.2kpi.cn/api/v1/note/id';
 const XHS_API_ENDPOINTS = {
   impression: '/api/v2/impression',
+  like: '/api/v2/note_likes',
   view: '/api/v2/note_views',
 };
 let noteBasicCacheTableReady;
 let problemLinkRecordTableReady;
 let batchLinkCheckRecordTableReady;
+let orderSnapshotColumnsReady;
 let xhsTaskClientOverride = null;
 
 const round4 = (value) => Math.round((Number(value) || 0) * 10_000) / 10_000;
@@ -61,43 +63,102 @@ const setXhsTaskClient = (client) => {
   xhsTaskClientOverride = client || null;
 };
 
+// XHS API configuration
 const getXhsApiConfig = () => ({
   baseUrl: process.env.XHS_API_BASE_URL || 'http://192.168.31.134:9101',
   timeoutMs: Number(process.env.XHS_API_TIMEOUT_MS) || 10_000,
-  token: process.env.XHS_API_TOKEN || '',
 });
 
 const createDefaultXhsTaskClient = () => ({
-  createTask: async (targetType, payload) => {
+  getTaskStatus: async (targetType, taskId, options = {}) => {
     const config = getXhsApiConfig();
-    if (!config.token) {
-      return { id: null, skipped: true };
+    const token = options.token || process.env.XHS_API_TOKEN || '';
+    if (!token) {
+      throw new Error('XHS authorization token is not configured');
     }
-
     const endpoint = XHS_API_ENDPOINTS[targetType];
     if (!endpoint) {
-      return { id: null, skipped: true };
+      throw new Error(`Unsupported XHS task type: ${targetType}`);
     }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+    const url = new URL(`${config.baseUrl}${endpoint}`);
+    url.searchParams.set('id', taskId);
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
 
     try {
-      const response = await fetch(`${config.baseUrl}${endpoint}`, {
+      console.log(`GET ${url.pathname}${url.search}`);
+      const response = await fetch(url, {
+        headers,
+        method: 'GET',
+        signal: controller.signal,
+      });
+      const body = await response.json().catch(() => null);
+      console.log(`RESPONSE ${url.pathname}${url.search}`, JSON.stringify(body, null, 2));
+      return {
+        body,
+        completed: getXhsTaskStatus(body) === 2,
+        ok: response.ok,
+        status: response.status,
+      };
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`XHS status request timed out after ${config.timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  },
+
+  createTask: async (targetType, payload, options = {}) => {
+    const config = getXhsApiConfig();
+    const token = options.token || process.env.XHS_API_TOKEN || '';
+    if (!token) {
+      throw new Error('XHS authorization token is not configured');
+    }
+
+    const endpoint = XHS_API_ENDPOINTS[targetType];
+    if (!endpoint) {
+      throw new Error(`Unsupported XHS task type: ${targetType}`);
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+    const url = `${config.baseUrl}${endpoint}`;
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+
+    try {
+      if (targetType === 'impression') {
+        console.log(`POST ${endpoint}`, JSON.stringify(payload, null, 2));
+      }
+      const response = await fetch(url, {
         body: JSON.stringify(payload),
-        headers: {
-          Authorization: `Bearer ${config.token}`,
-          'Content-Type': 'application/json',
-        },
+        headers,
         method: 'POST',
         signal: controller.signal,
       });
       const body = await response.json().catch(() => null);
+      if (targetType === 'impression') {
+        console.log(`RESPONSE ${endpoint}`, JSON.stringify(body, null, 2));
+      }
       if (!response.ok || body?.success === false || body?.code !== 0) {
         throw new Error(body?.message || `XHS API request failed with HTTP ${response.status}`);
       }
 
-      return { id: body?.data?.id ?? null };
+      const taskId = body?.data?.id;
+      if (taskId === null || taskId === undefined || taskId === '') {
+        throw new Error('XHS API response missing task id');
+      }
+
+      return { id: taskId };
     } catch (error) {
       if (error?.name === 'AbortError') {
         throw new Error(`XHS API request timed out after ${config.timeoutMs}ms`);
@@ -107,17 +168,85 @@ const createDefaultXhsTaskClient = () => ({
       clearTimeout(timeout);
     }
   },
+
+  updateTaskStatus: async (targetType, payload, options = {}) => {
+    const config = getXhsApiConfig();
+    const token = options.token || process.env.XHS_API_TOKEN || '';
+    if (!token) {
+      throw new Error('XHS authorization token is not configured');
+    }
+
+    const endpoint = XHS_API_ENDPOINTS[targetType];
+    if (!endpoint) {
+      throw new Error(`Unsupported XHS task type: ${targetType}`);
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+    const statusEndpoint = `${endpoint}/status`;
+    const url = `${config.baseUrl}${statusEndpoint}`;
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    };
+
+    const sendStatusUpdate = async (statusPayload) => {
+      console.log(`POST ${statusEndpoint}`, JSON.stringify(statusPayload, null, 2));
+      const response = await fetch(url, {
+        body: JSON.stringify(statusPayload),
+        headers,
+        method: 'POST',
+        signal: controller.signal,
+      });
+      const body = await response.json().catch(() => null);
+      console.log(`RESPONSE ${statusEndpoint}`, JSON.stringify(body, null, 2));
+      return { body, response };
+    };
+
+    try {
+      const { body, response } = await sendStatusUpdate(payload);
+
+      if (!response.ok || body?.success === false || body?.code !== 0) {
+        throw new Error(body?.message || `XHS status update failed with HTTP ${response.status}`);
+      }
+      return body;
+    } catch (error) {
+      if (error?.name === 'AbortError') {
+        throw new Error(`XHS status update timed out after ${config.timeoutMs}ms`);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  },
 });
 
-const getXhsTaskClient = () => xhsTaskClientOverride || createDefaultXhsTaskClient();
+const getXhsTaskClient = () => {
+  const defaultClient = createDefaultXhsTaskClient();
+  return xhsTaskClientOverride ? { ...defaultClient, ...xhsTaskClientOverride } : defaultClient;
+};
 
-const createXhsTaskPayload = ({ batchNo, item, orderNo, targetType }) => ({
-  author_id: '',
+const createCurrentUserToken = () => 'xhs-api-123456789';
+
+const getXhsStatusData = (body) => body?.data ?? body ?? {};
+
+const getXhsTaskStatus = (body) => {
+  const data = getXhsStatusData(body);
+  return Number(data.status ?? body?.status ?? 0) || 0;
+};
+
+const getXhsTaskCount = (body, key) => {
+  const data = getXhsStatusData(body);
+  return Number(data[key] ?? body?.[key] ?? 0) || 0;
+};
+
+const createXhsTaskPayload = ({ batchNo, item, orderNo, source, targetType }) => ({
+  author_id: item.author_id || '',
   current_count: 0,
   note_id: item.note_id,
   priority: 0,
   reason: `goods_order=${orderNo};session=${batchNo}`,
-  source: `goods:${batchNo}`,
+  source: source || `goods:${batchNo}`,
   status: 1,
   total_count: item.ordered_quantity,
   ...(targetType === 'view'
@@ -126,6 +255,11 @@ const createXhsTaskPayload = ({ batchNo, item, orderNo, targetType }) => ({
         channel: 1,
         mp_count: 0,
         web_count: 0,
+      }
+    : {}),
+  ...(targetType === 'like'
+    ? {
+        need_sync: false,
       }
     : {}),
 });
@@ -241,8 +375,15 @@ const normalizeNoteBasicResponse = (payload, noteId, noteUrl) => {
     findFirstStringByKey(data, /^note_?id$|^id$/i) || noteId;
   const title = findFirstStringByKey(data, /^title$|desc|display_title/i);
   const authorName = findFirstStringByKey(data, /nickname|nickName|userName|name/i);
+  const authorId =
+    data?.base_info?.user?.id ||
+    data?.baseInfo?.user?.id ||
+    data?.user?.id ||
+    data?.author?.id ||
+    '';
 
   return {
+    author_id: authorId,
     author_name: authorName,
     avatar_url: avatarUrl,
     note_id: resolvedNoteId,
@@ -261,6 +402,7 @@ const ensureNoteBasicCacheTable = async (db) => {
         note_id VARCHAR(64) NOT NULL,
         resolved_note_url VARCHAR(1024) DEFAULT NULL,
         title VARCHAR(255) DEFAULT NULL,
+        author_id VARCHAR(64) DEFAULT NULL,
         author_name VARCHAR(128) DEFAULT NULL,
         avatar_url VARCHAR(1024) DEFAULT NULL,
         raw_payload JSON DEFAULT NULL,
@@ -274,14 +416,56 @@ const ensureNoteBasicCacheTable = async (db) => {
   }
 
   await noteBasicCacheTableReady;
+  const ensureColumn = async (name, definition) => {
+    const [[row]] = await db.execute(
+      `
+        SELECT COUNT(1) AS count
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'note_basic_cache'
+          AND COLUMN_NAME = ?
+      `,
+      [name],
+    );
+    if (Number(row.count) === 0) {
+      await db.execute(`ALTER TABLE note_basic_cache ADD COLUMN ${name} ${definition}`);
+    }
+  };
+  await ensureColumn('author_id', 'VARCHAR(64) DEFAULT NULL AFTER title');
 };
 
 // 从缓存中获取笔记基本信息
+const ensureOrderSnapshotColumns = async (db) => {
+  if (!orderSnapshotColumnsReady) {
+    orderSnapshotColumnsReady = (async () => {
+      const ensureColumn = async (name, definition) => {
+        const [[row]] = await db.execute(
+          `
+            SELECT COUNT(1) AS count
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'orders'
+              AND COLUMN_NAME = ?
+          `,
+          [name],
+        );
+        if (Number(row.count) === 0) {
+          await db.execute(`ALTER TABLE orders ADD COLUMN ${name} ${definition}`);
+        }
+      };
+      await ensureColumn('title', 'VARCHAR(255) DEFAULT NULL AFTER note_url');
+      await ensureColumn('author_name', 'VARCHAR(255) DEFAULT NULL AFTER title');
+      await ensureColumn('avatar_url', 'VARCHAR(1024) DEFAULT NULL AFTER author_name');
+    })();
+  }
+  return orderSnapshotColumnsReady;
+};
+
 const getCachedNoteBasic = async (db, sourceUrl) => {
   await ensureNoteBasicCacheTable(db);
   const [[row]] = await db.execute(
     `
-      SELECT source_url, note_id, resolved_note_url, title, author_name, avatar_url
+      SELECT source_url, note_id, resolved_note_url, title, author_id, author_name, avatar_url
       FROM note_basic_cache
       WHERE source_url = ?
       LIMIT 1
@@ -294,6 +478,7 @@ const getCachedNoteBasic = async (db, sourceUrl) => {
   }
 
   return {
+    author_id: row.author_id || '',
     author_name: row.author_name || '',
     avatar_url: row.avatar_url || '',
     cache_hit: true,
@@ -309,12 +494,13 @@ const saveCachedNoteBasic = async (db, sourceUrl, noteBasic, rawPayload) => {
   await db.execute(
     `
       INSERT INTO note_basic_cache
-        (source_url, note_id, resolved_note_url, title, author_name, avatar_url, raw_payload)
-      VALUES (?, ?, ?, ?, ?, ?, CAST(? AS JSON))
+        (source_url, note_id, resolved_note_url, title, author_id, author_name, avatar_url, raw_payload)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CAST(? AS JSON))
       ON DUPLICATE KEY UPDATE
         note_id = VALUES(note_id),
         resolved_note_url = VALUES(resolved_note_url),
         title = VALUES(title),
+        author_id = VALUES(author_id),
         author_name = VALUES(author_name),
         avatar_url = VALUES(avatar_url),
         raw_payload = VALUES(raw_payload)
@@ -324,6 +510,7 @@ const saveCachedNoteBasic = async (db, sourceUrl, noteBasic, rawPayload) => {
       noteBasic.note_id,
       noteBasic.note_url,
       noteBasic.title || null,
+      noteBasic.author_id || null,
       noteBasic.author_name || null,
       noteBasic.avatar_url || null,
       JSON.stringify(rawPayload || {}),
@@ -469,8 +656,8 @@ const saveBatchLinkCheckRecords = async (db, userId, checkBatchNo, targetType, i
 };
 
 const serializeBatchLinkCheckRecord = (row) => ({
-  author_name: row.author_name || '',
-  avatar_url: row.avatar_url || '',
+  author_name: row.author_name || row.cache_author_name || '',
+  avatar_url: row.avatar_url || row.cache_avatar_url || '',
   check_batch_no: row.check_batch_no,
   created_at: row.created_at,
   errors: typeof row.errors === 'string' ? JSON.parse(row.errors || '[]') : row.errors || [],
@@ -483,7 +670,7 @@ const serializeBatchLinkCheckRecord = (row) => ({
   raw: row.raw_content || '',
   resolved_note_url: row.resolved_note_url || '',
   target_type: normalizeTargetType(row.target_type),
-  title: row.title || '',
+  title: row.title || row.cache_title || '',
   valid: Boolean(row.valid),
 });
 
@@ -532,6 +719,8 @@ const serializeBatchOrderItem = (row) => ({
   batch_item_id: Number(row.batch_item_id) || 0,
   completed_quantity: Number(row.completed_quantity) || 0,
   created_at: row.created_at,
+  external_status: row.external_status || '',
+  external_task_id: row.external_task_id || '',
   id: Number(row.id),
   note_id: row.note_id || '',
   note_url: row.note_url || '',
@@ -561,9 +750,187 @@ const buildRawUrlMap = (rawContent) => {
   return map;
 };
 
+const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
+  const batchFilter = batchIds.length > 0
+    ? `AND batch_id IN (${batchIds.map(() => '?').join(',')})`
+    : '';
+  const [orders] = await db.execute(
+    `
+      SELECT id, batch_id, external_status, external_task_id, last_verified_at,
+        ordered_quantity, target_type
+      FROM orders
+      WHERE user_id = ?
+        ${batchFilter}
+        AND order_status = 'running'
+        AND external_task_id IS NOT NULL
+        AND external_task_id <> ''
+        AND reason_message IS NULL
+        AND EXISTS (
+          SELECT 1
+          FROM account_records ar
+          WHERE ar.order_id = orders.id
+            AND ar.record_type = 'order_charge'
+            AND ar.status = 'success'
+        )
+    `,
+    [userId, ...batchIds],
+  );
+
+  if (orders.length === 0) {
+    return;
+  }
+
+  const now = new Date();
+  const affectedBatchIds = new Set();
+
+  for (const order of orders) {
+    let statusResult = null;
+    try {
+      statusResult = await getXhsTaskClient().getTaskStatus(
+        normalizeTargetType(order.target_type),
+        String(order.external_task_id),
+        {
+          token: createCurrentUserToken(userId),
+        },
+      );
+    } catch {
+      continue;
+    }
+
+    const taskStatus = getXhsTaskStatus(statusResult?.body);
+    if (![1, 2].includes(taskStatus)) {
+      continue;
+    }
+    const totalCount = Math.max(getXhsTaskCount(statusResult?.body, 'total_count'), 0);
+    const currentCount = Math.max(getXhsTaskCount(statusResult?.body, 'current_count'), 0);
+    const fallbackTotal = Math.max(Number(order.ordered_quantity) || 0, 1);
+    const progressTotal = totalCount > 0 ? totalCount : fallbackTotal;
+    const completedQuantity =
+      taskStatus === 2
+        ? Number(order.ordered_quantity) || currentCount
+        : Math.min(currentCount, Number(order.ordered_quantity) || currentCount);
+    const progress =
+      taskStatus === 2
+        ? 1
+        : Math.max(0, Math.min(round4(currentCount / progressTotal), 1));
+    const verifiedAt = order.last_verified_at ? new Date(order.last_verified_at) : null;
+    const canFinalize =
+      taskStatus === 2 &&
+      order.external_status === 'completed' &&
+      verifiedAt &&
+      now.getTime() - verifiedAt.getTime() >= 5 * 60 * 1000;
+    const nextOrderStatus = canFinalize ? 'completed' : 'running';
+    const nextExternalStatus = taskStatus === 2 ? 'completed' : 'running';
+    const nextVerifiedAt =
+      taskStatus === 2 && !verifiedAt
+        ? now
+        : verifiedAt || now;
+
+    await db.execute(
+      `
+        UPDATE orders
+        SET order_status = ?,
+            completed_quantity = ?,
+            external_status = ?,
+            external_progress = ?,
+            external_completed_quantity = ?,
+            last_verified_at = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+          AND order_status = 'running'
+      `,
+      [
+        nextOrderStatus,
+        completedQuantity,
+        nextExternalStatus,
+        progress,
+        completedQuantity,
+        nextVerifiedAt,
+        now,
+        order.id,
+        userId,
+      ],
+    );
+    affectedBatchIds.add(order.batch_id);
+  }
+
+  if (affectedBatchIds.size === 0) {
+    return;
+  }
+
+  const refreshedBatchIds = [...affectedBatchIds];
+  const placeholders = refreshedBatchIds.map(() => '?').join(',');
+
+  const [statsRows] = await db.execute(
+    `
+      SELECT
+        batch_id,
+        COUNT(1) AS total_count,
+        COALESCE(SUM(CASE WHEN order_status = 'running' THEN 1 ELSE 0 END), 0) AS processing_count,
+        COALESCE(SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END), 0) AS succeeded_count,
+        COALESCE(SUM(CASE WHEN order_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
+        COALESCE(SUM(CASE WHEN order_status IN ('failed', 'manual_review', 'repair_review') THEN 1 ELSE 0 END), 0) AS retryable_count
+      FROM orders
+      WHERE batch_id IN (${placeholders})
+        AND user_id = ?
+      GROUP BY batch_id
+    `,
+    [...refreshedBatchIds, userId],
+  );
+
+  for (const stats of statsRows) {
+    const totalCount = Number(stats.total_count) || 0;
+    const processingCount = Number(stats.processing_count) || 0;
+    const succeededCount = Number(stats.succeeded_count) || 0;
+    const failedCount = Number(stats.failed_count) || 0;
+    const retryableCount = Number(stats.retryable_count) || 0;
+    const nextStatus =
+      totalCount > 0 && succeededCount === totalCount
+        ? 'completed'
+        : failedCount > 0 && processingCount === 0
+          ? 'failed'
+          : 'processing';
+
+    await db.execute(
+      `
+        UPDATE order_batches
+        SET status = ?,
+            processing_count = ?,
+            succeeded_count = ?,
+            failed_count = ?,
+            retryable_count = ?,
+            finished_at = CASE WHEN ? IN ('completed', 'failed') THEN COALESCE(finished_at, ?) ELSE finished_at END,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+      `,
+      [
+        nextStatus,
+        processingCount,
+        succeededCount,
+        failedCount,
+        retryableCount,
+        nextStatus,
+        now,
+        now,
+        stats.batch_id,
+        userId,
+      ],
+    );
+  }
+};
+
 const listBatchOrderRecords = async (userId, query = {}) => {
   const { limit = 30, page, page_size: pageSize } = query;
   const db = getPool();
+  await ensureOrderSnapshotColumns(db);
+  await refundFailedChargedOrders(db, userId);
+  const skipStatusSync =
+    query.skip_status_sync === '1' ||
+    query.skip_status_sync === 1 ||
+    query.skip_status_sync === true ||
+    query.skip_status_sync === 'true';
   const paginationRequested = page !== undefined || pageSize !== undefined;
   const safePage = Math.max(Number(page) || 1, 1);
   const safeLimit = Math.min(Math.max(Number(pageSize || limit) || 10, 1), 100);
@@ -576,7 +943,7 @@ const listBatchOrderRecords = async (userId, query = {}) => {
     `,
     [userId],
   );
-  const [batches] = await db.execute(
+  let [batches] = await db.execute(
     `
       SELECT *
       FROM order_batches
@@ -600,6 +967,20 @@ const listBatchOrderRecords = async (userId, query = {}) => {
   }
 
   const batchIds = batches.map((batch) => batch.id);
+  if (!skipStatusSync) {
+    await syncRunningOrdersFromXhs(db, userId, batchIds);
+  }
+  await refreshBatchStats(db, userId, batchIds);
+  [batches] = await db.execute(
+    `
+      SELECT *
+      FROM order_batches
+      WHERE user_id = ?
+      ORDER BY id DESC
+      LIMIT ${safeLimit} OFFSET ${offset}
+    `,
+    [userId],
+  );
   const placeholders = batchIds.map(() => '?').join(',');
   const [orders] = await db.execute(
     `
@@ -611,9 +992,9 @@ const listBatchOrderRecords = async (userId, query = {}) => {
           ar.payable_amount,
           ar.refund_amount,
           ar.status AS record_status,
-          nbc.title,
-          nbc.author_name,
-          nbc.avatar_url
+          nbc.title AS cache_title,
+          nbc.author_name AS cache_author_name,
+          nbc.avatar_url AS cache_avatar_url
         FROM orders o
         LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
         LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
@@ -904,7 +1285,7 @@ const requestOrderRefund = async (userId, orderId) => {
   const viewAll = await canViewAllAccountRecords(db, userId);
   const [[order]] = await db.execute(
     `
-      SELECT id, user_id, order_no, order_status
+      SELECT id, user_id, order_no, order_status, external_task_id, target_type
       FROM orders
       WHERE id = ?
       LIMIT 1
@@ -926,10 +1307,22 @@ const requestOrderRefund = async (userId, orderId) => {
     };
   }
 
-  if (['completed', 'failed'].includes(order.order_status)) {
+  if (order.order_status === 'failed') {
     const error = new Error('Current order status cannot request refund');
     error.statusCode = 400;
     throw error;
+  }
+
+  if (order.external_task_id) {
+    await getXhsTaskClient().updateTaskStatus(
+      normalizeTargetType(order.target_type),
+      {
+        id: Number(order.external_task_id) || order.external_task_id,
+        reason: `goods_order=${order.order_no} refund requested`,
+        status: 3,
+      },
+      { token: createCurrentUserToken(userId) },
+    );
   }
 
   const now = new Date();
@@ -1037,7 +1430,38 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
 
     const paidAmount = Number(chargeRecord.actual_paid_amount) || 0;
     const refundedAmount = Number(order.refund_amount_total) || 0;
-    const refundAmount = round4(Math.max(paidAmount - refundedAmount, 0));
+    const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
+    let completedQuantity = Math.max(
+      Number(order.external_completed_quantity) || 0,
+      Number(order.completed_quantity) || 0,
+    );
+
+    if (order.external_task_id) {
+      try {
+        const statusResult = await getXhsTaskClient().getTaskStatus(
+          normalizeTargetType(order.target_type),
+          String(order.external_task_id),
+          {
+            token: createCurrentUserToken(order.user_id),
+          },
+        );
+        const taskStatus = getXhsTaskStatus(statusResult?.body);
+        const upstreamCurrentCount = getXhsTaskCount(statusResult?.body, 'current_count');
+        if (taskStatus === 2) {
+          completedQuantity = orderedQuantity;
+        } else if (taskStatus === 1) {
+          completedQuantity = Math.max(completedQuantity, upstreamCurrentCount);
+        }
+      } catch {
+        // Keep locally synced progress if the upstream check is unavailable during review.
+      }
+    }
+
+    completedQuantity = Math.min(Math.max(completedQuantity, 0), orderedQuantity);
+    const refundableQuantity = Math.max(orderedQuantity - completedQuantity, 0);
+    const grossRefundAmount =
+      orderedQuantity > 0 ? round4((paidAmount * refundableQuantity) / orderedQuantity) : 0;
+    const refundAmount = round4(Math.max(grossRefundAmount - refundedAmount, 0));
     if (refundAmount <= 0) {
       const error = new Error('No refundable amount');
       error.statusCode = 400;
@@ -1078,8 +1502,8 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
         order.order_no,
         chargeRecord.id,
         order.ordered_quantity,
-        order.completed_quantity,
-        order.ordered_quantity,
+        completedQuantity,
+        refundableQuantity,
         chargeRecord.discounted_unit_price,
         refundAmount,
         chargeRecord.discount_rate,
@@ -1101,7 +1525,10 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
       `
         UPDATE orders
         SET order_status = 'refund_approved',
-            refunded_quantity = ordered_quantity,
+            completed_quantity = ${completedQuantity},
+            external_completed_quantity = ${completedQuantity},
+            external_progress = CASE WHEN ordered_quantity > 0 THEN ${completedQuantity} / ordered_quantity ELSE external_progress END,
+            refunded_quantity = refunded_quantity + ${refundableQuantity},
             refund_amount_total = refund_amount_total + ?,
             reason_message = ?,
             updated_at = ?
@@ -1384,11 +1811,12 @@ const requestNoteBasic = async (params) => {
     signal: AbortSignal.timeout(8000),
   });
 
+  const payload = await response.json().catch(() => null);
+
   if (!response.ok) {
     return null;
   }
 
-  const payload = await response.json();
   return {
     noteBasic: normalizeNoteBasicResponse(
       payload,
@@ -1681,6 +2109,7 @@ const buildPreview = async (
 
     return {
       ...item,
+      author_id: noteBasic?.author_id || '',
       author_name: noteBasic?.author_name || '',
       avatar_url: noteBasic?.avatar_url || '',
       cache_hit: Boolean(noteBasic?.cache_hit),
@@ -1775,6 +2204,203 @@ const createOrderChargeRecord = async (
   return afterBalance;
 };
 
+const createBatchNo = () =>
+  `BATCH-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(1).toString('hex').toUpperCase()}`;
+
+const refundFailedChargedOrders = async (db, userId) => {
+  const connection = await db.getConnection();
+  const now = new Date();
+
+  try {
+    await connection.beginTransaction();
+
+    const [orders] = await connection.execute(
+      `
+        SELECT
+          o.*,
+          ar.id AS charge_record_id,
+          ar.actual_paid_amount,
+          ar.discount_rate,
+          ar.discounted_unit_price
+        FROM orders o
+        INNER JOIN account_records ar
+          ON ar.order_id = o.id
+          AND ar.record_type = 'order_charge'
+          AND ar.status = 'success'
+        WHERE o.user_id = ?
+          AND o.order_status = 'failed'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM account_records rr
+            WHERE rr.order_id = o.id
+              AND rr.record_type = 'refund'
+              AND rr.status = 'success'
+          )
+        FOR UPDATE
+      `,
+      [userId],
+    );
+
+    if (orders.length === 0) {
+      await connection.commit();
+      return;
+    }
+
+    const [[balance]] = await connection.execute(
+      `
+        SELECT available_amount
+        FROM balance_accounts
+        WHERE user_id = ?
+        LIMIT 1
+        FOR UPDATE
+      `,
+      [userId],
+    );
+    let beforeBalance = round4(balance?.available_amount);
+
+    for (const order of orders) {
+      const paidAmount = Number(order.actual_paid_amount) || 0;
+      const refundedAmount = Number(order.refund_amount_total) || 0;
+      const refundAmount = round4(Math.max(paidAmount - refundedAmount, 0));
+      if (refundAmount <= 0) {
+        continue;
+      }
+
+      const afterBalance = round4(beforeBalance + refundAmount);
+      const recordNo = `REFUND-${Date.now()}-${String(order.id).padStart(3, '0')}`;
+      await connection.execute(
+        `
+          INSERT INTO account_records
+            (
+              record_no, user_id, record_type, direction, order_id, order_no,
+              related_record_id, status, ordered_quantity, completed_quantity, refunded_quantity,
+              original_unit_price, original_total_amount, discount_rate, discounted_unit_price,
+              discount_amount, payable_amount, actual_paid_amount, refund_amount, net_amount,
+              before_available_amount, after_available_amount, reason_message, remark,
+              created_at, updated_at
+            )
+          VALUES (?, ?, 'refund', 'credit', ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          recordNo,
+          userId,
+          order.id,
+          order.order_no,
+          order.charge_record_id,
+          order.ordered_quantity,
+          order.completed_quantity,
+          order.ordered_quantity,
+          order.discounted_unit_price,
+          refundAmount,
+          order.discount_rate,
+          order.discounted_unit_price,
+          0,
+          refundAmount,
+          refundAmount,
+          refundAmount,
+          beforeBalance,
+          afterBalance,
+          '订单失败自动退款',
+          order.reason_message || '',
+          now,
+          now,
+        ],
+      );
+
+      await connection.execute(
+        `
+          UPDATE orders
+          SET refunded_quantity = ordered_quantity,
+              refund_amount_total = refund_amount_total + ?,
+              reason_message = COALESCE(reason_message, '订单失败自动退款'),
+              updated_at = ?
+          WHERE id = ?
+        `,
+        [refundAmount, now, order.id],
+      );
+
+      beforeBalance = afterBalance;
+    }
+
+    await connection.execute(
+      'UPDATE balance_accounts SET available_amount = ?, updated_at = ? WHERE user_id = ?',
+      [beforeBalance, now, userId],
+    );
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+const refreshBatchStats = async (db, userId, batchIds) => {
+  const ids = [...new Set(batchIds.map(Number).filter(Boolean))];
+  if (ids.length === 0) {
+    return;
+  }
+
+  const placeholders = ids.map(() => '?').join(',');
+  const [statsRows] = await db.execute(
+    `
+      SELECT
+        batch_id,
+        COUNT(1) AS total_count,
+        COALESCE(SUM(CASE WHEN order_status = 'running' THEN 1 ELSE 0 END), 0) AS processing_count,
+        COALESCE(SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END), 0) AS succeeded_count,
+        COALESCE(SUM(CASE WHEN order_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count
+      FROM orders
+      WHERE batch_id IN (${placeholders})
+        AND user_id = ?
+      GROUP BY batch_id
+    `,
+    [...ids, userId],
+  );
+
+  const now = new Date();
+  for (const stats of statsRows) {
+    const totalCount = Number(stats.total_count) || 0;
+    const processingCount = Number(stats.processing_count) || 0;
+    const succeededCount = Number(stats.succeeded_count) || 0;
+    const failedCount = Number(stats.failed_count) || 0;
+    const nextStatus =
+      totalCount > 0 && succeededCount === totalCount
+        ? 'completed'
+        : processingCount > 0
+          ? 'processing'
+          : failedCount > 0
+            ? 'failed'
+            : 'pending';
+
+    await db.execute(
+      `
+        UPDATE order_batches
+        SET status = ?,
+            processing_count = ?,
+            succeeded_count = ?,
+            failed_count = ?,
+            retryable_count = 0,
+            finished_at = CASE WHEN ? IN ('completed', 'failed') THEN COALESCE(finished_at, ?) ELSE finished_at END,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+      `,
+      [
+        nextStatus,
+        processingCount,
+        succeededCount,
+        failedCount,
+        nextStatus,
+        now,
+        now,
+        stats.batch_id,
+        userId,
+      ],
+    );
+  }
+};
+
 // 提交批量订单
 const submitBatch = async (userId, params) => {
   if (!params?.agree_policy) {
@@ -1792,10 +2418,11 @@ const submitBatch = async (userId, params) => {
   }
 
   const db = getPool();
+  await ensureOrderSnapshotColumns(db);
   const connection = await db.getConnection();
   const now = new Date();
   const batchUuid = crypto.randomUUID();
-  const batchNo = `BATCH-${Date.now()}`;
+  const batchNo = createBatchNo();
 
   try {
     await connection.beginTransaction();
@@ -1832,39 +2459,24 @@ const submitBatch = async (userId, params) => {
     let submittedCount = 0;
     let failedCount = 0;
     let chargedAmount = 0;
-    for (const [index, item] of preview.items.filter((entry) => entry.valid).entries()) {
+    const validPreviewItems = preview.items.filter((entry) => entry.valid);
+    const orderRows = [];
+
+    for (const [index, item] of validPreviewItems.entries()) {
       const orderNo = `ORDER-${Date.now()}-${String(index + 1).padStart(3, '0')}`;
       const recordNo = `REC-${Date.now()}-${String(index + 1).padStart(3, '0')}`;
-      let externalTaskId = null;
-      let orderStatus = 'running';
-      let reasonMessage = null;
 
-      try {
-        const xhsResult = await getXhsTaskClient().createTask(
-          preview.target_type,
-          createXhsTaskPayload({
-            batchNo,
-            item,
-            orderNo,
-            targetType: preview.target_type,
-          }),
-        );
-        externalTaskId =
-          xhsResult?.id === null || xhsResult?.id === undefined ? null : String(xhsResult.id);
-      } catch (error) {
-        orderStatus = 'failed';
-        reasonMessage = normalizeXhsErrorMessage(error);
-      }
-
-      await connection.execute(
+      const [insertResult] = await connection.execute(
         `
           INSERT INTO orders
             (
               order_no, user_id, batch_id, batch_item_id, note_id, note_url, target_type,
+              title, author_name, avatar_url,
               ordered_quantity, completed_quantity, order_status, external_task_id,
-              reason_message, created_at, updated_at
+              external_status, external_progress, external_completed_quantity,
+              last_verified_at, reason_message, created_at, updated_at
             )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           orderNo,
@@ -1874,25 +2486,107 @@ const submitBatch = async (userId, params) => {
           item.note_id,
           item.note_url,
           preview.target_type,
+          item.title || null,
+          item.author_name || null,
+          item.avatar_url || null,
           item.ordered_quantity,
-          orderStatus,
-          externalTaskId,
-          reasonMessage,
+          0,
+          'running',
+          null,
+          null,
+          0,
+          0,
+          null,
+          null,
           now,
           now,
         ],
       );
 
-      const [[order]] = await connection.execute('SELECT id FROM orders WHERE order_no = ?', [
+      orderRows.push({
+        id: insertResult.insertId,
+        item,
         orderNo,
-      ]);
+        recordNo,
+      });
+    }
 
-      if (orderStatus !== 'running') {
+    const taskResults = await Promise.all(
+      orderRows.map(async (order) => {
+        try {
+          const xhsResult = await getXhsTaskClient().createTask(
+            preview.target_type,
+            createXhsTaskPayload({
+              batchNo,
+              item: order.item,
+              orderNo: order.orderNo,
+              source: `goods:${order.id}`,
+              targetType: preview.target_type,
+            }),
+            { token: createCurrentUserToken(userId) },
+          );
+          const externalTaskId =
+            xhsResult?.id === null || xhsResult?.id === undefined ? null : String(xhsResult.id);
+          if (!externalTaskId) {
+            throw new Error('XHS API response missing task id');
+          }
+          return {
+            externalTaskId,
+            orderId: order.id,
+          };
+        } catch (error) {
+          return {
+            error,
+            orderId: order.id,
+          };
+        }
+      }),
+    );
+    const taskResultByOrderId = new Map(taskResults.map((result) => [result.orderId, result]));
+
+    for (const order of orderRows) {
+      let orderStatus = 'running';
+      const taskResult = taskResultByOrderId.get(order.id);
+      const externalTaskId = taskResult?.externalTaskId || null;
+
+      try {
+        if (taskResult?.error) {
+          throw taskResult.error;
+        }
+        if (!externalTaskId) {
+          throw new Error('XHS API response missing task id');
+        }
+        await connection.execute(
+          `
+            UPDATE orders
+            SET external_task_id = ?,
+                external_status = 'accepted',
+                reason_message = NULL,
+                updated_at = ?
+            WHERE id = ?
+          `,
+          [externalTaskId, now, order.id],
+        );
+      } catch (error) {
+        orderStatus = 'failed';
+        await connection.execute(
+          `
+            UPDATE orders
+            SET order_status = 'failed',
+                reason_message = ?,
+                updated_at = ?
+            WHERE id = ?
+          `,
+          [normalizeXhsErrorMessage(error), now, order.id],
+        );
+      }
+
+      if (orderStatus === 'failed') {
         failedCount += 1;
         continue;
       }
 
-      const afterBalance = round4(beforeBalance - item.payable_amount);
+      const afterBalance = round4(beforeBalance - order.item.payable_amount);
       await connection.execute(
         `
           INSERT INTO account_records
@@ -1906,19 +2600,19 @@ const submitBatch = async (userId, params) => {
           VALUES (?, ?, 'order_charge', 'debit', ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
-          recordNo,
+          order.recordNo,
           userId,
           order.id,
-          orderNo,
-          item.ordered_quantity,
+          order.orderNo,
+          order.item.ordered_quantity,
           preview.unit_price,
           preview.unit_price,
           preview.discount_rate,
           preview.discounted_unit_price,
-          item.discount_amount,
-          item.payable_amount,
-          item.payable_amount,
-          -item.payable_amount,
+          order.item.discount_amount,
+          order.item.payable_amount,
+          order.item.payable_amount,
+          -order.item.payable_amount,
           beforeBalance,
           afterBalance,
           '批量下单扣费',
@@ -1929,7 +2623,7 @@ const submitBatch = async (userId, params) => {
 
       beforeBalance = afterBalance;
       submittedCount += 1;
-      chargedAmount = round4(chargedAmount + item.payable_amount);
+      chargedAmount = round4(chargedAmount + order.item.payable_amount);
     }
 
     await connection.execute(
@@ -1938,23 +2632,22 @@ const submitBatch = async (userId, params) => {
     );
 
     const batchStatus =
-      submittedCount > 0 && failedCount === 0
+      submittedCount > 0
         ? 'processing'
-        : submittedCount > 0
-          ? 'manual_review'
-          : 'failed';
+        : 'failed';
     await connection.execute(
       `
         UPDATE order_batches
         SET status = ?,
             processing_count = ?,
-            succeeded_count = 0,
+            succeeded_count = ?,
             failed_count = ?,
             retryable_count = ?,
+            finished_at = CASE WHEN ? = 'failed' THEN ? ELSE finished_at END,
             updated_at = ?
         WHERE id = ?
       `,
-      [batchStatus, submittedCount, failedCount, failedCount, now, batch.id],
+      [batchStatus, submittedCount, 0, failedCount, failedCount, batchStatus, now, now, batch.id],
     );
 
     await connection.commit();
@@ -1975,6 +2668,10 @@ const submitBatch = async (userId, params) => {
 };
 
 const retryBatch = async (userId, batchId) => {
+  const error = new Error('Failed orders are refunded automatically and cannot be retried');
+  error.statusCode = 400;
+  throw error;
+
   const db = getPool();
   const connection = await db.getConnection();
   const targetBatchId = Number(batchId);
@@ -2044,9 +2741,13 @@ const retryBatch = async (userId, batchId) => {
               orderNo: order.order_no,
               targetType,
             }),
+            { token: createCurrentUserToken(userId) },
           );
           externalTaskId =
-            xhsResult?.id === null || xhsResult?.id === undefined ? null : String(xhsResult.id);
+          xhsResult?.id === null || xhsResult?.id === undefined ? null : String(xhsResult.id);
+          if (!externalTaskId) {
+            throw new Error('XHS API response missing task id');
+          }
         } catch (error) {
           await connection.execute(
             'UPDATE orders SET reason_message = ?, updated_at = ? WHERE id = ?',
@@ -2094,6 +2795,11 @@ const retryBatch = async (userId, batchId) => {
           UPDATE orders
           SET order_status = 'running',
               external_task_id = ?,
+              completed_quantity = 0,
+              external_status = 'accepted',
+              external_progress = 0,
+              external_completed_quantity = 0,
+              last_verified_at = NULL,
               reason_message = NULL,
               updated_at = ?
           WHERE id = ?

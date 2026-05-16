@@ -16,7 +16,6 @@ import {
   getBatchLinkCheckRecordsApi,
   getBatchOrderRecordsApi,
   getProblemLinkRecordsApi,
-  retryBatchOrderApi,
 } from '#/api';
 
 type OrderStatusFilter = 'all' | 'failed' | 'running' | 'success';
@@ -29,7 +28,6 @@ const selectedProblemBatchNo = ref('');
 const batchKeyword = ref('');
 const orderKeyword = ref('');
 const orderStatusFilter = ref<OrderStatusFilter>('all');
-const retryingBatchId = ref<number>();
 const pagination = ref({
   page: 1,
   page_size: 10,
@@ -104,6 +102,7 @@ const filteredRecords = computed(() => {
       record.batch_id,
       record.status,
       batchStatusLabel(record.status),
+      batchTargetTypeLabel(record),
       record.submitted_at,
       record.created_at,
     ]
@@ -211,7 +210,7 @@ const filteredProblemRecords = computed(() => {
 
 const summary = computed(() => {
   const totalAmount = records.value.reduce(
-    (total, record) => total + Number(record.estimated_amount || 0),
+    (total, record) => total + batchActualPaidAmount(record),
     0,
   );
   const totalOrders = records.value.reduce(
@@ -232,6 +231,17 @@ const summary = computed(() => {
       checkBatchGroups.value.reduce((total, record) => total + record.total, 0),
   };
 });
+
+function batchActualPaidAmount(record: OrderApi.BatchOrderRecord) {
+  return (record.orders ?? []).reduce(
+    (total, order) => total + Number(order.actual_paid_amount || 0),
+    0,
+  );
+}
+
+function batchTargetTypeLabel(record: OrderApi.BatchOrderRecord) {
+  return targetTypeLabel(record.orders?.[0]?.target_type || '');
+}
 
 watch([selectedBatchId, selectedProblemBatchNo], () => {
   orderKeyword.value = '';
@@ -262,7 +272,13 @@ function formatDateTime(value?: string) {
 }
 
 function targetTypeLabel(type: string) {
-  return type === 'impression' ? '曝光' : '阅读';
+  if (type === 'impression') {
+    return '曝光';
+  }
+  if (type === 'like') {
+    return '点赞';
+  }
+  return '阅读';
 }
 
 function batchStatusLabel(status: string) {
@@ -284,11 +300,35 @@ function orderStatusLabel(status: string) {
     running: '进行中',
     stopping: '停止中',
   };
+  Object.assign(statusMap, {
+    refund_approved: '退款已通过',
+    refund_calculating: '退款计算中',
+    refund_rejected: '退款已拒绝',
+  });
   return statusMap[status] || status || '-';
 }
 
+function orderDisplayStatusLabel(order: OrderApi.BatchOrderRecordItem) {
+  if (order.order_status === 'running' && order.external_status === 'completed') {
+    return '上游完成';
+  }
+  return orderStatusLabel(order.order_status);
+}
+
 function refundLabel(order: OrderApi.BatchOrderRecordItem) {
+  if (order.order_status === 'refund_approved') {
+    return '已退款';
+  }
+  if (order.order_status === 'refund_rejected') {
+    return '退款已拒绝';
+  }
+  if (['refund_calculating', 'stopping'].includes(order.order_status)) {
+    return '退款中';
+  }
   if (order.refund_amount > 0) {
+    return '已退款';
+  }
+  if (order.order_status === 'failed' && Number(order.actual_paid_amount || 0) <= 0) {
     return '已退款';
   }
   if (['refund_requested', 'refund_calculating'].includes(order.order_status)) {
@@ -298,19 +338,25 @@ function refundLabel(order: OrderApi.BatchOrderRecordItem) {
 }
 
 function batchProgress(record: OrderApi.BatchOrderRecord) {
-  const total = Number(record.total_count) || 0;
+  const orders = record.orders ?? [];
+  const total = orders.length;
   if (total <= 0) {
     return 0;
   }
-  const completed = Math.max(
-    Number(record.succeeded_count) || 0,
-    total - (Number(record.processing_count) || 0) - (Number(record.failed_count) || 0),
+  const completed = orders.reduce(
+    (sum, order) => sum + (order.order_status === 'completed' ? 1 : 0),
+    0,
   );
   return Math.min(100, Math.max(0, (completed / total) * 100));
 }
 
-function canRetryBatch(record: OrderApi.BatchOrderRecord) {
-  return Number(record.retryable_count || 0) > 0 || Number(record.failed_count || 0) > 0;
+function orderProgress(order: OrderApi.BatchOrderRecordItem) {
+  const total = Math.max(Number(order.ordered_quantity) || 0, 0);
+  if (total <= 0) {
+    return 0;
+  }
+  const completed = Math.min(Math.max(Number(order.completed_quantity) || 0, 0), total);
+  return Math.min(100, Math.max(0, (completed / total) * 100));
 }
 
 function copyTextWithFallback(text: string) {
@@ -419,19 +465,6 @@ function handleBatchPageSizeChange(pageSize: number) {
   loadRecords();
 }
 
-async function retryBatch(record: OrderApi.BatchOrderRecord) {
-  retryingBatchId.value = record.id;
-  try {
-    const result = await retryBatchOrderApi(record.id);
-    ElMessage.success(`已提交重试 ${result.retried_count} 条`);
-    await loadRecords();
-  } catch {
-    ElMessage.error('重试失败，请稍后再试');
-  } finally {
-    retryingBatchId.value = undefined;
-  }
-}
-
 onMounted(loadRecords);
 </script>
 
@@ -534,6 +567,9 @@ onMounted(loadRecords);
           <div>
             <div class="batch-title-line">
               <strong>{{ record.batch_no }}</strong>
+              <span class="batch-type-tag service">
+                {{ batchTargetTypeLabel(record) }}
+              </span>
               <span class="batch-type-tag primary">
                 确认提交
               </span>
@@ -554,17 +590,11 @@ onMounted(loadRecords);
           </div>
           <div class="batch-money">
             <span>实际付款金额</span>
-            <strong>{{ formatMoney(record.estimated_amount) }}</strong>
+            <strong>{{ formatMoney(batchActualPaidAmount(record)) }}</strong>
           </div>
-          <ElButton
-            :disabled="!canRetryBatch(record)"
-            :loading="retryingBatchId === record.id"
-            size="small"
-            type="primary"
-            @click.stop="retryBatch(record)"
-          >
-            一键重试
-          </ElButton>
+          <span class="batch-kind-tag batch-type-tag primary">
+            {{ batchStatusLabel(record.status) }}
+          </span>
         </article>
 
         <article
@@ -623,6 +653,7 @@ onMounted(loadRecords);
           v-for="order in filteredOrders"
           :key="order.id"
           class="order-detail-row"
+          :style="{ '--progress': `${orderProgress(order)}%` }"
         >
         <!-- {{ order }} -->
           <div class="product-cell">
@@ -644,13 +675,26 @@ onMounted(loadRecords);
           </div>
           <div class="tag-cell">
             <span>{{ targetTypeLabel(order.target_type) }}服务</span>
+            <span>订单ID：{{ order.id }}</span>
             <span>批次：{{ selectedBatch.batch_no }}</span>
             <span>明细：#{{ order.batch_item_id }}</span>
           </div>
           <!-- formatMoney(order.actual_paid_amount / Math.max(order.ordered_quantity, 1)) -->
           <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
-          <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-          <span>{{ orderStatusLabel(order.order_status) }}</span>
+          <div class="quantity-cell">
+            <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+            <small v-if="order.order_status === 'running'">
+              {{ order.completed_quantity.toLocaleString('zh-CN') }} /
+              {{ order.ordered_quantity.toLocaleString('zh-CN') }}
+              {{ orderProgress(order).toFixed(0) }}%
+            </small>
+          </div>
+          <div class="order-status-cell">
+            <span>{{ orderDisplayStatusLabel(order) }}</span>
+            <small v-if="order.order_status === 'failed' && order.reason_message">
+              失败原因：{{ order.reason_message }}
+            </small>
+          </div>
           <span>{{ refundLabel(order) }}</span>
           <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
         </article>
@@ -906,6 +950,12 @@ onMounted(loadRecords);
   color: var(--el-color-primary);
 }
 
+.batch-type-tag.service {
+  border-color: color-mix(in srgb, var(--el-color-success) 35%, transparent);
+  background: color-mix(in srgb, var(--el-color-success) 14%, transparent);
+  color: var(--el-color-success);
+}
+
 .batch-type-tag.warning {
   border-color: color-mix(in srgb, var(--el-color-warning) 38%, transparent);
   background: color-mix(in srgb, var(--el-color-warning) 16%, transparent);
@@ -948,7 +998,23 @@ onMounted(loadRecords);
 }
 
 .order-detail-row {
+  position: relative;
+  overflow: hidden;
   padding: 18px 20px;
+}
+
+.order-detail-row::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--progress, 0%);
+  background: color-mix(in srgb, var(--el-color-primary) 10%, transparent);
+  content: '';
+  pointer-events: none;
+}
+
+.order-detail-row > * {
+  position: relative;
+  z-index: 1;
 }
 
 .product-cell {
@@ -1022,6 +1088,32 @@ onMounted(loadRecords);
   display: grid;
   gap: 6px;
   line-height: 1.5;
+}
+
+.order-status-cell {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.order-status-cell small {
+  overflow: hidden;
+  color: var(--el-color-danger);
+  font-size: 12px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+}
+
+.quantity-cell {
+  display: grid;
+  gap: 4px;
+}
+
+.quantity-cell small {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
 }
 
 .empty-state {

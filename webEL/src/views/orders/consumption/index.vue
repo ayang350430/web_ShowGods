@@ -3,6 +3,8 @@ import type { OrderApi } from '#/api';
 
 import { computed, onMounted, reactive, ref } from 'vue';
 
+import { useUserStore } from '@vben/stores';
+
 import {
   ElButton,
   ElInput,
@@ -20,6 +22,7 @@ import { getConsumptionRecordsApi, requestOrderRefundApi } from '#/api';
 
 const loading = ref(false);
 const records = ref<OrderApi.ConsumptionRecord[]>([]);
+const userStore = useUserStore();
 const summary = ref<OrderApi.ConsumptionRecordSummary>({
   expense_amount: 0,
   income_amount: 0,
@@ -62,6 +65,10 @@ const stats = computed(() => [
     tone: 'normal',
   },
 ]);
+
+const canManageRefund = computed(() =>
+  (userStore.userInfo?.roles ?? []).some((role) => ['admin', 'super'].includes(role)),
+);
 
 function formatMoney(value?: number) {
   return `￥ ${(Number(value) || 0).toLocaleString('zh-CN', {
@@ -311,7 +318,7 @@ onMounted(loadRecords);
                   {{ orderStatusLabel(item.order_status) }}
                 </ElTag>
                 <ElPopconfirm
-                  v-if="canRequestRefund(item.order_status)"
+                  v-if="canManageRefund && canRequestRefund(item.order_status)"
                   title="确认申请这条订单退款？申请后需要管理员审核。"
                   confirm-button-text="申请退款"
                   cancel-button-text="取消"
@@ -321,7 +328,7 @@ onMounted(loadRecords);
                     <ElButton size="small" type="warning">申请退款</ElButton>
                   </template>
                 </ElPopconfirm>
-                <ElButton v-else disabled size="small">
+                <ElButton v-else-if="canManageRefund" disabled size="small">
                   {{
                     item.order_status === 'refund_requested'
                       ? '退款中'

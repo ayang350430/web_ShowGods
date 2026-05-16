@@ -9,6 +9,8 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  process.env.SEED_DEMO_DATA = 'false';
+  await initializeDatabase();
   delete process.env.SEED_DEMO_DATA;
   await closePool();
 });
@@ -133,6 +135,7 @@ describe('goods dashboard endpoints', () => {
           COALESCE(SUM(GREATEST(COALESCE(ordered_quantity, 0) - COALESCE(refunded_quantity, 0), 0)), 0) AS all_quantity,
           COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN GREATEST(COALESCE(ordered_quantity, 0) - COALESCE(refunded_quantity, 0), 0) ELSE 0 END), 0) AS today_quantity
         FROM orders
+        WHERE order_status <> 'failed'
       `,
       [todayStart, tomorrowStart],
     );

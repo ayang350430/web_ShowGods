@@ -2,7 +2,7 @@
 import type { VbenFormSchema } from '@vben/common-ui';
 import type { Recordable } from '@vben/types';
 
-import { computed, h, ref } from 'vue';
+import { computed, ref } from 'vue';
 import { useRouter } from 'vue-router';
 
 import { LOGIN_PATH } from '@vben/constants';
@@ -43,48 +43,6 @@ const formSchema = computed((): VbenFormSchema[] => {
         };
       },
       rules: z.string().min(6, { message: $t('authentication.passwordTip') }),
-    },
-    {
-      component: 'VbenInputPassword',
-      componentProps: {
-        placeholder: $t('authentication.confirmPassword'),
-      },
-      dependencies: {
-        rules(values) {
-          const { password } = values;
-          return z
-            .string({ required_error: $t('authentication.passwordTip') })
-            .min(1, { message: $t('authentication.passwordTip') })
-            .refine((value) => value === password, {
-              message: $t('authentication.confirmPasswordTip'),
-            });
-        },
-        triggerFields: ['password'],
-      },
-      fieldName: 'confirmPassword',
-      label: $t('authentication.confirmPassword'),
-    },
-    {
-      component: 'VbenCheckbox',
-      fieldName: 'agreePolicy',
-      renderComponentContent: () => ({
-        default: () =>
-          h('span', [
-            $t('authentication.agree'),
-            h(
-              'a',
-              {
-                class: 'vben-link ml-1',
-                href: '',
-                onClick: (event: Event) => event.preventDefault(),
-              },
-              `${$t('authentication.privacyPolicy')} & ${$t('authentication.terms')}`,
-            ),
-          ]),
-      }),
-      rules: z.boolean().refine((value) => !!value, {
-        message: $t('authentication.agreeTip'),
-      }),
     },
   ];
 });

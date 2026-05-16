@@ -81,13 +81,6 @@ const requestLogger = (req, res, next) => {
       user_id: getCurrentUserId(req),
     };
 
-    const message = `[${entry.time}] ${success ? 'SUCCESS' : 'FAILED'} ${entry.method} ${entry.path} ${entry.status_code} ${entry.duration_ms}ms request_id=${entry.request_id}`;
-    if (success) {
-      console.log(message);
-    } else {
-      console.error(message);
-    }
-
     void writeRequestLog(entry);
   });
 

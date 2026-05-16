@@ -45,6 +45,7 @@ const preview = ref<OrderApi.BatchOrderPreview>();
 const previewing = ref(false);
 const removedDrawerVisible = ref(false);
 const orderRecords = ref<OrderApi.BatchOrderRecord[]>([]);
+const orderRecordTotal = ref(0);
 const selectedDrawerBatchKey = ref('');
 const orderDrawerKeyword = ref('');
 const orderDrawerStatus = ref<'all' | 'failed' | 'success'>('all');
@@ -55,7 +56,7 @@ const selectedCheckRecordId = ref<number>();
 const selectedCheckBatchNo = ref('');
 const latestPreviewBatchNo = ref('');
 const submitting = ref(false);
-const targetType = ref<'impression' | 'view'>('view');
+const targetType = ref<'impression' | 'like' | 'view'>('view');
 
 const parsedLines = computed(() =>
   content.value
@@ -426,12 +427,34 @@ async function copySelectedProblemBatchLinks() {
   }
 }
 
-async function loadOrderRecords() {
+async function loadOrderRecords(
+  preferredBatchNo = '',
+  options: { silent?: boolean; skipStatusSync?: boolean } = {},
+) {
   try {
-    orderRecords.value = (await getBatchOrderRecordsApi({ page: 1, page_size: 10 })).items;
+    const result = await getBatchOrderRecordsApi(
+      {
+        page: 1,
+        page_size: 100,
+        ...(options.skipStatusSync ? { skip_status_sync: 1 as const } : {}),
+      },
+      { silent: options.silent },
+    );
+    orderRecords.value = result.items;
+    orderRecordTotal.value = result.total;
+    if (preferredBatchNo) {
+      const preferredRecord = orderRecords.value.find(
+        (record) => record.batch_no === preferredBatchNo,
+      );
+      syncSelectedDrawerBatch(
+        preferredRecord ? `order-${preferredRecord.id}` : undefined,
+      );
+      return;
+    }
     syncSelectedDrawerBatch();
   } catch {
     orderRecords.value = [];
+    orderRecordTotal.value = 0;
   }
 }
 
@@ -571,10 +594,12 @@ async function checkConnection(showSuccess = false) {
 async function validateContent() {
   previewing.value = true;
   try {
-    preview.value = await previewBatchOrderApi({
+    const result = await previewBatchOrderApi({
       content: content.value,
       target_type: targetType.value,
     });
+    console.log('[Batch Preview] response', result);
+    preview.value = result;
     latestPreviewBatchNo.value = preview.value.check_batch_no;
     selectedCheckBatchNo.value = preview.value.check_batch_no;
     if (preview.value.invalid_count > 0 || preview.value.warnings.length > 0) {
@@ -582,6 +607,9 @@ async function validateContent() {
       return;
     }
     ElMessage.success('预校验通过');
+  } catch (error) {
+    console.error('[Batch Preview] error', error);
+    throw error;
   } finally {
     previewing.value = false;
   }
@@ -597,13 +625,16 @@ async function submitOrder() {
 
   submitting.value = true;
   try {
-    const result = await submitBatchOrderApi({
-      agree_policy: agreePolicy.value,
-      content: content.value,
-      target_type: targetType.value,
-    });
+    const result = await submitBatchOrderApi(
+      {
+        agree_policy: agreePolicy.value,
+        content: content.value,
+        target_type: targetType.value,
+      },
+      { silent: true },
+    );
+    await loadOrderRecords(result.batch_no, { silent: true, skipStatusSync: true });
     ElMessage.success(`提交成功：${result.batch_no}`);
-    await loadOrderRecords();
     content.value = '';
     preview.value = undefined;
     agreePolicy.value = false;
@@ -654,6 +685,7 @@ onMounted(() => {
           </div>
           <ElRadioGroup v-model="targetType" size="small" @change="validateContent">
             <ElRadioButton label="view">阅读</ElRadioButton>
+            <ElRadioButton label="like">点赞</ElRadioButton>
             <ElRadioButton label="impression">曝光</ElRadioButton>
           </ElRadioGroup>
         </div>
@@ -675,13 +707,12 @@ onMounted(() => {
             一键删除问题链接并记录
           </ElButton>
           <ElButton @click="openOrderRecords">
-            下单记录（{{ drawerBatches.length }} 批）
+            下单记录（{{ orderRecordTotal }} 批）
           </ElButton>
           <ElButton @click="clearContent">清空</ElButton>
           <ElButton
             type="primary"
-            :disabled="!canSubmit"
-            :loading="submitting"
+            :disabled="!canSubmit || submitting"
             @click="submitOrder"
           >
             确认提交{{ targetType === 'view' ? '阅读' : '曝光' }}
@@ -870,6 +901,7 @@ onMounted(() => {
             >
               <div>
                 <span>{{ order.order_no }}</span>
+                <small>订单ID：{{ order.id }}</small>
                 <em>{{ order.source_note_url || order.note_url || '-' }}</em>
               </div>
               <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
@@ -1327,11 +1359,17 @@ onMounted(() => {
 }
 
 .order-record-drawer-item span,
+.order-record-drawer-item small,
 .order-record-drawer-item em {
   display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.order-record-drawer-item small {
+  margin-top: 4px;
+  color: var(--el-text-color-secondary);
 }
 
 .order-record-drawer-item em {

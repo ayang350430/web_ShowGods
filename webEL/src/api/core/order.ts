@@ -4,7 +4,7 @@ export namespace OrderApi {
   export interface BatchOrderParams {
     agree_policy?: boolean;
     content: string;
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
   }
 
   export interface BatchOrderItem {
@@ -33,7 +33,7 @@ export namespace OrderApi {
     discounted_unit_price: number;
     invalid_count: number;
     items: BatchOrderItem[];
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
     total_amount: number;
     total_count: number;
     unit_price: number;
@@ -56,6 +56,7 @@ export namespace OrderApi {
     batch_item_id: number;
     completed_quantity: number;
     created_at: string;
+    external_status: string;
     id: number;
     note_id: string;
     note_url: string;
@@ -66,7 +67,7 @@ export namespace OrderApi {
     reason_message: string;
     record_status: string;
     refund_amount: number;
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
     source_note_url: string;
     title: string;
     updated_at: string;
@@ -104,7 +105,7 @@ export namespace OrderApi {
     payable_amount: number;
     raw: string;
     resolved_note_url: string;
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
     title: string;
     valid: boolean;
   }
@@ -123,7 +124,7 @@ export namespace OrderApi {
     payable_amount: number;
     raw: string;
     resolved_note_url: string;
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
     title: string;
     valid: boolean;
   }
@@ -202,7 +203,7 @@ export namespace OrderApi {
     refund_calc_after_at: null | string;
     refund_requested_at: null | string;
     refunded_quantity: number;
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
     title: string;
     updated_at: string;
     user_id: number;
@@ -224,7 +225,7 @@ export namespace OrderApi {
       resolved_note_url?: string;
       title?: string;
     }>;
-    target_type: 'impression' | 'view';
+    target_type: 'impression' | 'like' | 'view';
   }
 
   export interface SaveProblemLinkRecordsResult {
@@ -266,20 +267,28 @@ export async function previewBatchOrderSilentApi(
   );
 }
 
-export async function submitBatchOrderApi(data: OrderApi.BatchOrderParams) {
+export async function submitBatchOrderApi(
+  data: OrderApi.BatchOrderParams,
+  options?: { silent?: boolean },
+) {
   return requestClient.post<OrderApi.BatchOrderSubmitResult>(
     '/v1/orders/batch/submit',
     data,
+    { skipBackendLoading: options?.silent } as any,
   );
 }
 
-export async function getBatchOrderRecordsApi(params?: {
-  page?: number;
-  page_size?: number;
-}) {
+export async function getBatchOrderRecordsApi(
+  params?: {
+    page?: number;
+    page_size?: number;
+    skip_status_sync?: 1;
+  },
+  options?: { silent?: boolean },
+) {
   return requestClient.get<OrderApi.PageResult<OrderApi.BatchOrderRecord>>(
     '/v1/orders/batch/records',
-    { params },
+    { params, skipBackendLoading: options?.silent } as any,
   );
 }
 

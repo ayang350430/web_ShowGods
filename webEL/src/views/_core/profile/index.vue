@@ -128,7 +128,7 @@ const weeklyRows = computed(() => [
 
 const recentOperations = computed<RecentOperation[]>(() => {
   const orderOperations = recentOrders.value.map((order) => ({
-    description: `${order.target_type === 'impression' ? '曝光' : '阅读'} / ${order.completed_quantity}/${order.ordered_quantity}`,
+    description: `${order.target_type === 'impression' ? '曝光' : order.target_type === 'like' ? '点赞' : '阅读'} / ${order.completed_quantity}/${order.ordered_quantity}`,
     id: `order-${order.order_no}`,
     status: getOrderStatusLabel(order.order_status),
     time: order.created_at,
