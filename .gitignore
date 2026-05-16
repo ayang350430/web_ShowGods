@@ -1,0 +1,14 @@
+node_modules/
+.env
+npm-debug.log*
+logs/
+*.log
+dist/
+dist.zip
+*.zip
+downloads/
+my.ini
+mysql-8.4.9-winx64/
+mysql-data/
+mysql-logs/
+vue-vben-admin/
