@@ -44,6 +44,18 @@ function hideBackendLoading() {
   }
 }
 
+function isAbortLikeError(error: any) {
+  const message = String(error?.message || '').toLowerCase();
+  return (
+    error?.code === 'ERR_CANCELED' ||
+    error?.name === 'AbortError' ||
+    error?.name === 'CanceledError' ||
+    message.includes('aborted') ||
+    message.includes('canceled') ||
+    message.includes('cancelled')
+  );
+}
+
 function attachBackendLoading(client: RequestClient) {
   client.addRequestInterceptor({
     fulfilled: (config) => {
@@ -145,6 +157,9 @@ function createRequestClient(baseURL: string, options?: RequestClientOptions) {
 
   client.addResponseInterceptor(
     errorMessageResponseInterceptor((msg: string, error) => {
+      if (isAbortLikeError(error)) {
+        return;
+      }
       const responseData = error?.response?.data ?? {};
       const errorMessage = responseData?.error ?? responseData?.message ?? '';
 

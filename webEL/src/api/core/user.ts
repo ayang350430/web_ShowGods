@@ -75,15 +75,25 @@ export namespace UserApi {
   }
 
   export interface AdminUserPermission {
+    available_amount: number;
     created_at: string;
     display_name: string;
     discount_rate: number;
     fixed_unit_price: null | number;
     id: number;
     impression_fixed_unit_price: null | number;
+    impression_quantity_price_amount: null | number;
+    impression_quantity_price_base: null | number;
     impression_discount_rate: number;
-    impression_price_mode: 'default' | 'discount' | 'fixed';
-    price_mode: 'default' | 'discount' | 'fixed';
+    impression_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    like_discount_rate: number;
+    like_fixed_unit_price: null | number;
+    like_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    like_quantity_price_amount: null | number;
+    like_quantity_price_base: null | number;
+    price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    quantity_price_amount: null | number;
+    quantity_price_base: null | number;
     real_name: string;
     role_names: string[];
     roles: string[];
@@ -155,6 +165,18 @@ export async function updateAdminUserStatusApi(userId: number, status: string) {
   );
 }
 
+export async function updateAdminUserBalanceApi(
+  userId: number,
+  data: { amount: number; reason?: string },
+) {
+  return requestClient.put<{
+    after_available_amount: number;
+    before_available_amount: number;
+    delta_amount: number;
+    user_id: number;
+  }>(`/v1/admin/permissions/users/${userId}/balance`, data);
+}
+
 export async function updateAdminUserDiscountsApi(
   userId: number,
   data: {
@@ -162,8 +184,17 @@ export async function updateAdminUserDiscountsApi(
     fixed_unit_price: null | number;
     impression_discount_rate: number;
     impression_fixed_unit_price: null | number;
-    impression_price_mode: 'default' | 'discount' | 'fixed';
-    price_mode: 'default' | 'discount' | 'fixed';
+    impression_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    impression_quantity_price_amount: null | number;
+    impression_quantity_price_base: null | number;
+    like_discount_rate: number;
+    like_fixed_unit_price: null | number;
+    like_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    like_quantity_price_amount: null | number;
+    like_quantity_price_base: null | number;
+    price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    quantity_price_amount: null | number;
+    quantity_price_base: null | number;
   },
 ) {
   return requestClient.put<{
@@ -171,8 +202,17 @@ export async function updateAdminUserDiscountsApi(
     fixed_unit_price: null | number;
     impression_discount_rate: number;
     impression_fixed_unit_price: null | number;
-    impression_price_mode: 'default' | 'discount' | 'fixed';
-    price_mode: 'default' | 'discount' | 'fixed';
+    impression_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    impression_quantity_price_amount: null | number;
+    impression_quantity_price_base: null | number;
+    like_discount_rate: number;
+    like_fixed_unit_price: null | number;
+    like_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    like_quantity_price_amount: null | number;
+    like_quantity_price_base: null | number;
+    price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
+    quantity_price_amount: null | number;
+    quantity_price_base: null | number;
     user_id: number;
   }>(`/v1/admin/permissions/users/${userId}/discounts`, data);
 }

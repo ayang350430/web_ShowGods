@@ -101,6 +101,23 @@ const listBatchOrderRecords = async (req, res, next) => {
   }
 };
 
+const searchBatchOrders = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.searchBatchOrdersByLinks(
+      getCurrentUserId(req),
+      req.body,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const listConsumptionRecords = async (req, res, next) => {
   try {
     const data = await batchOrderService.listConsumptionRecords(getCurrentUserId(req), req.query);
@@ -132,6 +149,74 @@ const listRefundRecords = async (req, res, next) => {
 const retryBatchOrder = async (req, res, next) => {
   try {
     const data = await batchOrderService.retryBatch(getCurrentUserId(req), req.params.batchId);
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const replenishBatchOrder = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.approveReplenishmentBatch(
+      getCurrentUserId(req),
+      req.params.batchId,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const requestReplenishBatchOrder = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.requestReplenishBatch(
+      getCurrentUserId(req),
+      req.params.batchId,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const listReplenishmentRequests = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.listReplenishmentRequests(
+      getCurrentUserId(req),
+      req.query,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const approveReplenishmentRequest = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.approveReplenishmentRequest(
+      getCurrentUserId(req),
+      req.params.requestId,
+    );
 
     return res.json({
       code: 0,
@@ -183,12 +268,17 @@ module.exports = {
   listCheckRecords,
   listConsumptionRecords,
   listProblemLinks,
+  listReplenishmentRequests,
   listRefundRecords,
+  approveReplenishmentRequest,
   previewBatchOrder,
   previewBatchOrderSilent,
+  replenishBatchOrder,
+  requestReplenishBatchOrder,
   retryBatchOrder,
   requestOrderRefund,
   reviewOrderRefund,
   saveProblemLinks,
+  searchBatchOrders,
   submitBatchOrder,
 };

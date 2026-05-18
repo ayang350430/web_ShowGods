@@ -1,10 +1,35 @@
 const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 
 const { getPool } = require('../config/database');
 
+const execFileAsync = promisify(execFile);
 const TARGET_TYPES = new Set(['view', 'impression', 'like']);
+const ACTIVE_NOTE_ORDER_STATUSES = [
+  'running',
+  'repair_review',
+  'refund_requested',
+  'refund_calculating',
+  'stopping',
+  'refund_rejected',
+];
+const TARGET_TYPE_LABELS = {
+  impression: '曝光',
+  like: '点赞',
+  view: '阅读',
+};
 const NOTE_BASIC_API = 'http://zl.2kpi.cn/api/v1/note/basic';
 const NOTE_ID_API = 'http://zl.2kpi.cn/api/v1/note/id';
+const NOTE_LIKES_API = 'http://zl.2kpi.cn/api/v1/note/likes';
+const NOTE_REALTIME_API = 'http://zl.2kpi.cn/api/v1/note/realtime';
+const TINYDATA_PREVIEW_API =
+  process.env.TINYDATA_PREVIEW_API || 'https://www.tinydata.cc/api/v1/order-batches/preview';
+const TINYDATA_PREVIEW_JOB_API =
+  process.env.TINYDATA_PREVIEW_JOB_API ||
+  new URL('../preview-jobs/', TINYDATA_PREVIEW_API.endsWith('/')
+    ? TINYDATA_PREVIEW_API
+    : `${TINYDATA_PREVIEW_API}/`).toString();
 const XHS_API_ENDPOINTS = {
   impression: '/api/v2/impression',
   like: '/api/v2/note_likes',
@@ -14,6 +39,7 @@ let noteBasicCacheTableReady;
 let problemLinkRecordTableReady;
 let batchLinkCheckRecordTableReady;
 let orderSnapshotColumnsReady;
+let replenishmentRecordTableReady;
 let xhsTaskClientOverride = null;
 
 const round4 = (value) => Math.round((Number(value) || 0) * 10_000) / 10_000;
@@ -40,10 +66,21 @@ const canViewAllAccountRecords = async (db, userId) => {
   return roleCodes.some((roleCode) => ADMIN_ROLES.has(roleCode));
 };
 
+const assertAdmin = async (db, userId) => {
+  const isAdmin = await canViewAllAccountRecords(db, userId);
+  if (!isAdmin) {
+    const error = new Error('Admin permission required');
+    error.statusCode = 403;
+    throw error;
+  }
+};
+
 const normalizeTargetType = (value) => {
   const targetType = String(value || 'view').trim().toLowerCase();
   return TARGET_TYPES.has(targetType) ? targetType : 'view';
 };
+
+const getTargetTypeLabel = (targetType) => TARGET_TYPE_LABELS[targetType] || '当前业务';
 
 const normalizeDiscountRate = (value) => {
   const rate = Number(value);
@@ -66,7 +103,7 @@ const setXhsTaskClient = (client) => {
 // XHS API configuration
 const getXhsApiConfig = () => ({
   baseUrl: process.env.XHS_API_BASE_URL || 'http://192.168.31.134:9101',
-  timeoutMs: Number(process.env.XHS_API_TIMEOUT_MS) || 10_000,
+  timeoutMs: Number(process.env.XHS_API_TIMEOUT_MS) || 60_000,
 });
 
 const createDefaultXhsTaskClient = () => ({
@@ -136,9 +173,7 @@ const createDefaultXhsTaskClient = () => ({
     };
 
     try {
-      if (targetType === 'impression') {
-        console.log(`POST ${endpoint}`, JSON.stringify(payload, null, 2));
-      }
+      console.log(`POST ${endpoint}`, JSON.stringify(payload, null, 2));
       const response = await fetch(url, {
         body: JSON.stringify(payload),
         headers,
@@ -146,16 +181,14 @@ const createDefaultXhsTaskClient = () => ({
         signal: controller.signal,
       });
       const body = await response.json().catch(() => null);
-      if (targetType === 'impression') {
-        console.log(`RESPONSE ${endpoint}`, JSON.stringify(body, null, 2));
-      }
+      console.log(`RESPONSE ${endpoint}`, JSON.stringify(body, null, 2));
       if (!response.ok || body?.success === false || body?.code !== 0) {
         throw new Error(body?.message || `XHS API request failed with HTTP ${response.status}`);
       }
 
-      const taskId = body?.data?.id;
-      if (taskId === null || taskId === undefined || taskId === '') {
-        throw new Error('XHS API response missing task id');
+      const taskId = normalizeXhsTaskId(body?.data?.id);
+      if (!taskId) {
+        throw new Error('XHS API response missing task id (numeric)');
       }
 
       return { id: taskId };
@@ -240,15 +273,23 @@ const getXhsTaskCount = (body, key) => {
   return Number(data[key] ?? body?.[key] ?? 0) || 0;
 };
 
+const getXhsCreateTotalCount = (item, targetType) => {
+  const orderedQuantity = Math.max(Number(item?.ordered_quantity) || 0, 0);
+  if (targetType !== 'like') {
+    return orderedQuantity;
+  }
+  const currentLikeCount = Math.max(Number(item?.like_count) || 0, 0);
+  return orderedQuantity + currentLikeCount;
+};
+
 const createXhsTaskPayload = ({ batchNo, item, orderNo, source, targetType }) => ({
   author_id: item.author_id || '',
-  current_count: 0,
   note_id: item.note_id,
   priority: 0,
   reason: `goods_order=${orderNo};session=${batchNo}`,
   source: source || `goods:${batchNo}`,
   status: 1,
-  total_count: item.ordered_quantity,
+  total_count: getXhsCreateTotalCount(item, targetType),
   ...(targetType === 'view'
     ? {
         app_count: 0,
@@ -264,8 +305,40 @@ const createXhsTaskPayload = ({ batchNo, item, orderNo, source, targetType }) =>
     : {}),
 });
 
-const normalizeXhsErrorMessage = (error) =>
-  `XHS task create failed: ${String(error?.message || error || 'unknown error').slice(0, 220)}`;
+const normalizeXhsTaskId = (value) => {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const taskId = String(value).trim();
+  return /^\d+$/.test(taskId) ? taskId : null;
+};
+
+const stopXhsTask = async ({ reason = '', taskId, targetType, userId }) => {
+  const externalTaskId = normalizeXhsTaskId(taskId);
+  if (!externalTaskId) {
+    const error = new Error('Invalid XHS task id');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  return getXhsTaskClient().updateTaskStatus(
+    normalizeTargetType(targetType),
+    {
+      id: Number(externalTaskId),
+      reason,
+      status: 3,
+    },
+    { token: createCurrentUserToken(userId) },
+  );
+};
+
+const normalizeXhsErrorMessage = (error) => {
+  const causeMessage = error?.cause?.message || error?.cause?.code || '';
+  const message = [error?.message || error || 'unknown error', causeMessage]
+    .filter(Boolean)
+    .join(': ');
+  return `XHS task create failed: ${String(message).slice(0, 220)}`;
+};
 
 const createAsyncLimiter = (limit) => {
   let activeCount = 0;
@@ -354,6 +427,30 @@ const findFirstStringByKey = (value, keyPattern) => {
   }
 
   return '';
+};
+
+const findFirstNumberByKey = (value, keyPattern) => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  for (const [key, entry] of Object.entries(value)) {
+    if (keyPattern.test(key)) {
+      const numberValue = Number(entry);
+      if (Number.isFinite(numberValue)) {
+        return numberValue;
+      }
+    }
+
+    if (entry && typeof entry === 'object') {
+      const childValue = findFirstNumberByKey(entry, keyPattern);
+      if (childValue !== null) {
+        return childValue;
+      }
+    }
+  }
+
+  return null;
 };
 
 // 规范笔记基本信息响应
@@ -454,8 +551,18 @@ const ensureOrderSnapshotColumns = async (db) => {
         }
       };
       await ensureColumn('title', 'VARCHAR(255) DEFAULT NULL AFTER note_url');
-      await ensureColumn('author_name', 'VARCHAR(255) DEFAULT NULL AFTER title');
+      await ensureColumn('author_id', 'VARCHAR(64) DEFAULT NULL AFTER title');
+      await ensureColumn('author_name', 'VARCHAR(255) DEFAULT NULL AFTER author_id');
       await ensureColumn('avatar_url', 'VARCHAR(1024) DEFAULT NULL AFTER author_name');
+      await ensureColumn('like_count', 'BIGINT UNSIGNED DEFAULT NULL AFTER avatar_url');
+      await ensureColumn('snapshot_current_read_count', 'INT UNSIGNED DEFAULT NULL AFTER reason_message');
+      await ensureColumn('snapshot_verified_read_count', 'INT UNSIGNED DEFAULT NULL AFTER snapshot_current_read_count');
+      await ensureColumn('snapshot_current_read_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_verified_read_count');
+      await ensureColumn('snapshot_verified_read_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_current_read_payload');
+      await ensureColumn('snapshot_current_like_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_verified_read_payload');
+      await ensureColumn('snapshot_verified_like_count', 'INT UNSIGNED DEFAULT NULL AFTER snapshot_current_like_payload');
+      await ensureColumn('snapshot_verified_like_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_verified_like_count');
+      await ensureColumn('repair_count', 'INT UNSIGNED NOT NULL DEFAULT 0 AFTER refund_amount_total');
     })();
   }
   return orderSnapshotColumnsReady;
@@ -610,6 +717,65 @@ const ensureBatchLinkCheckRecordTable = async (db) => {
   await batchLinkCheckRecordTableReady;
 };
 
+const ensureReplenishmentRecordTable = async (db) => {
+  if (!replenishmentRecordTableReady) {
+    replenishmentRecordTableReady = (async () => {
+      await db.execute(`
+        CREATE TABLE IF NOT EXISTS order_replenishment_records (
+          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+          replenishment_no VARCHAR(48) NOT NULL,
+          order_id BIGINT UNSIGNED NOT NULL,
+          order_no VARCHAR(40) NOT NULL,
+          batch_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+          user_id BIGINT UNSIGNED NOT NULL,
+          target_type VARCHAR(32) NOT NULL DEFAULT 'view',
+          note_id VARCHAR(64) DEFAULT NULL,
+          note_url VARCHAR(1024) DEFAULT NULL,
+          original_external_task_id VARCHAR(128) DEFAULT NULL,
+          replenishment_external_task_id VARCHAR(128) DEFAULT NULL,
+          ordered_quantity INT UNSIGNED NOT NULL DEFAULT 0,
+          actual_quantity INT UNSIGNED NOT NULL DEFAULT 0,
+          shortage_quantity INT UNSIGNED NOT NULL DEFAULT 0,
+          snapshot_before_count INT UNSIGNED DEFAULT NULL,
+          snapshot_after_count INT UNSIGNED DEFAULT NULL,
+          status VARCHAR(32) NOT NULL DEFAULT 'created',
+          reason_message VARCHAR(255) DEFAULT NULL,
+          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          PRIMARY KEY (id),
+          UNIQUE KEY uk_order_replenishment_records_no (replenishment_no),
+          KEY idx_order_replenishment_records_order_id (order_id),
+          KEY idx_order_replenishment_records_user_created_at (user_id, created_at),
+          KEY idx_order_replenishment_records_status (status)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+      `);
+
+      const ensureColumn = async (columnName, definition) => {
+        const [columns] = await db.execute(
+          `
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'order_replenishment_records'
+              AND COLUMN_NAME = ?
+          `,
+          [columnName],
+        );
+        if (columns.length === 0) {
+          await db.execute(`ALTER TABLE order_replenishment_records ADD COLUMN ${columnName} ${definition}`);
+        }
+      };
+
+      await ensureColumn('requested_at', 'DATETIME DEFAULT NULL AFTER reason_message');
+      await ensureColumn('reviewed_at', 'DATETIME DEFAULT NULL AFTER requested_at');
+      await ensureColumn('reviewed_by', 'INT UNSIGNED DEFAULT NULL AFTER reviewed_at');
+      await ensureColumn('result_json', 'LONGTEXT DEFAULT NULL AFTER reviewed_by');
+    })();
+  }
+
+  await replenishmentRecordTableReady;
+};
+
 const createCheckBatchNo = () =>
   `CHECK-${Date.now()}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
@@ -719,9 +885,12 @@ const serializeBatchOrderItem = (row) => ({
   batch_item_id: Number(row.batch_item_id) || 0,
   completed_quantity: Number(row.completed_quantity) || 0,
   created_at: row.created_at,
+  external_completed_quantity: Number(row.external_completed_quantity) || 0,
+  external_progress: Number(row.external_progress) || 0,
   external_status: row.external_status || '',
   external_task_id: row.external_task_id || '',
   id: Number(row.id),
+  like_count: row.like_count === null || row.like_count === undefined ? null : Number(row.like_count),
   note_id: row.note_id || '',
   note_url: row.note_url || '',
   order_no: row.order_no,
@@ -730,11 +899,33 @@ const serializeBatchOrderItem = (row) => ({
   payable_amount: round4(row.payable_amount),
   reason_message: row.reason_message || '',
   refund_amount: round4(row.refund_amount),
+  repair_count: Number(row.repair_count) || 0,
   record_status: row.record_status || '',
   source_note_url: row.source_note_url || row.note_url || '',
+  snapshot_current_read_count:
+    row.snapshot_current_read_count === null || row.snapshot_current_read_count === undefined
+      ? null
+      : Number(row.snapshot_current_read_count),
+  snapshot_verified_read_count:
+    row.snapshot_verified_read_count === null || row.snapshot_verified_read_count === undefined
+      ? null
+      : Number(row.snapshot_verified_read_count),
+  snapshot_verified_like_count:
+    row.snapshot_verified_like_count === null || row.snapshot_verified_like_count === undefined
+      ? null
+      : Number(row.snapshot_verified_like_count),
   target_type: normalizeTargetType(row.target_type),
   title: row.title || '',
   updated_at: row.updated_at,
+});
+
+const serializeBatchSearchOrderItem = (row) => ({
+  ...serializeBatchOrderItem(row),
+  batch_no: row.batch_no || '',
+  batch_uuid: row.batch_uuid || '',
+  matched_input: row.matched_input || '',
+  user_id: Number(row.user_id) || 0,
+  username: row.username || '',
 });
 
 const buildRawUrlMap = (rawContent) => {
@@ -752,23 +943,28 @@ const buildRawUrlMap = (rawContent) => {
 
 const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
   const batchFilter = batchIds.length > 0
-    ? `AND batch_id IN (${batchIds.map(() => '?').join(',')})`
+    ? `AND o.batch_id IN (${batchIds.map(() => '?').join(',')})`
     : '';
   const [orders] = await db.execute(
     `
-      SELECT id, batch_id, external_status, external_task_id, last_verified_at,
-        ordered_quantity, target_type
-      FROM orders
-      WHERE user_id = ?
+      SELECT o.id, o.batch_id, ob.batch_no, o.external_status, o.external_task_id,
+        o.last_verified_at, o.ordered_quantity, o.target_type, o.order_no, o.note_id,
+        o.repair_count, o.like_count, o.snapshot_current_read_count, o.snapshot_verified_read_count,
+        o.snapshot_verified_like_count,
+        nbc.author_id
+      FROM orders o
+      INNER JOIN order_batches ob ON ob.id = o.batch_id
+      LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+      WHERE o.user_id = ?
         ${batchFilter}
-        AND order_status = 'running'
-        AND external_task_id IS NOT NULL
-        AND external_task_id <> ''
-        AND reason_message IS NULL
+        AND o.order_status = 'running'
+        AND o.external_task_id IS NOT NULL
+        AND o.external_task_id <> ''
+        AND o.reason_message IS NULL
         AND EXISTS (
           SELECT 1
           FROM account_records ar
-          WHERE ar.order_id = orders.id
+          WHERE ar.order_id = o.id
             AND ar.record_type = 'order_charge'
             AND ar.status = 'success'
         )
@@ -783,48 +979,135 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
   const now = new Date();
   const affectedBatchIds = new Set();
 
-  for (const order of orders) {
+  const runStatusSync = createAsyncLimiter(getBatchCheckConcurrency());
+  await Promise.all(orders.map((order) => runStatusSync(async () => {
     let statusResult = null;
     try {
+      const externalTaskId = normalizeXhsTaskId(order.external_task_id);
+      if (!externalTaskId) {
+        await db.execute(
+          `
+            UPDATE orders
+            SET reason_message = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+          `,
+          [`Invalid XHS task id: ${order.external_task_id}`, now, order.id, userId],
+        );
+        affectedBatchIds.add(order.batch_id);
+        return;
+      }
+
       statusResult = await getXhsTaskClient().getTaskStatus(
         normalizeTargetType(order.target_type),
-        String(order.external_task_id),
+        externalTaskId,
         {
           token: createCurrentUserToken(userId),
         },
       );
     } catch {
-      continue;
+      return;
+    }
+
+    if (statusResult?.ok === false || statusResult?.body?.success === false || statusResult?.body?.code === -1) {
+      await db.execute(
+        `
+          UPDATE orders
+          SET order_status = 'failed',
+              external_status = 'failed',
+              external_progress = 0,
+              external_completed_quantity = 0,
+              completed_quantity = 0,
+              reason_message = ?,
+              updated_at = ?
+          WHERE id = ?
+            AND user_id = ?
+            AND order_status = 'running'
+        `,
+        [
+          statusResult?.body?.message || `XHS task status request failed with HTTP ${statusResult?.status || 'unknown'}`,
+          now,
+          order.id,
+          userId,
+        ],
+      );
+      affectedBatchIds.add(order.batch_id);
+      return;
     }
 
     const taskStatus = getXhsTaskStatus(statusResult?.body);
     if (![1, 2].includes(taskStatus)) {
-      continue;
+      return;
     }
     const totalCount = Math.max(getXhsTaskCount(statusResult?.body, 'total_count'), 0);
     const currentCount = Math.max(getXhsTaskCount(statusResult?.body, 'current_count'), 0);
+    const taskFinished = taskStatus === 2;
+    const countReached = totalCount > 0 && currentCount >= totalCount;
     const fallbackTotal = Math.max(Number(order.ordered_quantity) || 0, 1);
     const progressTotal = totalCount > 0 ? totalCount : fallbackTotal;
-    const completedQuantity =
-      taskStatus === 2
-        ? Number(order.ordered_quantity) || currentCount
-        : Math.min(currentCount, Number(order.ordered_quantity) || currentCount);
-    const progress =
-      taskStatus === 2
+    const orderedQuantity = Number(order.ordered_quantity) || 0;
+    const repairedViewBase =
+      normalizeTargetType(order.target_type) === 'view' &&
+      Number(order.repair_count || 0) > 0 &&
+      Number.isFinite(Number(order.snapshot_current_read_count)) &&
+      Number.isFinite(Number(order.snapshot_verified_read_count))
+        ? Math.max(
+            Number(order.snapshot_verified_read_count) - Number(order.snapshot_current_read_count),
+            0,
+          )
+        : 0;
+    const supplementalCount = taskFinished || countReached ? totalCount || currentCount : currentCount;
+    const completedQuantity = repairedViewBase > 0
+      ? Math.min(repairedViewBase + supplementalCount, orderedQuantity || repairedViewBase + supplementalCount)
+      : taskFinished || countReached
+        ? orderedQuantity || currentCount
+        : Math.min(
+            Math.round(orderedQuantity * Math.max(0, Math.min(currentCount / progressTotal, 1))),
+            orderedQuantity || currentCount,
+          );
+    const progress = orderedQuantity > 0
+      ? Math.max(0, Math.min(round4(completedQuantity / orderedQuantity), 1))
+      : taskFinished || countReached
         ? 1
         : Math.max(0, Math.min(round4(currentCount / progressTotal), 1));
+    const nextExternalStatus = taskFinished ? 'completed' : 'running';
     const verifiedAt = order.last_verified_at ? new Date(order.last_verified_at) : null;
     const canFinalize =
       taskStatus === 2 &&
       order.external_status === 'completed' &&
       verifiedAt &&
       now.getTime() - verifiedAt.getTime() >= 5 * 60 * 1000;
+    if (canFinalize && ['like', 'view'].includes(normalizeTargetType(order.target_type))) {
+      try {
+        const replenishResult = await replenishOrderIfNeeded(db, userId, order, {
+          dispatch: false,
+          now,
+        });
+        if (replenishResult.needs_replenish) {
+          affectedBatchIds.add(order.batch_id);
+          return;
+        }
+      } catch (error) {
+        await db.execute(
+          `
+            UPDATE orders
+            SET reason_message = ?,
+                updated_at = ?
+            WHERE id = ?
+              AND user_id = ?
+          `,
+          [normalizeXhsErrorMessage(error), now, order.id, userId],
+        );
+        affectedBatchIds.add(order.batch_id);
+        return;
+      }
+    }
     const nextOrderStatus = canFinalize ? 'completed' : 'running';
-    const nextExternalStatus = taskStatus === 2 ? 'completed' : 'running';
     const nextVerifiedAt =
-      taskStatus === 2 && !verifiedAt
-        ? now
-        : verifiedAt || now;
+      taskFinished
+        ? (order.external_status === 'completed' ? verifiedAt || now : now)
+        : null;
 
     await db.execute(
       `
@@ -853,7 +1136,7 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
       ],
     );
     affectedBatchIds.add(order.batch_id);
-  }
+  })));
 
   if (affectedBatchIds.size === 0) {
     return;
@@ -867,7 +1150,7 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
       SELECT
         batch_id,
         COUNT(1) AS total_count,
-        COALESCE(SUM(CASE WHEN order_status = 'running' THEN 1 ELSE 0 END), 0) AS processing_count,
+        COALESCE(SUM(CASE WHEN order_status IN ('running', 'repair_review') THEN 1 ELSE 0 END), 0) AS processing_count,
         COALESCE(SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END), 0) AS succeeded_count,
         COALESCE(SUM(CASE WHEN order_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count,
         COALESCE(SUM(CASE WHEN order_status IN ('failed', 'manual_review', 'repair_review') THEN 1 ELSE 0 END), 0) AS retryable_count
@@ -969,6 +1252,7 @@ const listBatchOrderRecords = async (userId, query = {}) => {
   const batchIds = batches.map((batch) => batch.id);
   if (!skipStatusSync) {
     await syncRunningOrdersFromXhs(db, userId, batchIds);
+    await refundFailedChargedOrders(db, userId);
   }
   await refreshBatchStats(db, userId, batchIds);
   [batches] = await db.execute(
@@ -997,7 +1281,15 @@ const listBatchOrderRecords = async (userId, query = {}) => {
           nbc.avatar_url AS cache_avatar_url
         FROM orders o
         LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
-        LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+        LEFT JOIN (
+          SELECT
+            note_id,
+            MAX(title) AS title,
+            MAX(author_name) AS author_name,
+            MAX(avatar_url) AS avatar_url
+          FROM note_basic_cache
+          GROUP BY note_id
+        ) nbc ON nbc.note_id = o.note_id
         WHERE o.batch_id IN (${placeholders})
       ) order_rows
       ORDER BY batch_id DESC, batch_item_id ASC, id ASC
@@ -1027,6 +1319,108 @@ const listBatchOrderRecords = async (userId, query = {}) => {
     page: safePage,
     page_size: safeLimit,
     total: Number(countRow.total) || 0,
+  };
+};
+
+const searchBatchOrdersByLinks = async (userId, params = {}) => {
+  const db = getPool();
+  await ensureOrderSnapshotColumns(db);
+  const parsedLinks = parseBatchSearchLinks(params.content);
+  const validLinks = parsedLinks.filter((item) => item.valid);
+  if (validLinks.length === 0) {
+    return {
+      invalid_count: parsedLinks.length,
+      items: [],
+      links: parsedLinks,
+      matched_count: 0,
+      total_count: parsedLinks.length,
+    };
+  }
+
+  const viewAll = await canViewAllAccountRecords(db, userId);
+  const urls = [...new Set(validLinks.map((item) => item.note_url).filter(Boolean))];
+  const linkWhere = [];
+  const filters = [];
+  const queryParams = [];
+
+  if (urls.length > 0) {
+    linkWhere.push(`o.note_url IN (${urls.map(() => '?').join(',')})`);
+    queryParams.push(...urls);
+    for (const url of urls) {
+      linkWhere.push('ob.raw_content LIKE ?');
+      queryParams.push(`%${url}%`);
+    }
+  }
+
+  const startDate = String(params.start_date || '').trim();
+  const endDate = String(params.end_date || '').trim();
+  if (startDate) {
+    filters.push('o.created_at >= ?');
+    queryParams.push(/^\d{4}-\d{2}-\d{2}$/.test(startDate) ? `${startDate} 00:00:00` : startDate);
+  }
+  if (endDate) {
+    filters.push('o.created_at <= ?');
+    queryParams.push(/^\d{4}-\d{2}-\d{2}$/.test(endDate) ? `${endDate} 23:59:59` : endDate);
+  }
+  if (!viewAll) {
+    filters.push('o.user_id = ?');
+    queryParams.push(userId);
+  }
+  const filterSql = filters.length > 0 ? `AND ${filters.join(' AND ')}` : '';
+
+  const [rows] = await db.execute(
+    `
+      SELECT
+        o.*,
+        ob.batch_no,
+        ob.batch_id AS batch_uuid,
+        ob.raw_content,
+        ar.actual_paid_amount,
+        ar.payable_amount,
+        ar.refund_amount,
+        ar.status AS record_status,
+        u.username,
+        nbc.title AS cache_title,
+        nbc.author_name AS cache_author_name,
+        nbc.avatar_url AS cache_avatar_url
+      FROM orders o
+      INNER JOIN order_batches ob ON ob.id = o.batch_id
+      LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
+      LEFT JOIN users u ON u.id = o.user_id
+      LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+      WHERE (${linkWhere.join(' OR ')})
+        ${filterSql}
+      ORDER BY o.id DESC
+      LIMIT 500
+    `,
+    queryParams,
+  );
+
+  const resultRows = rows.flatMap((row) => {
+    const rawUrlMap = buildRawUrlMap(row.raw_content);
+    const sourceUrl = rawUrlMap.get(Number(row.batch_item_id)) || row.note_url;
+    const matchedLink =
+      validLinks.find((item) => item.note_url === row.note_url || item.note_url === sourceUrl) ||
+      null;
+    if (!matchedLink) {
+      return [];
+    }
+    return [serializeBatchSearchOrderItem({
+      ...row,
+      author_name: row.author_name || row.cache_author_name,
+      avatar_url: row.avatar_url || row.cache_avatar_url,
+      matched_input: matchedLink?.raw || '',
+      source_note_url: sourceUrl,
+      title: row.title || row.cache_title,
+    })];
+  });
+
+  return {
+    invalid_count: parsedLinks.filter((item) => !item.valid).length,
+    items: resultRows,
+    links: parsedLinks,
+    matched_count: resultRows.length,
+    total_count: parsedLinks.length,
   };
 };
 
@@ -1148,6 +1542,8 @@ const listConsumptionRecords = async (userId, query = {}) => {
         o.batch_id,
         o.id AS order_id,
         o.order_status,
+        o.external_status,
+        o.repair_count,
         o.refund_requested_at,
         o.refund_amount_total,
         o.refunded_quantity AS order_refunded_quantity,
@@ -1220,7 +1616,9 @@ const listConsumptionRecords = async (userId, query = {}) => {
           order_id: Number(item.order_id),
           order_no: item.order_no,
           order_status: item.order_status || 'running',
+          external_status: item.external_status || '',
           ordered_quantity: Number(item.ordered_quantity) || 0,
+          repair_count: Number(item.repair_count) || 0,
           refund_amount: round4(item.refund_amount_total ?? item.refund_amount),
           refund_requested_at: item.refund_requested_at || null,
           refunded_quantity: Number(item.order_refunded_quantity ?? item.refunded_quantity) || 0,
@@ -1313,11 +1711,12 @@ const requestOrderRefund = async (userId, orderId) => {
     throw error;
   }
 
-  if (order.external_task_id) {
+  const externalTaskId = normalizeXhsTaskId(order.external_task_id);
+  if (externalTaskId) {
     await getXhsTaskClient().updateTaskStatus(
       normalizeTargetType(order.target_type),
       {
-        id: Number(order.external_task_id) || order.external_task_id,
+        id: Number(externalTaskId),
         reason: `goods_order=${order.order_no} refund requested`,
         status: 3,
       },
@@ -1362,6 +1761,7 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
     throw error;
   }
 
+  await ensureReplenishmentRecordTable(db);
   const connection = await db.getConnection();
   const now = new Date();
   try {
@@ -1391,21 +1791,102 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
     }
 
     if (!approved) {
-      await connection.execute(
-        `
-          UPDATE orders
-          SET order_status = 'refund_rejected',
-              reason_message = ?,
-              updated_at = ?
-          WHERE id = ?
-        `,
-        [reason || '退款审核拒绝', now, targetOrderId],
-      );
+      let nextStatus = 'running';
+      let nextReason = reason || '退款审核拒绝，继续处理';
+      let completedQuantityAfterReject = null;
+      let replenishmentRequest = null;
+
+      if (['like', 'view'].includes(normalizeTargetType(order.target_type))) {
+        try {
+          const checkResult = await replenishOrderIfNeeded(connection, order.user_id, order, {
+            dispatch: false,
+            now,
+          });
+          if (checkResult?.needs_replenish) {
+            nextStatus = 'repair_review';
+            nextReason = `退款被拒绝后复查未完成，需补单 ${checkResult.replenish_quantity}`;
+            const [[checkedOrder]] = await connection.execute(
+              'SELECT * FROM orders WHERE id = ? LIMIT 1',
+              [targetOrderId],
+            );
+            replenishmentRequest = await createPendingReplenishmentForOrder(
+              connection,
+              {
+                ...order,
+                ...checkedOrder,
+                completed_quantity: checkResult.achieved_quantity,
+                external_completed_quantity: checkResult.achieved_quantity,
+                reason_message: nextReason,
+              },
+              nextReason,
+              now,
+            );
+          } else if (
+            checkResult?.checked &&
+            Number(checkResult.replenish_quantity) === 0 &&
+            Number.isFinite(Number(checkResult.achieved_quantity))
+          ) {
+            nextStatus = 'completed';
+            const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
+            completedQuantityAfterReject = Math.min(
+              Math.max(Number(checkResult.achieved_quantity) || 0, 0),
+              orderedQuantity,
+            );
+          }
+        } catch (error) {
+          nextReason = `${nextReason}; 补单复查失败: ${normalizeXhsErrorMessage(error)}`;
+        }
+      }
+
+      if (nextStatus === 'completed') {
+        await connection.execute(
+          `
+            UPDATE orders
+            SET order_status = 'completed',
+                external_status = 'completed',
+                external_progress = 1,
+                external_completed_quantity = ?,
+                completed_quantity = ?,
+                reason_message = ?,
+                updated_at = ?
+            WHERE id = ?
+          `,
+          [
+            completedQuantityAfterReject,
+            completedQuantityAfterReject,
+            nextReason,
+            now,
+            targetOrderId,
+          ],
+        );
+      } else if (nextStatus === 'running') {
+        await connection.execute(
+          `
+            UPDATE orders
+            SET order_status = 'running',
+                reason_message = ?,
+                updated_at = ?
+            WHERE id = ?
+          `,
+          [nextReason, now, targetOrderId],
+        );
+      } else {
+        await connection.execute(
+          `
+            UPDATE orders
+            SET reason_message = ?,
+                updated_at = ?
+            WHERE id = ?
+          `,
+          [nextReason, now, targetOrderId],
+        );
+      }
       await connection.commit();
       return {
         order_id: targetOrderId,
         order_no: order.order_no,
-        order_status: 'refund_rejected',
+        order_status: nextStatus,
+        replenishment_request_id: replenishmentRequest?.id || null,
         refunded_amount: 0,
       };
     }
@@ -1435,21 +1916,41 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
       Number(order.external_completed_quantity) || 0,
       Number(order.completed_quantity) || 0,
     );
+    const targetType = normalizeTargetType(order.target_type);
+    const isRepairedMeasuredOrder =
+      Number(order.repair_count || 0) > 0 && ['like', 'view'].includes(targetType);
+    let repairedActualChecked = false;
 
-    if (order.external_task_id) {
+    if (isRepairedMeasuredOrder) {
+      try {
+        const actualResult = await replenishOrderIfNeeded(connection, order.user_id, order, {
+          dispatch: false,
+          now,
+        });
+        if (Number.isFinite(Number(actualResult?.achieved_quantity))) {
+          completedQuantity = Math.max(completedQuantity, Number(actualResult.achieved_quantity));
+          repairedActualChecked = true;
+        }
+      } catch {
+        // Keep locally synced progress if the actual count check is unavailable during review.
+      }
+    }
+
+    const externalTaskId = normalizeXhsTaskId(order.external_task_id);
+    if (externalTaskId) {
       try {
         const statusResult = await getXhsTaskClient().getTaskStatus(
-          normalizeTargetType(order.target_type),
-          String(order.external_task_id),
+          targetType,
+          externalTaskId,
           {
             token: createCurrentUserToken(order.user_id),
           },
         );
         const taskStatus = getXhsTaskStatus(statusResult?.body);
         const upstreamCurrentCount = getXhsTaskCount(statusResult?.body, 'current_count');
-        if (taskStatus === 2) {
+        if (taskStatus === 2 && !repairedActualChecked) {
           completedQuantity = orderedQuantity;
-        } else if (taskStatus === 1) {
+        } else if (taskStatus === 1 && !repairedActualChecked) {
           completedQuantity = Math.max(completedQuantity, upstreamCurrentCount);
         }
       } catch {
@@ -1463,9 +1964,33 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
       orderedQuantity > 0 ? round4((paidAmount * refundableQuantity) / orderedQuantity) : 0;
     const refundAmount = round4(Math.max(grossRefundAmount - refundedAmount, 0));
     if (refundAmount <= 0) {
-      const error = new Error('No refundable amount');
-      error.statusCode = 400;
-      throw error;
+      const noRefundReason = '无可退款金额';
+      await connection.execute(
+        `
+          UPDATE orders
+          SET order_status = 'refund_rejected',
+              completed_quantity = ?,
+              external_completed_quantity = ?,
+              reason_message = ?,
+              updated_at = ?
+          WHERE id = ?
+        `,
+        [
+          completedQuantity,
+          completedQuantity,
+          noRefundReason,
+          now,
+          targetOrderId,
+        ],
+      );
+      await connection.commit();
+      return {
+        order_id: targetOrderId,
+        order_no: order.order_no,
+        order_status: 'refund_rejected',
+        refunded_amount: 0,
+        reason_message: noRefundReason,
+      };
     }
 
     const [[balance]] = await connection.execute(
@@ -1644,7 +2169,15 @@ const listRefundRecords = async (userId, query = {}) => {
     FROM orders o
     LEFT JOIN order_batches ob ON ob.id = o.batch_id
     LEFT JOIN users u ON u.id = o.user_id
-    LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+    LEFT JOIN (
+      SELECT
+        note_id,
+        MAX(title) AS title,
+        MAX(author_name) AS author_name,
+        MAX(avatar_url) AS avatar_url
+      FROM note_basic_cache
+      GROUP BY note_id
+    ) nbc ON nbc.note_id = o.note_id
     LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
     LEFT JOIN (
       SELECT order_id, MAX(id) AS refund_record_id
@@ -1656,7 +2189,7 @@ const listRefundRecords = async (userId, query = {}) => {
     WHERE ${where.join(' AND ')}
   `;
 
-  const [[countRow]] = await db.execute(`SELECT COUNT(1) AS total ${fromSql}`, params);
+  const [[countRow]] = await db.execute(`SELECT COUNT(DISTINCT o.id) AS total ${fromSql}`, params);
   const [rows] = await db.execute(
     `
       SELECT
@@ -1827,6 +2360,100 @@ const requestNoteBasic = async (params) => {
   };
 };
 
+const normalizeNoteLikeCountResponse = (payload) => {
+  const data = payload?.data ?? payload?.result ?? payload;
+  const likeCount = findFirstNumberByKey(
+    data,
+    /^(like|likes|liked|like_count|likes_count|likes_num|liked_count|likedCount|likeCount|note_likes|digg_count|diggCount)$/i,
+  );
+  return likeCount === null ? null : Math.max(Math.floor(likeCount), 0);
+};
+
+const normalizeNoteRealtimeViewCountResponse = (payload) => {
+  const data = payload?.data ?? payload?.result ?? payload;
+  const viewCount = findFirstNumberByKey(
+    data,
+    /^(view|views|view_num|viewNum|views_num|view_count|viewCount|read_count|readCount|browse_count|browseCount|play_count|playCount)$/i,
+  );
+  return viewCount === null ? null : Math.max(Math.floor(viewCount), 0);
+};
+
+const requestNoteLikeCount = async ({ note_id: noteId } = {}) => {
+  const apiUrl = new URL(NOTE_LIKES_API);
+  if (noteId) {
+    apiUrl.searchParams.set('note_id', noteId);
+  }
+  apiUrl.searchParams.set('proxy_line', 'line_1070');
+
+  try {
+    console.log(`GET ${apiUrl.toString()} [like_count]`);
+    const response = await fetch(apiUrl, {
+      headers: {
+        accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+    const payload = await response.json().catch(() => null);
+    console.log('RESPONSE note like count', JSON.stringify(payload, null, 2));
+
+    if (!response.ok) {
+      return {
+        like_count: null,
+        payload,
+      };
+    }
+
+    return {
+      like_count: normalizeNoteLikeCountResponse(payload),
+      payload,
+    };
+  } catch (error) {
+    console.log('RESPONSE note like count error', error?.message || String(error));
+    return {
+      like_count: null,
+      payload: null,
+    };
+  }
+};
+
+const requestNoteRealtimeViewCount = async ({ note_id: noteId } = {}) => {
+  const apiUrl = new URL(NOTE_REALTIME_API);
+  if (noteId) {
+    apiUrl.searchParams.set('note_id', noteId);
+  }
+  apiUrl.searchParams.set('proxy_line', 'line_1070');
+
+  try {
+    console.log(`GET ${apiUrl.toString()} [view_realtime]`);
+    const response = await fetch(apiUrl, {
+      headers: {
+        accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(15_000),
+    });
+    const payload = await response.json().catch(() => null);
+    console.log('RESPONSE note realtime view', JSON.stringify(payload, null, 2));
+
+    if (!response.ok) {
+      return {
+        payload,
+        view_count: null,
+      };
+    }
+
+    return {
+      payload,
+      view_count: normalizeNoteRealtimeViewCountResponse(payload),
+    };
+  } catch (error) {
+    console.log('RESPONSE note realtime view error', error?.message || String(error));
+    return {
+      payload: null,
+      view_count: null,
+    };
+  }
+};
+
 const normalizeNoteIdResponse = (payload) => {
   const data = payload?.data ?? payload?.result ?? payload;
   if (!data || (payload?.code !== undefined && payload.code !== 0)) {
@@ -1964,6 +2591,327 @@ const parseBatchContent = (content) => {
 };
 
 // 获取系统配置中的数值类型
+const getTinydataPreviewToken = () => {
+  const rawToken = String(process.env.TINYDATA_PREVIEW_TOKEN || '').trim();
+  if (!rawToken) {
+    const error = new Error('Tinydata preview token is not configured');
+    error.statusCode = 500;
+    throw error;
+  }
+  return rawToken.replace(/^Bearer\s+/i, '');
+};
+
+const getTinydataPreviewTargetType = (targetType) => {
+  const normalizedTargetType = normalizeTargetType(targetType);
+  return normalizedTargetType === 'like' ? 'view' : normalizedTargetType;
+};
+
+const normalizeBatchInputContent = (content) =>
+  String(content || '')
+    .replace(/\\r\\n/g, '\n')
+    .replace(/\\n/g, '\n')
+    .replace(/\\t/g, '\t');
+
+const getPreviewLines = (content) =>
+  normalizeBatchInputContent(content)
+    .split(/\r?\n/)
+    .map((line, index) => ({
+      is_link: /^https?:\/\/\S+/i.test(line.trim().split(/\s+/)[0] || ''),
+      line_no: index + 1,
+      raw: line.trim(),
+    }))
+    .filter((line) => line.raw);
+
+const requestTinydataPreviewWithPowershell = async ({ content, targetType }) => {
+  const requestBody = JSON.stringify({
+    content: normalizeBatchInputContent(content),
+    target_type: getTinydataPreviewTargetType(targetType),
+  });
+  const script = [
+    '$headers = @{ Authorization = $env:TINYDATA_AUTH_HEADER }',
+    '$response = Invoke-RestMethod -Uri $env:TINYDATA_PREVIEW_URL -Method Post -ContentType "application/json" -Headers $headers -Body $env:TINYDATA_REQUEST_BODY',
+    '$response | ConvertTo-Json -Depth 20 -Compress',
+  ].join('; ');
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    {
+      env: {
+        ...process.env,
+        TINYDATA_AUTH_HEADER: `Bearer ${getTinydataPreviewToken()}`,
+        TINYDATA_PREVIEW_URL: TINYDATA_PREVIEW_API,
+        TINYDATA_REQUEST_BODY: requestBody,
+      },
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: Number(process.env.TINYDATA_PREVIEW_TIMEOUT_MS) || 30_000,
+      windowsHide: true,
+    },
+  );
+  return JSON.parse(stdout);
+};
+
+const requestTinydataPreviewJobWithPowershell = async (jobId) => {
+  const script = [
+    '$headers = @{ Authorization = $env:TINYDATA_AUTH_HEADER }',
+    '$response = Invoke-RestMethod -Uri ($env:TINYDATA_PREVIEW_JOB_URL + $env:TINYDATA_PREVIEW_JOB_ID) -Method Get -Headers $headers',
+    '$response | ConvertTo-Json -Depth 20 -Compress',
+  ].join('; ');
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script],
+    {
+      env: {
+        ...process.env,
+        TINYDATA_AUTH_HEADER: `Bearer ${getTinydataPreviewToken()}`,
+        TINYDATA_PREVIEW_JOB_ID: String(jobId || ''),
+        TINYDATA_PREVIEW_JOB_URL: TINYDATA_PREVIEW_JOB_API,
+      },
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: Number(process.env.TINYDATA_PREVIEW_TIMEOUT_MS) || 30_000,
+      windowsHide: true,
+    },
+  );
+  return JSON.parse(stdout);
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const requestTinydataPreviewJob = async (jobId) => {
+  const jobUrl = new URL(String(jobId), TINYDATA_PREVIEW_JOB_API).toString();
+  try {
+    const response = await fetch(jobUrl, {
+      headers: {
+        Authorization: `Bearer ${getTinydataPreviewToken()}`,
+      },
+      method: 'GET',
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok || body?.code !== 'OK') {
+      const error = new Error(body?.message || `Tinydata preview job failed with HTTP ${response.status}`);
+      error.statusCode = response.ok ? 400 : response.status;
+      error.details = body;
+      throw error;
+    }
+    return body;
+  } catch (error) {
+    if (error?.cause?.code === 'ECONNRESET' || error?.message === 'fetch failed') {
+      return requestTinydataPreviewJobWithPowershell(jobId);
+    }
+    throw error;
+  }
+};
+
+const resolveTinydataPreviewAsyncJob = async (body) => {
+  const jobId = body?.data?.job_id;
+  if (!body?.data?.async || !jobId) {
+    return body;
+  }
+
+  const timeoutMs = Number(process.env.TINYDATA_PREVIEW_ASYNC_TIMEOUT_MS) || 60_000;
+  const intervalMs = Number(process.env.TINYDATA_PREVIEW_ASYNC_INTERVAL_MS) || 1000;
+  const deadline = Date.now() + timeoutMs;
+  let latestBody = body;
+
+  while (Date.now() < deadline) {
+    await sleep(intervalMs);
+    latestBody = await requestTinydataPreviewJob(jobId);
+    const status = String(latestBody?.data?.status || '').toLowerCase();
+    if (status === 'succeeded' || Array.isArray(latestBody?.data?.items)) {
+      return latestBody;
+    }
+    if (status === 'failed') {
+      const error = new Error(latestBody?.message || 'Tinydata preview async job failed');
+      error.statusCode = 400;
+      error.details = latestBody;
+      throw error;
+    }
+  }
+
+  const error = new Error('Tinydata preview async job timeout');
+  error.statusCode = 504;
+  error.details = latestBody;
+  throw error;
+};
+
+const requestTinydataPreview = async ({ content, targetType }) => {
+  const previewLines = getPreviewLines(content);
+  const linkLines = previewLines.filter((line) => line.is_link);
+  const invalidLines = previewLines.filter((line) => !line.is_link);
+  console.log('[Tinydata Preview] input', JSON.stringify({
+    invalid_lines: invalidLines.length,
+    line_count: previewLines.length,
+    link_lines: linkLines.length,
+    target_type: getTinydataPreviewTargetType(targetType),
+  }));
+  if (linkLines.length === 0) {
+    return { invalid_lines: invalidLines, items: [], source_lines: [] };
+  }
+  const previewContent = linkLines.map((line) => line.raw).join('\n');
+  const controller = new AbortController();
+  const timeout = setTimeout(
+    () => controller.abort(),
+    Number(process.env.TINYDATA_PREVIEW_TIMEOUT_MS) || 30_000,
+  );
+
+  try {
+    const response = await fetch(TINYDATA_PREVIEW_API, {
+      body: JSON.stringify({
+        content: previewContent,
+        target_type: getTinydataPreviewTargetType(targetType),
+      }),
+      headers: {
+        Authorization: `Bearer ${getTinydataPreviewToken()}`,
+        'Content-Type': 'application/json',
+      },
+      method: 'POST',
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok || body?.code !== 'OK') {
+      const error = new Error(body?.message || `Tinydata preview failed with HTTP ${response.status}`);
+      error.statusCode = response.ok ? 400 : response.status;
+      error.details = body;
+      throw error;
+    }
+    console.log('[Tinydata Preview] response', JSON.stringify({
+      code: body?.code,
+      item_count: Array.isArray(body?.data?.items) ? body.data.items.length : 0,
+      message: body?.message,
+    }));
+    const resolvedBody = await resolveTinydataPreviewAsyncJob(body);
+    console.log('[Tinydata Preview] response', JSON.stringify({
+      async: Boolean(resolvedBody?.data?.async),
+      code: resolvedBody?.code,
+      item_count: Array.isArray(resolvedBody?.data?.items) ? resolvedBody.data.items.length : 0,
+      job_id: resolvedBody?.data?.job_id || body?.data?.job_id,
+      message: resolvedBody?.message,
+      status: resolvedBody?.data?.status,
+    }));
+    return { ...(resolvedBody?.data || {}), invalid_lines: invalidLines, source_lines: linkLines };
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      const timeoutError = new Error('Tinydata preview request timeout');
+      timeoutError.statusCode = 504;
+      throw timeoutError;
+    }
+    if (error?.cause?.code === 'ECONNRESET' || error?.message === 'fetch failed') {
+      const body = await requestTinydataPreviewWithPowershell({ content: previewContent, targetType });
+      if (body?.code !== 'OK') {
+        const previewError = new Error(body?.message || 'Tinydata preview failed');
+        previewError.statusCode = 400;
+        previewError.details = body;
+        throw previewError;
+      }
+      console.log('[Tinydata Preview] response', JSON.stringify({
+        code: body?.code,
+        item_count: Array.isArray(body?.data?.items) ? body.data.items.length : 0,
+        message: body?.message,
+      }));
+      const resolvedBody = await resolveTinydataPreviewAsyncJob(body);
+      console.log('[Tinydata Preview] response', JSON.stringify({
+        async: Boolean(resolvedBody?.data?.async),
+        code: resolvedBody?.code,
+        item_count: Array.isArray(resolvedBody?.data?.items) ? resolvedBody.data.items.length : 0,
+        job_id: resolvedBody?.data?.job_id || body?.data?.job_id,
+        message: resolvedBody?.message,
+        status: resolvedBody?.data?.status,
+      }));
+      return { ...(resolvedBody?.data || {}), invalid_lines: invalidLines, source_lines: linkLines };
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const normalizeTinydataPreviewItems = (previewData) => {
+  const items = Array.isArray(previewData?.items) ? previewData.items : [];
+  const invalidItems = (Array.isArray(previewData?.invalid_lines) ? previewData.invalid_lines : [])
+    .map((line) => ({
+      avatar_url: '',
+      duplicate: false,
+      errors: ['链接格式不正确'],
+      line_no: Number(line.line_no) || 0,
+      note_id: '',
+      note_url: String(line.raw || '').split(/\s+/)[0] || '',
+      ordered_quantity: 0,
+      raw: String(line.raw || ''),
+      resolved_note_url: '',
+      valid: false,
+    }));
+  const sourceLines = Array.isArray(previewData?.source_lines) ? previewData.source_lines : [];
+  const tinydataItems = items.map((item, index) => {
+    const sourceLine = sourceLines[index] || {};
+    const raw = String(sourceLine.raw || item.raw_line || item.raw || '').trim();
+    const noteId = String(item.note_id || '').trim();
+    const noteUrl = noteId
+      ? `https://www.xiaohongshu.com/explore/${noteId}`
+      : String(item.normalized_url || item.raw_url || item.note_url || '').trim();
+    const orderedQuantity = Number(item.target_quantity ?? item.ordered_quantity ?? item.quantity);
+    const errors = [];
+    if (item.message) {
+      errors.push(String(item.message));
+    }
+    if (!item.valid && errors.length === 0) {
+      errors.push('Tinydata preview validation failed');
+    }
+    if (item.valid && !noteId) {
+      errors.push('Tinydata preview response missing note_id');
+    }
+
+    return {
+      avatar_url: '',
+      duplicate: false,
+      errors,
+      line_no: Number(sourceLine.line_no || item.line_no) || index + 1,
+      note_id: noteId,
+      note_url: noteUrl,
+      ordered_quantity: Number.isInteger(orderedQuantity) && orderedQuantity > 0 ? orderedQuantity : 0,
+      raw,
+      resolved_note_url: noteUrl,
+      valid: Boolean(item.valid) && errors.length === 0,
+    };
+  });
+  return [...invalidItems, ...tinydataItems].sort((left, right) => left.line_no - right.line_no);
+};
+
+const parseBatchSearchLinks = (content) => {
+  const lines = String(content || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const seenKeys = new Set();
+
+  return lines.map((line, index) => {
+    const [noteUrl = ''] = line.split(/\s+/);
+    const noteId = extractNoteId(noteUrl);
+    const errors = [];
+
+    if (!/^https?:\/\/\S+/i.test(noteUrl)) {
+      errors.push('链接格式不正确');
+    }
+
+    const key = noteId || noteUrl;
+    const duplicate = Boolean(key) && seenKeys.has(key);
+    if (duplicate) {
+      errors.push('链接重复');
+    }
+    if (key && !duplicate) {
+      seenKeys.add(key);
+    }
+
+    return {
+      duplicate,
+      errors,
+      line_no: index + 1,
+      note_id: noteId,
+      note_url: noteUrl,
+      raw: line,
+      valid: errors.length === 0,
+    };
+  });
+};
+
 const getNumericConfig = async (db, group, key, defaultValue) => {
   const [[row]] = await db.execute(
     `
@@ -1993,7 +2941,11 @@ const getUserOrderContext = async (db, userId, targetType) => {
   const [[user]] = await db.execute(
     `
       SELECT id, discount_rate, impression_discount_rate, price_mode, impression_price_mode,
-        fixed_unit_price, impression_fixed_unit_price
+        fixed_unit_price, impression_fixed_unit_price,
+        quantity_price_base, quantity_price_amount,
+        impression_quantity_price_base, impression_quantity_price_amount,
+        like_discount_rate, like_price_mode, like_fixed_unit_price,
+        like_quantity_price_base, like_quantity_price_amount
       FROM users
       WHERE id = ?
       LIMIT 1
@@ -2024,28 +2976,111 @@ const getUserOrderContext = async (db, userId, targetType) => {
   const mode =
     targetType === 'impression'
       ? user.impression_price_mode || 'discount'
+      : targetType === 'like'
+        ? user.like_price_mode || user.price_mode || 'discount'
       : user.price_mode || 'discount';
   const rawDiscountRate =
-    targetType === 'impression' ? user.impression_discount_rate : user.discount_rate;
+    targetType === 'impression'
+      ? user.impression_discount_rate
+      : targetType === 'like'
+        ? user.like_discount_rate ?? user.discount_rate
+      : user.discount_rate;
   const fixedUnitPrice =
-    targetType === 'impression' ? user.impression_fixed_unit_price : user.fixed_unit_price;
+    targetType === 'impression'
+      ? user.impression_fixed_unit_price
+      : targetType === 'like'
+        ? user.like_fixed_unit_price ?? user.fixed_unit_price
+      : user.fixed_unit_price;
+  const quantityPriceBase =
+    targetType === 'impression'
+      ? user.impression_quantity_price_base
+      : targetType === 'like'
+        ? user.like_quantity_price_base ?? user.quantity_price_base
+      : user.quantity_price_base;
+  const quantityPriceAmount =
+    targetType === 'impression'
+      ? user.impression_quantity_price_amount
+      : targetType === 'like'
+        ? user.like_quantity_price_amount ?? user.quantity_price_amount
+      : user.quantity_price_amount;
   const userUnitPrice = Number(fixedUnitPrice) > 0 ? round4(fixedUnitPrice) : configuredUnitPrice;
-  const unitPrice = mode === 'discount' ? configuredUnitPrice : userUnitPrice;
+  const packageAmount = Number(quantityPriceAmount) > 0 ? round4(quantityPriceAmount) : userUnitPrice;
+  const packageBaseQuantity = Number(quantityPriceBase) > 0 ? Number(quantityPriceBase) : 1;
+  const unitPrice = mode === 'discount' ? configuredUnitPrice : packageAmount;
   const discountRate = mode === 'default' ? 1 : normalizeDiscountRate(rawDiscountRate);
   const discountedUnitPrice =
     mode === 'fixed'
       ? userUnitPrice
+      : mode === 'quantity'
+        ? packageAmount
       : round4(unitPrice * discountRate);
 
   return {
     availableBalance: round4(balance?.available_amount),
     discountRate: unitPrice > 0 ? round4(discountedUnitPrice / unitPrice) : discountRate,
     discountedUnitPrice,
+    priceBaseQuantity: mode === 'quantity' ? packageBaseQuantity : 1,
+    priceMode: mode,
     unitPrice: round4(unitPrice),
   };
 };
 
+const calculateOrderAmounts = (context, orderedQuantity) => {
+  const quantity = Number(orderedQuantity) || 0;
+  if (context.priceMode === 'quantity') {
+    const baseQuantity = Math.max(Number(context.priceBaseQuantity) || 1, 1);
+    const originalAmount = round4((quantity / baseQuantity) * context.unitPrice);
+    const payableAmount = round4((quantity / baseQuantity) * context.discountedUnitPrice);
+    return {
+      discountAmount: round4(Math.max(originalAmount - payableAmount, 0)),
+      originalAmount,
+      payableAmount,
+    };
+  }
+
+  const originalAmount = context.unitPrice;
+  const payableAmount = context.discountedUnitPrice;
+  return {
+    discountAmount: round4(Math.max(originalAmount - payableAmount, 0)),
+    originalAmount,
+    payableAmount,
+  };
+};
+
 // 构建订单预览
+const findActiveNoteOrderConflicts = async (db, targetType, noteIds) => {
+  const uniqueNoteIds = [...new Set(noteIds.filter(Boolean))];
+  if (uniqueNoteIds.length === 0) {
+    return new Map();
+  }
+
+  const notePlaceholders = uniqueNoteIds.map(() => '?').join(',');
+  const statusPlaceholders = ACTIVE_NOTE_ORDER_STATUSES.map(() => '?').join(',');
+  const [rows] = await db.execute(
+    `
+      SELECT id, order_no, note_id, order_status
+      FROM orders
+      WHERE target_type = ?
+        AND note_id IN (${notePlaceholders})
+        AND order_status IN (${statusPlaceholders})
+      ORDER BY id ASC
+    `,
+    [targetType, ...uniqueNoteIds, ...ACTIVE_NOTE_ORDER_STATUSES],
+  );
+
+  const conflicts = new Map();
+  for (const row of rows) {
+    if (!conflicts.has(row.note_id)) {
+      conflicts.set(row.note_id, {
+        id: Number(row.id),
+        order_no: row.order_no,
+        order_status: row.order_status,
+      });
+    }
+  }
+  return conflicts;
+};
+
 const buildPreview = async (
   userId,
   { content, target_type: targetTypeValue },
@@ -2054,10 +3089,11 @@ const buildPreview = async (
   const db = getPool();
   const targetType = normalizeTargetType(targetTypeValue);
   const context = await getUserOrderContext(db, userId, targetType);
-  const parsedItems = parseBatchContent(content);
+  const tinydataPreview = await requestTinydataPreview({ content, targetType });
+  const previewItems = normalizeTinydataPreviewItems(tinydataPreview);
   const seenResolvedNoteIds = new Set();
   const runExternalCheck = createAsyncLimiter(getBatchCheckConcurrency());
-  const items = await Promise.all(parsedItems.map(async (item) => {
+  const items = await Promise.all(previewItems.map(async (item) => {
     const errors = [...item.errors];
     let noteId = item.note_id;
     let resolvedNoteUrl = item.note_url;
@@ -2100,12 +3136,23 @@ const buildPreview = async (
       }
     }
 
-    const originalAmount = context.unitPrice;
-    const payableAmount = context.discountedUnitPrice;
+    const { discountAmount, originalAmount, payableAmount } = calculateOrderAmounts(
+      context,
+      item.ordered_quantity,
+    );
+    let likeCount = null;
     if (item.valid && !noteBasic) {
       // The note lookup error has already been appended above.
     }
     const valid = errors.length === 0;
+    if (valid && targetType === 'like') {
+      const likeCountResult = await runExternalCheck(() =>
+        requestNoteLikeCount({
+          note_id: noteBasic?.note_id || noteId,
+        }),
+      );
+      likeCount = likeCountResult.like_count;
+    }
 
     return {
       ...item,
@@ -2115,14 +3162,34 @@ const buildPreview = async (
       cache_hit: Boolean(noteBasic?.cache_hit),
       duplicate: errors.includes('链接重复'),
       errors,
+      like_count: likeCount,
       note_id: noteBasic?.note_id || noteId,
       resolved_note_url: resolvedNoteUrl,
       title: noteBasic?.title || '',
       valid,
-      discount_amount: valid ? round4(Math.max(originalAmount - payableAmount, 0)) : 0,
+      discount_amount: valid ? discountAmount : 0,
+      original_amount: valid ? round4(originalAmount) : 0,
       payable_amount: valid ? round4(payableAmount) : 0,
     };
   }));
+
+  const activeConflicts = await findActiveNoteOrderConflicts(
+    db,
+    targetType,
+    items.filter((item) => item.valid).map((item) => item.note_id),
+  );
+  for (const item of items) {
+    const conflict = item.valid ? activeConflicts.get(item.note_id) : null;
+    if (conflict) {
+      item.valid = false;
+      item.payable_amount = 0;
+      item.discount_amount = 0;
+      item.errors = [
+        ...item.errors,
+        `${getTargetTypeLabel(targetType)}任务正在处理中，不能重复下单（订单ID：${conflict.id}）`,
+      ];
+    }
+  }
 
   const validItems = items.filter((item) => item.valid);
   const totalAmount = round4(validItems.reduce((sum, item) => sum + item.payable_amount, 0));
@@ -2152,6 +3219,8 @@ const buildPreview = async (
     discounted_unit_price: context.discountedUnitPrice,
     invalid_count: items.length - validItems.length,
     items,
+    price_base_quantity: context.priceBaseQuantity,
+    price_mode: context.priceMode,
     target_type: targetType,
     total_amount: totalAmount,
     total_count: items.length,
@@ -2186,7 +3255,7 @@ const createOrderChargeRecord = async (
       orderNo,
       item.ordered_quantity,
       preview.unit_price,
-      preview.unit_price,
+      item.original_amount ?? preview.unit_price,
       preview.discount_rate,
       preview.discounted_unit_price,
       item.discount_amount,
@@ -2347,7 +3416,7 @@ const refreshBatchStats = async (db, userId, batchIds) => {
       SELECT
         batch_id,
         COUNT(1) AS total_count,
-        COALESCE(SUM(CASE WHEN order_status = 'running' THEN 1 ELSE 0 END), 0) AS processing_count,
+        COALESCE(SUM(CASE WHEN order_status IN ('running', 'repair_review') THEN 1 ELSE 0 END), 0) AS processing_count,
         COALESCE(SUM(CASE WHEN order_status = 'completed' THEN 1 ELSE 0 END), 0) AS succeeded_count,
         COALESCE(SUM(CASE WHEN order_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_count
       FROM orders
@@ -2401,6 +3470,625 @@ const refreshBatchStats = async (db, userId, batchIds) => {
   }
 };
 
+const collectSubmitSnapshots = async (targetType, items) => {
+  if (!['like', 'view'].includes(targetType)) {
+    return new Map();
+  }
+
+  const snapshotEntries = await Promise.all(
+    items.map(async (item) => {
+      const result = targetType === 'like'
+        ? await requestNoteLikeCount({ note_id: item.note_id })
+        : await requestNoteRealtimeViewCount({ note_id: item.note_id });
+      return [
+        item.line_no,
+        {
+          payload: result.payload ? JSON.stringify(result.payload).slice(0, 8000) : null,
+          like_count: result.like_count,
+          view_count: result.view_count,
+        },
+      ];
+    }),
+  );
+  return new Map(snapshotEntries);
+};
+
+const buildReplenishItem = (order, quantity) => ({
+  author_id: order.author_id || '',
+  note_id: order.note_id,
+  ordered_quantity: quantity,
+});
+
+const markOrderNeedsReplenish = async (
+  db,
+  userId,
+  order,
+  {
+    achievedQuantity,
+    latest,
+    payloadColumn,
+    payloadText,
+    progress,
+    replenishQuantity,
+    verifiedColumn,
+    now,
+  },
+) => {
+  await db.execute(
+    `
+      UPDATE orders
+      SET order_status = 'repair_review',
+          external_status = 'completed',
+          external_progress = ?,
+          external_completed_quantity = ?,
+          completed_quantity = ?,
+          ${verifiedColumn} = ?,
+          ${payloadColumn} = ?,
+          reason_message = ?,
+          updated_at = ?
+      WHERE id = ?
+        AND user_id = ?
+    `,
+    [
+      progress,
+      achievedQuantity,
+      achievedQuantity,
+      latest,
+      payloadText,
+      `need replenish ${replenishQuantity}`,
+      now,
+      order.id,
+      userId,
+    ],
+  );
+
+  return {
+    achieved_quantity: achievedQuantity,
+    checked: true,
+    latest_count: latest,
+    needs_replenish: true,
+    replenished: false,
+    replenish_quantity: replenishQuantity,
+  };
+};
+
+const replenishViewOrderIfNeeded = async (db, userId, order, options = {}) => {
+  const now = options.now || new Date();
+  const shouldDispatch = options.dispatch !== false;
+  const targetType = normalizeTargetType(order.target_type);
+  if (targetType !== 'view') {
+    return { checked: false, reason: 'unsupported_target_type', replenished: false };
+  }
+
+  if (
+    order.snapshot_current_read_count === null ||
+    order.snapshot_current_read_count === undefined ||
+    order.snapshot_current_read_count === ''
+  ) {
+    return { checked: true, reason: 'missing_snapshot', replenished: false };
+  }
+  const baseline = Number(order.snapshot_current_read_count);
+  if (!Number.isFinite(baseline)) {
+    return { checked: true, reason: 'missing_snapshot', replenished: false };
+  }
+
+  const realtime = await requestNoteRealtimeViewCount({ note_id: order.note_id });
+  const latest = realtime.view_count;
+  const payloadText = realtime.payload ? JSON.stringify(realtime.payload).slice(0, 8000) : null;
+  if (!Number.isFinite(Number(latest))) {
+    return { checked: true, reason: 'missing_realtime_count', replenished: false };
+  }
+
+  const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
+  const achievedQuantity = Math.max(Number(latest) - baseline, 0);
+  const replenishQuantity = Math.max(orderedQuantity - achievedQuantity, 0);
+  const progress = orderedQuantity > 0
+    ? Math.max(0, Math.min(round4(achievedQuantity / orderedQuantity), 1))
+    : 0;
+
+  if (replenishQuantity <= 0) {
+    await db.execute(
+      `
+        UPDATE orders
+        SET snapshot_verified_read_count = ?,
+            snapshot_verified_read_payload = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+      `,
+      [latest, payloadText, now, order.id, userId],
+    );
+    return {
+      achieved_quantity: achievedQuantity,
+      checked: true,
+      latest_count: latest,
+      replenished: false,
+      replenish_quantity: 0,
+    };
+  }
+
+  if (!shouldDispatch) {
+    return markOrderNeedsReplenish(db, userId, order, {
+      achievedQuantity,
+      latest,
+      now,
+      payloadColumn: 'snapshot_verified_read_payload',
+      payloadText,
+      progress,
+      replenishQuantity,
+      verifiedColumn: 'snapshot_verified_read_count',
+    });
+  }
+
+  const nextRepairCount = Number(order.repair_count || 0) + 1;
+  const xhsResult = await getXhsTaskClient().createTask(
+    targetType,
+    createXhsTaskPayload({
+      batchNo: order.batch_no || `BATCH-${order.batch_id}`,
+      item: buildReplenishItem(order, replenishQuantity),
+      orderNo: order.order_no,
+      source: `goods:repair:${order.id}:${nextRepairCount}`,
+      targetType,
+    }),
+    { token: createCurrentUserToken(userId) },
+  );
+  const externalTaskId = normalizeXhsTaskId(xhsResult?.id);
+  if (!externalTaskId) {
+    throw new Error('XHS API response missing task id (numeric)');
+  }
+
+  await db.execute(
+    `
+      UPDATE orders
+      SET order_status = 'running',
+          external_task_id = ?,
+          external_status = 'accepted',
+          external_progress = ?,
+          external_completed_quantity = ?,
+          completed_quantity = ?,
+          snapshot_verified_read_count = ?,
+          snapshot_verified_read_payload = ?,
+          repair_count = ?,
+          last_verified_at = NULL,
+          reason_message = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND user_id = ?
+    `,
+    [
+      externalTaskId,
+      progress,
+      achievedQuantity,
+      achievedQuantity,
+      latest,
+      payloadText,
+      nextRepairCount,
+      now,
+      order.id,
+      userId,
+    ],
+  );
+
+  return {
+    achieved_quantity: achievedQuantity,
+    checked: true,
+    external_task_id: externalTaskId,
+    latest_count: latest,
+    replenished: true,
+    replenish_quantity: replenishQuantity,
+  };
+};
+
+const replenishLikeOrderIfNeeded = async (db, userId, order, options = {}) => {
+  const now = options.now || new Date();
+  const shouldDispatch = options.dispatch !== false;
+  const targetType = normalizeTargetType(order.target_type);
+  if (targetType !== 'like') {
+    return { checked: false, reason: 'unsupported_target_type', replenished: false };
+  }
+
+  if (order.like_count === null || order.like_count === undefined || order.like_count === '') {
+    return { checked: true, reason: 'missing_snapshot', replenished: false };
+  }
+  const baseline = Number(order.like_count);
+  if (!Number.isFinite(baseline)) {
+    return { checked: true, reason: 'missing_snapshot', replenished: false };
+  }
+
+  const latestResult = await requestNoteLikeCount({ note_id: order.note_id });
+  const latest = latestResult.like_count;
+  const payloadText = latestResult.payload ? JSON.stringify(latestResult.payload).slice(0, 8000) : null;
+  if (!Number.isFinite(Number(latest))) {
+    return { checked: true, reason: 'missing_like_count', replenished: false };
+  }
+
+  const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
+  const achievedQuantity = Math.max(Number(latest) - baseline, 0);
+  const replenishQuantity = Math.max(orderedQuantity - achievedQuantity, 0);
+  const progress = orderedQuantity > 0
+    ? Math.max(0, Math.min(round4(achievedQuantity / orderedQuantity), 1))
+    : 0;
+
+  if (replenishQuantity <= 0) {
+    await db.execute(
+      `
+        UPDATE orders
+        SET snapshot_verified_like_count = ?,
+            snapshot_verified_like_payload = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND user_id = ?
+      `,
+      [latest, payloadText, now, order.id, userId],
+    );
+    return {
+      achieved_quantity: achievedQuantity,
+      checked: true,
+      latest_count: latest,
+      replenished: false,
+      replenish_quantity: 0,
+    };
+  }
+
+  if (!shouldDispatch) {
+    return markOrderNeedsReplenish(db, userId, order, {
+      achievedQuantity,
+      latest,
+      now,
+      payloadColumn: 'snapshot_verified_like_payload',
+      payloadText,
+      progress,
+      replenishQuantity,
+      verifiedColumn: 'snapshot_verified_like_count',
+    });
+  }
+
+  const nextRepairCount = Number(order.repair_count || 0) + 1;
+  const xhsResult = await getXhsTaskClient().createTask(
+    targetType,
+    createXhsTaskPayload({
+      batchNo: order.batch_no || `BATCH-${order.batch_id}`,
+      item: {
+        author_id: order.author_id || '',
+        like_count: latest,
+        note_id: order.note_id,
+        ordered_quantity: replenishQuantity,
+      },
+      orderNo: order.order_no,
+      source: `goods:repair:${order.id}:${nextRepairCount}`,
+      targetType,
+    }),
+    { token: createCurrentUserToken(userId) },
+  );
+  const externalTaskId = normalizeXhsTaskId(xhsResult?.id);
+  if (!externalTaskId) {
+    throw new Error('XHS API response missing task id (numeric)');
+  }
+
+  await db.execute(
+    `
+      UPDATE orders
+      SET order_status = 'running',
+          external_task_id = ?,
+          external_status = 'accepted',
+          external_progress = ?,
+          external_completed_quantity = ?,
+          completed_quantity = ?,
+          snapshot_verified_like_count = ?,
+          snapshot_verified_like_payload = ?,
+          repair_count = ?,
+          last_verified_at = NULL,
+          reason_message = NULL,
+          updated_at = ?
+      WHERE id = ?
+        AND user_id = ?
+    `,
+    [
+      externalTaskId,
+      progress,
+      achievedQuantity,
+      achievedQuantity,
+      latest,
+      payloadText,
+      nextRepairCount,
+      now,
+      order.id,
+      userId,
+    ],
+  );
+
+  return {
+    achieved_quantity: achievedQuantity,
+    checked: true,
+    external_task_id: externalTaskId,
+    latest_count: latest,
+    replenished: true,
+    replenish_quantity: replenishQuantity,
+  };
+};
+
+const replenishOrderIfNeeded = async (db, userId, order, options = {}) => {
+  const targetType = normalizeTargetType(order.target_type);
+  if (targetType === 'like') {
+    return replenishLikeOrderIfNeeded(db, userId, order, options);
+  }
+  if (targetType === 'view') {
+    return replenishViewOrderIfNeeded(db, userId, order, options);
+  }
+  return { checked: false, reason: 'unsupported_target_type', replenished: false };
+};
+
+const requestReplenishBatch = async (userId, batchId) => {
+  const targetBatchId = Number(batchId);
+  if (!targetBatchId) {
+    const error = new Error('Invalid batch id');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const db = getPool();
+  await ensureReplenishmentRecordTable(db);
+  const [[batch]] = await db.execute(
+    'SELECT id, batch_no, user_id FROM order_batches WHERE id = ? AND user_id = ?',
+    [targetBatchId, userId],
+  );
+  if (!batch) {
+    const error = new Error('Batch not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const [[existing]] = await db.execute(
+    `
+      SELECT id, status
+      FROM order_replenishment_records
+      WHERE batch_id = ?
+        AND user_id = ?
+        AND status = 'pending'
+      ORDER BY id ASC
+      LIMIT 1
+    `,
+    [targetBatchId, userId],
+  );
+  if (existing) {
+    return {
+      batch_id: targetBatchId,
+      batch_no: batch.batch_no,
+      id: Number(existing.id),
+      status: existing.status,
+    };
+  }
+
+  const [repairOrders] = await db.execute(
+    `
+      SELECT *
+      FROM orders
+      WHERE batch_id = ?
+        AND user_id = ?
+        AND order_status = 'repair_review'
+      ORDER BY batch_item_id ASC, id ASC
+    `,
+    [targetBatchId, userId],
+  );
+  if (repairOrders.length === 0) {
+    const error = new Error('No replenishable orders');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const now = new Date();
+  for (const order of repairOrders) {
+    const actualQuantity = Math.max(Number(order.completed_quantity) || 0, 0);
+    const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
+    await db.execute(
+      `
+        INSERT INTO order_replenishment_records
+          (
+            replenishment_no, order_id, order_no, batch_id, user_id, target_type,
+            note_id, note_url, original_external_task_id, ordered_quantity,
+            actual_quantity, shortage_quantity, snapshot_before_count, snapshot_after_count,
+            status, reason_message, requested_at, created_at, updated_at
+          )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+      `,
+      [
+        `REP-${Date.now()}-${order.id}`,
+        order.id,
+        order.order_no,
+        targetBatchId,
+        userId,
+        order.target_type,
+        order.note_id,
+        order.note_url,
+        order.external_task_id,
+        orderedQuantity,
+        actualQuantity,
+        Math.max(orderedQuantity - actualQuantity, 0),
+        order.like_count ?? order.snapshot_current_read_count ?? null,
+        order.snapshot_verified_like_count ?? order.snapshot_verified_read_count ?? null,
+        order.reason_message || `batch_no=${batch.batch_no}`,
+        now,
+        now,
+        now,
+      ],
+    );
+  }
+
+  const [[record]] = await db.execute(
+    `
+      SELECT *
+      FROM order_replenishment_records
+      WHERE batch_id = ?
+        AND status = 'pending'
+      ORDER BY id ASC
+      LIMIT 1
+    `,
+    [targetBatchId],
+  );
+
+  return {
+    batch_id: targetBatchId,
+    batch_no: batch.batch_no,
+    id: Number(record.id),
+    status: record.status,
+  };
+};
+
+const createPendingReplenishmentForOrder = async (
+  db,
+  order,
+  reasonMessage,
+  now = new Date(),
+) => {
+  await ensureReplenishmentRecordTable(getPool());
+  const [[batch]] = await db.execute(
+    'SELECT id, batch_no, user_id FROM order_batches WHERE id = ? LIMIT 1',
+    [order.batch_id],
+  );
+  if (!batch) {
+    return null;
+  }
+
+  const [[existing]] = await db.execute(
+    `
+      SELECT id, status
+      FROM order_replenishment_records
+      WHERE order_id = ?
+        AND status = 'pending'
+      ORDER BY id ASC
+      LIMIT 1
+    `,
+    [order.id],
+  );
+  if (existing) {
+    return {
+      id: Number(existing.id),
+      status: existing.status,
+    };
+  }
+
+  const actualQuantity = Math.max(Number(order.completed_quantity) || 0, 0);
+  const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
+  await db.execute(
+    `
+      INSERT INTO order_replenishment_records
+        (
+          replenishment_no, order_id, order_no, batch_id, user_id, target_type,
+          note_id, note_url, original_external_task_id, ordered_quantity,
+          actual_quantity, shortage_quantity, snapshot_before_count, snapshot_after_count,
+          status, reason_message, requested_at, created_at, updated_at
+        )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+    `,
+    [
+      `REP-${Date.now()}-${order.id}`,
+      order.id,
+      order.order_no,
+      order.batch_id,
+      order.user_id,
+      order.target_type,
+      order.note_id,
+      order.note_url,
+      order.external_task_id,
+      orderedQuantity,
+      actualQuantity,
+      Math.max(orderedQuantity - actualQuantity, 0),
+      order.like_count ?? order.snapshot_current_read_count ?? null,
+      order.snapshot_verified_like_count ?? order.snapshot_verified_read_count ?? null,
+      reasonMessage,
+      now,
+      now,
+      now,
+    ],
+  );
+
+  const [[record]] = await db.execute(
+    `
+      SELECT id, status
+      FROM order_replenishment_records
+      WHERE order_id = ?
+        AND status = 'pending'
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [order.id],
+  );
+  return record ? { id: Number(record.id), status: record.status } : null;
+};
+
+const listReplenishmentRequests = async (actorUserId, query = {}) => {
+  const db = getPool();
+  await assertAdmin(db, actorUserId);
+  await ensureReplenishmentRecordTable(db);
+
+  const { page, page_size: pageSize, status = 'pending' } = query;
+  const safePage = Math.max(Number(page) || 1, 1);
+  const safePageSize = Math.min(Math.max(Number(pageSize) || 20, 1), 100);
+  const offset = (safePage - 1) * safePageSize;
+  const params = [];
+  let statusSql = '';
+  if (status && status !== 'all') {
+    statusSql = 'WHERE rr.status = ?';
+    params.push(status);
+  }
+
+  const [[countRow]] = await db.execute(
+    `SELECT COUNT(1) AS total FROM order_replenishment_records rr ${statusSql}`,
+    params,
+  );
+  const [rows] = await db.execute(
+    `
+      SELECT
+        MIN(rr.id) AS id,
+        rr.batch_id,
+        rr.user_id,
+        rr.status,
+        MIN(COALESCE(rr.requested_at, rr.created_at)) AS requested_at,
+        MAX(rr.reviewed_at) AS reviewed_at,
+        MAX(rr.reason_message) AS reason_message,
+        ob.batch_no,
+        ob.batch_id AS batch_uuid,
+        ob.total_count AS target_count,
+        ob.estimated_amount,
+        u.username,
+        u.real_name,
+        COUNT(DISTINCT rr.order_id) AS pending_order_count,
+        COALESCE(SUM(rr.shortage_quantity), 0) AS pending_quantity
+      FROM order_replenishment_records rr
+      INNER JOIN order_batches ob ON ob.id = rr.batch_id
+      INNER JOIN users u ON u.id = rr.user_id
+      ${statusSql}
+      GROUP BY rr.batch_id, rr.user_id, rr.status, ob.batch_no, ob.batch_id, ob.total_count, ob.estimated_amount, u.username, u.real_name
+      ORDER BY requested_at DESC, id DESC
+      LIMIT ${safePageSize} OFFSET ${offset}
+    `,
+    params,
+  );
+
+  return {
+    items: rows.map((row) => ({
+      batch_id: Number(row.batch_id),
+      batch_no: row.batch_no,
+      batch_uuid: row.batch_uuid,
+      estimated_amount: round4(row.estimated_amount),
+      id: Number(row.id),
+      pending_order_count: Number(row.pending_order_count) || 0,
+      pending_quantity: Number(row.pending_quantity) || 0,
+      reason_message: row.reason_message || '',
+      real_name: row.real_name || '',
+      requested_at: row.requested_at,
+      reviewed_at: row.reviewed_at || null,
+      status: row.status,
+      target_count: Number(row.target_count) || 0,
+      user_id: Number(row.user_id),
+      username: row.username || '',
+    })),
+    page: safePage,
+    page_size: safePageSize,
+    total: Number(countRow.total) || 0,
+  };
+};
+
 // 提交批量订单
 const submitBatch = async (userId, params) => {
   if (!params?.agree_policy) {
@@ -2419,6 +4107,8 @@ const submitBatch = async (userId, params) => {
 
   const db = getPool();
   await ensureOrderSnapshotColumns(db);
+  const validPreviewItems = preview.items.filter((entry) => entry.valid);
+  const submitSnapshots = await collectSubmitSnapshots(preview.target_type, validPreviewItems);
   const connection = await db.getConnection();
   const now = new Date();
   const batchUuid = crypto.randomUUID();
@@ -2459,24 +4149,26 @@ const submitBatch = async (userId, params) => {
     let submittedCount = 0;
     let failedCount = 0;
     let chargedAmount = 0;
-    const validPreviewItems = preview.items.filter((entry) => entry.valid);
     const orderRows = [];
 
     for (const [index, item] of validPreviewItems.entries()) {
       const orderNo = `ORDER-${Date.now()}-${String(index + 1).padStart(3, '0')}`;
       const recordNo = `REC-${Date.now()}-${String(index + 1).padStart(3, '0')}`;
+      const submitSnapshot = submitSnapshots.get(item.line_no) || {};
 
       const [insertResult] = await connection.execute(
         `
           INSERT INTO orders
             (
               order_no, user_id, batch_id, batch_item_id, note_id, note_url, target_type,
-              title, author_name, avatar_url,
+              title, author_id, author_name, avatar_url, like_count,
               ordered_quantity, completed_quantity, order_status, external_task_id,
               external_status, external_progress, external_completed_quantity,
-              last_verified_at, reason_message, created_at, updated_at
+              last_verified_at, reason_message, snapshot_current_read_count,
+              snapshot_current_read_payload, snapshot_current_like_payload,
+              created_at, updated_at
             )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           orderNo,
@@ -2487,8 +4179,10 @@ const submitBatch = async (userId, params) => {
           item.note_url,
           preview.target_type,
           item.title || null,
+          item.author_id || null,
           item.author_name || null,
           item.avatar_url || null,
+          item.like_count,
           item.ordered_quantity,
           0,
           'running',
@@ -2498,6 +4192,9 @@ const submitBatch = async (userId, params) => {
           0,
           null,
           null,
+          submitSnapshot.view_count ?? null,
+          preview.target_type === 'view' ? submitSnapshot.payload ?? null : null,
+          preview.target_type === 'like' ? submitSnapshot.payload ?? null : null,
           now,
           now,
         ],
@@ -2525,10 +4222,9 @@ const submitBatch = async (userId, params) => {
             }),
             { token: createCurrentUserToken(userId) },
           );
-          const externalTaskId =
-            xhsResult?.id === null || xhsResult?.id === undefined ? null : String(xhsResult.id);
+          const externalTaskId = normalizeXhsTaskId(xhsResult?.id);
           if (!externalTaskId) {
-            throw new Error('XHS API response missing task id');
+            throw new Error('XHS API response missing task id (numeric)');
           }
           return {
             externalTaskId,
@@ -2554,7 +4250,7 @@ const submitBatch = async (userId, params) => {
           throw taskResult.error;
         }
         if (!externalTaskId) {
-          throw new Error('XHS API response missing task id');
+          throw new Error('XHS API response missing task id (numeric)');
         }
         await connection.execute(
           `
@@ -2606,7 +4302,7 @@ const submitBatch = async (userId, params) => {
           order.orderNo,
           order.item.ordered_quantity,
           preview.unit_price,
-          preview.unit_price,
+          order.item.original_amount ?? preview.unit_price,
           preview.discount_rate,
           preview.discounted_unit_price,
           order.item.discount_amount,
@@ -2667,11 +4363,184 @@ const submitBatch = async (userId, params) => {
   }
 };
 
-const retryBatch = async (userId, batchId) => {
-  const error = new Error('Failed orders are refunded automatically and cannot be retried');
-  error.statusCode = 400;
-  throw error;
+const replenishBatch = async (userId, batchId) => {
+  const targetBatchId = Number(batchId);
+  if (!targetBatchId) {
+    const error = new Error('Invalid batch id');
+    error.statusCode = 400;
+    throw error;
+  }
 
+  const db = getPool();
+  await ensureOrderSnapshotColumns(db);
+  await ensureNoteBasicCacheTable(db);
+  const [[batch]] = await db.execute(
+    'SELECT id, batch_no FROM order_batches WHERE id = ? AND user_id = ?',
+    [targetBatchId, userId],
+  );
+  if (!batch) {
+    const error = new Error('Batch not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const [orders] = await db.execute(
+    `
+      SELECT o.id, o.batch_id, ob.batch_no, o.order_no, o.note_id, o.target_type,
+        o.ordered_quantity, o.repair_count, o.like_count, o.snapshot_current_read_count,
+        o.snapshot_verified_read_count, o.snapshot_verified_like_count,
+        COALESCE(o.author_id, nbc.author_id) AS author_id
+      FROM orders o
+      INNER JOIN order_batches ob ON ob.id = o.batch_id
+      LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+      WHERE o.batch_id = ?
+        AND o.user_id = ?
+        AND o.target_type IN ('like', 'view')
+        AND o.order_status IN ('running', 'completed', 'repair_review')
+      ORDER BY o.batch_item_id ASC, o.id ASC
+    `,
+    [targetBatchId, userId],
+  );
+
+  const results = [];
+  for (const order of orders) {
+    try {
+      const result = await replenishOrderIfNeeded(db, userId, order, { now: new Date() });
+      results.push({
+        order_id: Number(order.id),
+        ...result,
+      });
+    } catch (error) {
+      results.push({
+        error: normalizeXhsErrorMessage(error),
+        order_id: Number(order.id),
+        replenished: false,
+      });
+    }
+  }
+
+  await refreshBatchStats(db, userId, [targetBatchId]);
+
+  return {
+    batch_id: targetBatchId,
+    batch_no: batch.batch_no,
+    checked_count: results.filter((result) => result.checked !== false).length,
+    errors: results.filter((result) => result.error),
+    replenished_count: results.filter((result) => result.replenished).length,
+    results,
+    total_replenish_quantity: results.reduce(
+      (total, result) => total + (Number(result.replenish_quantity) || 0),
+      0,
+    ),
+  };
+};
+
+const approveReplenishmentRequest = async (actorUserId, requestId) => {
+  const targetRequestId = Number(requestId);
+  if (!targetRequestId) {
+    const error = new Error('Invalid replenish request id');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const db = getPool();
+  await assertAdmin(db, actorUserId);
+  await ensureReplenishmentRecordTable(db);
+
+  const [[record]] = await db.execute(
+    `
+      SELECT rr.*, ob.batch_no
+      FROM order_replenishment_records rr
+      INNER JOIN order_batches ob ON ob.id = rr.batch_id
+      WHERE rr.id = ?
+      LIMIT 1
+    `,
+    [targetRequestId],
+  );
+  if (!record) {
+    const error = new Error('Replenish request not found');
+    error.statusCode = 404;
+    throw error;
+  }
+  if (record.status !== 'pending') {
+    const error = new Error('Replenish request is not pending');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const now = new Date();
+  try {
+    const result = await replenishBatch(record.user_id, record.batch_id);
+    await db.execute(
+      `
+        UPDATE order_replenishment_records
+        SET status = 'approved',
+            reviewed_at = ?,
+            reviewed_by = ?,
+            result_json = ?,
+            updated_at = ?
+        WHERE batch_id = ?
+          AND user_id = ?
+          AND status = 'pending'
+      `,
+      [
+        now,
+        actorUserId,
+        JSON.stringify(result).slice(0, 8000),
+        now,
+        record.batch_id,
+        record.user_id,
+      ],
+    );
+
+    return {
+      batch_id: Number(record.batch_id),
+      batch_no: record.batch_no,
+      id: targetRequestId,
+      result,
+      status: 'approved',
+    };
+  } catch (error) {
+    await db.execute(
+      `
+        UPDATE order_replenishment_records
+        SET status = 'failed',
+            reviewed_at = ?,
+            reviewed_by = ?,
+            reason_message = ?,
+            updated_at = ?
+        WHERE batch_id = ?
+          AND user_id = ?
+          AND status = 'pending'
+      `,
+      [now, actorUserId, normalizeXhsErrorMessage(error), now, record.batch_id, record.user_id],
+    );
+    throw error;
+  }
+};
+
+const approveReplenishmentBatch = async (actorUserId, batchId) => {
+  const db = getPool();
+  await assertAdmin(db, actorUserId);
+  await ensureReplenishmentRecordTable(db);
+  const [[record]] = await db.execute(
+    `
+      SELECT id
+      FROM order_replenishment_records
+      WHERE batch_id = ?
+        AND status = 'pending'
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [Number(batchId)],
+  );
+  if (!record) {
+    return replenishBatch(actorUserId, batchId);
+  }
+  return approveReplenishmentRequest(actorUserId, record.id);
+};
+
+const retryBatch = async (userId, batchId) => {
   const db = getPool();
   const connection = await db.getConnection();
   const targetBatchId = Number(batchId);
@@ -2701,8 +4570,10 @@ const retryBatch = async (userId, batchId) => {
         SELECT
           o.id, o.order_no, o.batch_item_id, o.note_id, o.note_url, o.target_type,
           o.ordered_quantity, o.external_task_id,
+          COALESCE(o.author_id, nbc.author_id, '') AS author_id,
           COUNT(ar.id) AS charge_count
         FROM orders o
+        LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
         LEFT JOIN account_records ar
           ON ar.order_id = o.id
           AND ar.record_type = 'order_charge'
@@ -2712,7 +4583,7 @@ const retryBatch = async (userId, batchId) => {
           AND o.order_status IN ('failed', 'manual_review', 'repair_review')
         GROUP BY
           o.id, o.order_no, o.batch_item_id, o.note_id, o.note_url, o.target_type,
-          o.ordered_quantity, o.external_task_id
+          o.ordered_quantity, o.external_task_id, o.author_id, nbc.author_id
         FOR UPDATE
       `,
       [targetBatchId, userId],
@@ -2734,6 +4605,7 @@ const retryBatch = async (userId, batchId) => {
               batchNo: batch.batch_no,
               item: {
                 line_no: order.batch_item_id,
+                author_id: order.author_id || '',
                 note_id: order.note_id,
                 note_url: order.note_url,
                 ordered_quantity: Number(order.ordered_quantity) || 0,
@@ -2743,10 +4615,9 @@ const retryBatch = async (userId, batchId) => {
             }),
             { token: createCurrentUserToken(userId) },
           );
-          externalTaskId =
-          xhsResult?.id === null || xhsResult?.id === undefined ? null : String(xhsResult.id);
+          externalTaskId = normalizeXhsTaskId(xhsResult?.id);
           if (!externalTaskId) {
-            throw new Error('XHS API response missing task id');
+            throw new Error('XHS API response missing task id (numeric)');
           }
         } catch (error) {
           await connection.execute(
@@ -2768,10 +4639,14 @@ const retryBatch = async (userId, batchId) => {
 
         const context = await getUserOrderContext(connection, userId, targetType);
         const orderedQuantity = Number(order.ordered_quantity) || 0;
-        const payableAmount = round4(orderedQuantity * context.discountedUnitPrice);
+        const { discountAmount, originalAmount, payableAmount } = calculateOrderAmounts(
+          context,
+          orderedQuantity,
+        );
         const item = {
-          discount_amount: round4(orderedQuantity * context.unitPrice - payableAmount),
+          discount_amount: discountAmount,
           ordered_quantity: orderedQuantity,
+          original_amount: originalAmount,
           payable_amount: payableAmount,
         };
         beforeBalance = await createOrderChargeRecord(connection, {
@@ -2783,7 +4658,7 @@ const retryBatch = async (userId, batchId) => {
           preview: {
             discount_rate: context.discountRate,
             discounted_unit_price: context.discountedUnitPrice,
-            unit_price: context.unitPrice,
+            unit_price: originalAmount,
           },
           recordNo: `REC-${Date.now()}-${String(order.id).padStart(3, '0')}`,
           userId,
@@ -2881,14 +4756,20 @@ const retryBatch = async (userId, batchId) => {
 };
 
 module.exports = {
+  approveReplenishmentBatch,
+  approveReplenishmentRequest,
   buildPreview,
   listBatchOrderRecords,
   listBatchLinkCheckRecords,
   listConsumptionRecords,
   listProblemLinkRecords,
+  listReplenishmentRequests,
   listRefundRecords,
+  requestReplenishBatch,
   requestOrderRefund,
   reviewOrderRefund,
+  searchBatchOrdersByLinks,
+  replenishBatch,
   retryBatch,
   saveProblemLinkRecords,
   submitBatch,
@@ -2896,6 +4777,10 @@ module.exports = {
     ensureBatchLinkCheckRecordTable,
     ensureNoteBasicCacheTable,
     ensureProblemLinkRecordTable,
+    ensureReplenishmentRecordTable,
+    stopXhsTask,
+    syncRunningOrdersFromXhs,
+    requestNoteRealtimeViewCount,
     setXhsTaskClient,
   },
 };

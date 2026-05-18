@@ -15,9 +15,11 @@ export namespace OrderApi {
     duplicate: boolean;
     errors: string[];
     line_no: number;
+    like_count: null | number;
     note_id: string;
     note_url: string;
     ordered_quantity: number;
+    original_amount?: number;
     payable_amount: number;
     raw: string;
     resolved_note_url: string;
@@ -33,6 +35,8 @@ export namespace OrderApi {
     discounted_unit_price: number;
     invalid_count: number;
     items: BatchOrderItem[];
+    price_base_quantity?: number;
+    price_mode?: 'default' | 'discount' | 'fixed' | 'quantity';
     target_type: 'impression' | 'like' | 'view';
     total_amount: number;
     total_count: number;
@@ -56,8 +60,11 @@ export namespace OrderApi {
     batch_item_id: number;
     completed_quantity: number;
     created_at: string;
+    external_completed_quantity: number;
+    external_progress: number;
     external_status: string;
     id: number;
+    like_count: null | number;
     note_id: string;
     note_url: string;
     order_no: string;
@@ -67,7 +74,10 @@ export namespace OrderApi {
     reason_message: string;
     record_status: string;
     refund_amount: number;
+    repair_count: number;
     target_type: 'impression' | 'like' | 'view';
+    snapshot_current_read_count: null | number;
+    snapshot_verified_read_count: null | number;
     source_note_url: string;
     title: string;
     updated_at: string;
@@ -145,10 +155,12 @@ export namespace OrderApi {
     order_id: number;
     order_items: Array<{
       actual_paid_amount: number;
+      external_status: string;
       order_id: number;
       order_no: string;
       order_status: string;
       ordered_quantity: number;
+      repair_count: number;
       refund_amount: number;
       refund_requested_at: null | string;
       refunded_quantity: number;
@@ -210,6 +222,48 @@ export namespace OrderApi {
     username: string;
   }
 
+  export interface ReplenishmentRequest {
+    batch_id: number;
+    batch_no: string;
+    batch_uuid: string;
+    estimated_amount: number;
+    id: number;
+    pending_order_count: number;
+    pending_quantity: number;
+    reason_message: string;
+    real_name: string;
+    requested_at: string;
+    reviewed_at: null | string;
+    status: string;
+    target_count: number;
+    user_id: number;
+    username: string;
+  }
+
+  export interface BatchOrderSearchResult {
+    invalid_count: number;
+    items: Array<
+      BatchOrderRecordItem & {
+        batch_no: string;
+        batch_uuid: string;
+        matched_input: string;
+        user_id: number;
+        username: string;
+      }
+    >;
+    links: Array<{
+      duplicate: boolean;
+      errors: string[];
+      line_no: number;
+      note_id: string;
+      note_url: string;
+      raw: string;
+      valid: boolean;
+    }>;
+    matched_count: number;
+    total_count: number;
+  }
+
   export interface SaveProblemLinkRecordsParams {
     check_batch_no?: string;
     records: Array<{
@@ -237,6 +291,21 @@ export namespace OrderApi {
     status: string;
     timestamp: string;
     uptime: number;
+  }
+
+  export interface OpenApiKey {
+    created_at: string;
+    id: number;
+    key_name: string;
+    key_prefix: string;
+    last_used_at: null | string;
+    masked_key: string;
+    revoked_at: null | string;
+    status: 'active' | 'revoked' | string;
+  }
+
+  export interface OpenApiKeyCreateResult extends OpenApiKey {
+    api_key: string;
   }
 
   export interface PageResult<T> {
@@ -274,7 +343,7 @@ export async function submitBatchOrderApi(
   return requestClient.post<OrderApi.BatchOrderSubmitResult>(
     '/v1/orders/batch/submit',
     data,
-    { skipBackendLoading: options?.silent } as any,
+    { skipBackendLoading: options?.silent, timeout: 60_000 } as any,
   );
 }
 
@@ -289,6 +358,17 @@ export async function getBatchOrderRecordsApi(
   return requestClient.get<OrderApi.PageResult<OrderApi.BatchOrderRecord>>(
     '/v1/orders/batch/records',
     { params, skipBackendLoading: options?.silent } as any,
+  );
+}
+
+export async function searchBatchOrdersApi(data: {
+  content: string;
+  end_date?: string;
+  start_date?: string;
+}) {
+  return requestClient.post<OrderApi.BatchOrderSearchResult>(
+    '/v1/orders/batch/search',
+    data,
   );
 }
 
@@ -326,6 +406,50 @@ export async function retryBatchOrderApi(batchId: number) {
   }>(`/v1/orders/batch/${batchId}/retry`);
 }
 
+export async function replenishBatchOrderApi(batchId: number) {
+  return requestClient.post<{
+    batch_id: number;
+    batch_no: string;
+    checked_count: number;
+    replenished_count: number;
+    total_replenish_quantity: number;
+  }>(`/v1/orders/batch/${batchId}/replenish`);
+}
+
+export async function requestReplenishBatchOrderApi(batchId: number) {
+  return requestClient.post<{
+    batch_id: number;
+    batch_no: string;
+    id: number;
+    status: string;
+  }>(`/v1/orders/batch/${batchId}/replenish-request`);
+}
+
+export async function getReplenishmentRequestsApi(params?: {
+  page?: number;
+  page_size?: number;
+  status?: string;
+}) {
+  return requestClient.get<OrderApi.PageResult<OrderApi.ReplenishmentRequest>>(
+    '/v1/orders/replenishments',
+    { params },
+  );
+}
+
+export async function approveReplenishmentRequestApi(requestId: number) {
+  return requestClient.post<{
+    batch_id: number;
+    batch_no: string;
+    id: number;
+    result: {
+      checked_count: number;
+      replenished_count: number;
+      total_replenish_quantity: number;
+    };
+    status: string;
+  }>(`/v1/orders/replenishments/${requestId}/approve`);
+}
+
 export async function requestOrderRefundApi(orderId: number) {
   return requestClient.post<{
     order_id: number;
@@ -355,14 +479,33 @@ export async function saveProblemLinkRecordsApi(
   );
 }
 
-export async function getProblemLinkRecordsApi() {
+export async function getProblemLinkRecordsApi(options?: { silent?: boolean }) {
   return requestClient.get<OrderApi.ProblemLinkRecord[]>(
     '/v1/orders/batch/problem-links',
+    { skipBackendLoading: options?.silent } as any,
   );
 }
 
-export async function getBatchLinkCheckRecordsApi() {
+export async function getBatchLinkCheckRecordsApi(options?: { silent?: boolean }) {
   return requestClient.get<OrderApi.BatchLinkCheckRecord[]>(
     '/v1/orders/batch/check-records',
+    { skipBackendLoading: options?.silent } as any,
+  );
+}
+
+export async function getOpenApiKeysApi() {
+  return requestClient.get<OrderApi.OpenApiKey[]>('/v1/open-api/keys');
+}
+
+export async function createOpenApiKeyApi(data: { name?: string }) {
+  return requestClient.post<OrderApi.OpenApiKeyCreateResult>(
+    '/v1/open-api/keys',
+    data,
+  );
+}
+
+export async function deleteOpenApiKeyApi(keyId: number) {
+  return requestClient.delete<{ id: number; status: string }>(
+    `/v1/open-api/keys/${keyId}`,
   );
 }

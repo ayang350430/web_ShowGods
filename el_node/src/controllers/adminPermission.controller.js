@@ -83,9 +83,28 @@ const updateUserDiscounts = async (req, res, next) => {
   }
 };
 
+const updateUserBalance = async (req, res, next) => {
+  try {
+    const data = await adminPermissionService.updateUserBalance(
+      getCurrentUserId(req),
+      req.params.userId,
+      req.body,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   listRoles,
   listUsers,
+  updateUserBalance,
   updateUserDiscounts,
   updateUserStatus,
   updateUserRoles,

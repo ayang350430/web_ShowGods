@@ -1,4 +1,4 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import type { OrderApi } from '#/api';
 
 import { computed, onMounted, reactive, ref } from 'vue';
@@ -94,6 +94,11 @@ function targetTypeLabel(type: string) {
 
 function statusLabel(status: string) {
   const map: Record<string, string> = {
+    completed: '订单完成',
+    failed: '订单失败',
+    manual_review: '人工处理',
+    repair_review: '待补单',
+    running: '进行中',
     refund_calculating: '退款中',
     refund_approved: '退款通过',
     refund_rejected: '退款拒绝',
@@ -110,8 +115,11 @@ function statusTagType(status: string) {
   if (status === 'refund_approved') {
     return 'success';
   }
-  if (status === 'refund_rejected') {
+  if (status === 'refund_rejected' || status === 'failed') {
     return 'danger';
+  }
+  if (status === 'completed') {
+    return 'success';
   }
   if (status === 'refund_requested' || status === 'stopping') {
     return 'primary';
@@ -131,9 +139,11 @@ async function reviewRefund(record: OrderApi.RefundRecord, approved: boolean) {
       reason: approved ? '管理员审核通过' : '管理员审核拒绝',
     });
     ElMessage.success(
-      approved
+      approved && Number(result.refunded_amount || 0) > 0
         ? `已退款 ${formatMoney(result.refunded_amount)}`
-        : '已拒绝退款申请',
+        : approved
+          ? '没有可退金额，已标记为不可退'
+          : '已拒绝退款申请',
     );
     await loadRecords();
   } finally {
@@ -506,3 +516,4 @@ onMounted(loadRecords);
   }
 }
 </style>
+

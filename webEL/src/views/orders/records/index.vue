@@ -1,7 +1,8 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import type { OrderApi } from '#/api';
 
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
 
 import {
   ElButton,
@@ -16,11 +17,15 @@ import {
   getBatchLinkCheckRecordsApi,
   getBatchOrderRecordsApi,
   getProblemLinkRecordsApi,
+  requestReplenishBatchOrderApi,
 } from '#/api';
 
 type OrderStatusFilter = 'all' | 'failed' | 'running' | 'success';
 
 const loading = ref(false);
+const polling = ref(false);
+const replenishLoading = ref(false);
+const router = useRouter();
 const records = ref<OrderApi.BatchOrderRecord[]>([]);
 const checkRecords = ref<OrderApi.ProblemLinkRecord[]>([]);
 const selectedBatchId = ref<number>();
@@ -33,6 +38,7 @@ const pagination = ref({
   page_size: 10,
   total: 0,
 });
+let pollingTimer: ReturnType<typeof setInterval> | undefined;
 
 function normalizeCheckRecordAsProblem(
   record: OrderApi.BatchLinkCheckRecord,
@@ -142,6 +148,10 @@ const selectedProblemBatch = computed(() =>
   ),
 );
 
+const selectedBatchNeedsReplenish = computed(() =>
+  (selectedBatch.value?.orders ?? []).some((order) => order.order_status === 'repair_review'),
+);
+
 const filteredOrders = computed(() => {
   const orders = selectedBatch.value?.orders ?? [];
   const keyword = orderKeyword.value.trim().toLowerCase();
@@ -243,6 +253,15 @@ function batchTargetTypeLabel(record: OrderApi.BatchOrderRecord) {
   return targetTypeLabel(record.orders?.[0]?.target_type || '');
 }
 
+function openConsumptionBatch(record: OrderApi.BatchOrderRecord) {
+  void router.push({
+    name: 'ConsumptionRecords',
+    query: {
+      keyword: record.batch_no,
+    },
+  });
+}
+
 watch([selectedBatchId, selectedProblemBatchNo], () => {
   orderKeyword.value = '';
   orderStatusFilter.value = 'all';
@@ -296,6 +315,7 @@ function orderStatusLabel(status: string) {
     completed: '订单完成',
     failed: '订单失败',
     manual_review: '人工处理',
+    repair_review: '需要补单',
     refund_requested: '退款中',
     running: '进行中',
     stopping: '停止中',
@@ -337,20 +357,74 @@ function refundLabel(order: OrderApi.BatchOrderRecordItem) {
   return '无退款';
 }
 
+function isRefundedOrder(order: OrderApi.BatchOrderRecordItem) {
+  return (
+    order.order_status === 'refund_approved' ||
+    Number(order.refund_amount || 0) > 0 ||
+    Number((order as OrderApi.BatchOrderRecordItem & { refunded_quantity?: number })
+      .refunded_quantity || 0) > 0 ||
+    (order.order_status === 'failed' && Number(order.actual_paid_amount || 0) <= 0)
+  );
+}
+
+function isRefundingOrder(order: OrderApi.BatchOrderRecordItem) {
+  return ['refund_requested', 'refund_calculating', 'stopping'].includes(order.order_status);
+}
+
+function isRefundRejectedOrder(order: OrderApi.BatchOrderRecordItem) {
+  return order.order_status === 'refund_rejected';
+}
+
+function hasRefundedOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some(isRefundedOrder);
+}
+
+function hasRefundingOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some(isRefundingOrder);
+}
+
+function hasRefundRejectedOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some(isRefundRejectedOrder);
+}
+
+function hasRepairReviewOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some((order) => order.order_status === 'repair_review');
+}
+
+function batchDisplayStatusLabel(record: OrderApi.BatchOrderRecord) {
+  if (hasRepairReviewOrder(record)) {
+    return '待补单';
+  }
+  if (hasRefundedOrder(record)) {
+    return '已退款';
+  }
+  if (hasRefundingOrder(record)) {
+    return '退款中';
+  }
+  if (hasRefundRejectedOrder(record)) {
+    return '退款已拒绝';
+  }
+  return batchStatusLabel(record.status);
+}
+
 function batchProgress(record: OrderApi.BatchOrderRecord) {
   const orders = record.orders ?? [];
   const total = orders.length;
   if (total <= 0) {
     return 0;
   }
-  const completed = orders.reduce(
-    (sum, order) => sum + (order.order_status === 'completed' ? 1 : 0),
-    0,
-  );
-  return Math.min(100, Math.max(0, (completed / total) * 100));
+  const progressTotal = orders.reduce((sum, order) => sum + orderProgress(order), 0);
+  return Math.min(100, Math.max(0, progressTotal / total));
 }
 
 function orderProgress(order: OrderApi.BatchOrderRecordItem) {
+  if (order.order_status === 'completed') {
+    return 100;
+  }
+  const externalProgress = Number(order.external_progress);
+  if (Number.isFinite(externalProgress) && externalProgress > 0) {
+    return Math.min(100, Math.max(0, externalProgress * 100));
+  }
   const total = Math.max(Number(order.ordered_quantity) || 0, 0);
   if (total <= 0) {
     return 0;
@@ -401,16 +475,39 @@ async function copySelectedProblemBatchLinks() {
   }
 }
 
-async function loadRecords() {
-  loading.value = true;
+async function replenishSelectedBatch() {
+  if (!selectedBatch.value) {
+    return;
+  }
+  replenishLoading.value = true;
+  try {
+    await requestReplenishBatchOrderApi(selectedBatch.value.id);
+    ElMessage.success('已提交补单申请，等待管理员同意');
+    await loadRecords({ silent: true });
+  } catch (error: any) {
+    ElMessage.error(error?.message || '补单申请失败，请稍后重试');
+  } finally {
+    replenishLoading.value = false;
+  }
+}
+
+async function loadRecords(options: { silent?: boolean } = {}) {
+  if (polling.value) {
+    return;
+  }
+  const silent = Boolean(options.silent);
+  polling.value = silent;
+  if (!silent) {
+    loading.value = true;
+  }
   try {
     const [orderRecords, problemRecords, linkCheckRecords] = await Promise.all([
       getBatchOrderRecordsApi({
         page: pagination.value.page,
         page_size: pagination.value.page_size,
-      }),
-      getProblemLinkRecordsApi(),
-      getBatchLinkCheckRecordsApi(),
+      }, { silent }),
+      getProblemLinkRecordsApi({ silent }),
+      getBatchLinkCheckRecordsApi({ silent }),
     ]);
     records.value = orderRecords.items;
     pagination.value.total = orderRecords.total;
@@ -446,8 +543,37 @@ async function loadRecords() {
       selectedProblemBatchNo.value = '';
     }
   } finally {
-    loading.value = false;
+    if (!silent) {
+      loading.value = false;
+    }
+    polling.value = false;
   }
+}
+
+function pollRecords() {
+  if (document.hidden) {
+    return;
+  }
+  void loadRecords({ silent: true });
+}
+
+function startPolling() {
+  stopPolling();
+  pollingTimer = setInterval(pollRecords, 5000);
+}
+
+function stopPolling() {
+  if (pollingTimer) {
+    clearInterval(pollingTimer);
+    pollingTimer = undefined;
+  }
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    return;
+  }
+  pollRecords();
 }
 
 function handleBatchPageChange(page: number) {
@@ -465,7 +591,16 @@ function handleBatchPageSizeChange(pageSize: number) {
   loadRecords();
 }
 
-onMounted(loadRecords);
+onMounted(() => {
+  void loadRecords();
+  startPolling();
+  document.addEventListener('visibilitychange', handleVisibilityChange);
+});
+
+onUnmounted(() => {
+  stopPolling();
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
+});
 </script>
 
 <template>
@@ -500,7 +635,15 @@ onMounted(loadRecords);
         >
           一键复制问题链接
         </ElButton>
-        <ElButton :loading="loading" type="primary" @click="loadRecords">
+        <ElButton
+          v-if="selectedBatchNeedsReplenish"
+          :loading="replenishLoading"
+          type="warning"
+          @click="replenishSelectedBatch"
+        >
+          申请补单
+        </ElButton>
+        <ElButton :loading="loading" type="primary" @click="() => loadRecords()">
           刷新
         </ElButton>
       </div>
@@ -558,6 +701,11 @@ onMounted(loadRecords);
           v-for="record in filteredRecords"
           :key="record.id"
           class="batch-row"
+          :class="{
+            refunded: hasRefundedOrder(record),
+            refunding: hasRefundingOrder(record),
+            'refund-rejected': hasRefundRejectedOrder(record),
+          }"
           :style="{ '--progress': `${batchProgress(record)}%` }"
           @click="
             selectedBatchId = record.id;
@@ -566,7 +714,13 @@ onMounted(loadRecords);
         >
           <div>
             <div class="batch-title-line">
-              <strong>{{ record.batch_no }}</strong>
+              <strong
+                class="batch-no-link"
+                title="查看这批次的消费记录"
+                @click.stop="openConsumptionBatch(record)"
+              >
+                {{ record.batch_no }}
+              </strong>
               <span class="batch-type-tag service">
                 {{ batchTargetTypeLabel(record) }}
               </span>
@@ -592,8 +746,11 @@ onMounted(loadRecords);
             <span>实际付款金额</span>
             <strong>{{ formatMoney(batchActualPaidAmount(record)) }}</strong>
           </div>
-          <span class="batch-kind-tag batch-type-tag primary">
-            {{ batchStatusLabel(record.status) }}
+          <span
+            class="batch-kind-tag batch-type-tag"
+            :class="hasRefundedOrder(record) || hasRefundingOrder(record) ? 'warning' : 'primary'"
+          >
+            {{ batchDisplayStatusLabel(record) }}
           </span>
         </article>
 
@@ -653,6 +810,11 @@ onMounted(loadRecords);
           v-for="order in filteredOrders"
           :key="order.id"
           class="order-detail-row"
+          :class="{
+            refunded: isRefundedOrder(order),
+            refunding: isRefundingOrder(order),
+            'refund-rejected': isRefundRejectedOrder(order),
+          }"
           :style="{ '--progress': `${orderProgress(order)}%` }"
         >
         <!-- {{ order }} -->
@@ -683,11 +845,6 @@ onMounted(loadRecords);
           <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
           <div class="quantity-cell">
             <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-            <small v-if="order.order_status === 'running'">
-              {{ order.completed_quantity.toLocaleString('zh-CN') }} /
-              {{ order.ordered_quantity.toLocaleString('zh-CN') }}
-              {{ orderProgress(order).toFixed(0) }}%
-            </small>
           </div>
           <div class="order-status-cell">
             <span>{{ orderDisplayStatusLabel(order) }}</span>
@@ -730,7 +887,7 @@ onMounted(loadRecords);
             </div>
           </div>
           <div class="tag-cell">
-            <span>一键删除问题链接</span>
+            <span>问题链接</span>
             <span>{{ targetTypeLabel(record.target_type) }}检测</span>
             <span>明细：#{{ record.line_no }}</span>
           </div>
@@ -891,6 +1048,7 @@ onMounted(loadRecords);
   background: color-mix(in srgb, var(--el-color-success) 12%, transparent);
   content: '';
   pointer-events: none;
+  transition: width 1.15s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .batch-row:hover {
@@ -906,9 +1064,39 @@ onMounted(loadRecords);
   background: color-mix(in srgb, var(--el-color-warning) 12%, transparent);
 }
 
+.batch-row.refunded,
+.batch-row.refunding {
+  border-color: var(--el-color-warning-light-5);
+  background: color-mix(in srgb, var(--el-color-warning) 9%, var(--el-bg-color));
+}
+
+.batch-row.refund-rejected {
+  border-color: var(--el-color-danger-light-5);
+  background: color-mix(in srgb, var(--el-color-danger) 6%, var(--el-bg-color));
+}
+
+.batch-row.refunded::before,
+.batch-row.refunding::before {
+  background: color-mix(in srgb, var(--el-color-warning) 16%, transparent);
+}
+
+.batch-row.refund-rejected::before {
+  background: color-mix(in srgb, var(--el-color-danger) 12%, transparent);
+}
+
 .batch-row > * {
   position: relative;
   z-index: 1;
+}
+
+.batch-no-link {
+  cursor: pointer;
+}
+
+.batch-no-link:hover {
+  color: var(--el-color-primary);
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .batch-row strong,
@@ -1001,6 +1189,9 @@ onMounted(loadRecords);
   position: relative;
   overflow: hidden;
   padding: 18px 20px;
+  transition:
+    background-color 0.35s ease,
+    border-color 0.35s ease;
 }
 
 .order-detail-row::before {
@@ -1010,6 +1201,36 @@ onMounted(loadRecords);
   background: color-mix(in srgb, var(--el-color-primary) 10%, transparent);
   content: '';
   pointer-events: none;
+  transition:
+    width 1.15s cubic-bezier(0.22, 1, 0.36, 1),
+    background 0.35s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .batch-row::before,
+  .order-detail-row::before {
+    transition: none;
+  }
+}
+
+.order-detail-row.refunded,
+.order-detail-row.refunding {
+  border-color: var(--el-color-warning-light-5);
+  background: color-mix(in srgb, var(--el-color-warning) 9%, var(--el-bg-color));
+}
+
+.order-detail-row.refund-rejected {
+  border-color: var(--el-color-danger-light-5);
+  background: color-mix(in srgb, var(--el-color-danger) 6%, var(--el-bg-color));
+}
+
+.order-detail-row.refunded::before,
+.order-detail-row.refunding::before {
+  background: color-mix(in srgb, var(--el-color-warning) 14%, transparent);
+}
+
+.order-detail-row.refund-rejected::before {
+  background: color-mix(in srgb, var(--el-color-danger) 10%, transparent);
 }
 
 .order-detail-row > * {
@@ -1163,3 +1384,5 @@ onMounted(loadRecords);
   }
 }
 </style>
+
+

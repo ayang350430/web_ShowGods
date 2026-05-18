@@ -93,39 +93,49 @@ function notificationAvatar(type?: string) {
 }
 
 async function loadNotifications(silent = false) {
-  const { readIds, removedIds } = readNotificationState();
-  const previousIds = new Set(notifications.value.map((item) => String(item.id)));
-  const data = await getUserNotificationsApi({ silent });
-  const nextNotifications = data
-    .filter((item) => !removedIds.has(String(item.id)))
-    .map((item) => ({
-      ...item,
-      avatar: notificationAvatar(item.type),
-      isRead: readIds.has(String(item.id)),
-    }));
-
-  notifications.value = nextNotifications;
-
-  if (hasLoadedNotifications) {
-    const urgentNotification = nextNotifications.find(
-      (item) =>
-        item.id &&
-        !item.isRead &&
-        !previousIds.has(String(item.id)) &&
-        (item.title === '退款待审核' || item.link === '/orders/refunds'),
+  try {
+    const { readIds, removedIds } = readNotificationState();
+    const previousIds = new Set(
+      notifications.value.map((item) => String(item.id)),
     );
+    const data = await getUserNotificationsApi({ silent });
+    const list = Array.isArray(data) ? data : [];
+    const nextNotifications = list
+      .filter((item) => !removedIds.has(String(item.id)))
+      .map((item) => ({
+        ...item,
+        avatar: notificationAvatar(item.type),
+        isRead: readIds.has(String(item.id)),
+      }));
 
-    if (urgentNotification) {
-      ElNotification({
-        duration: 0,
-        message: urgentNotification.message || '有新的退款申请需要处理',
-        title: '新的退款申请',
-        type: 'warning',
-      });
+    notifications.value = nextNotifications;
+
+    if (hasLoadedNotifications) {
+      const urgentNotification = nextNotifications.find(
+        (item) =>
+          item.id &&
+          !item.isRead &&
+          !previousIds.has(String(item.id)) &&
+          (item.title === '退款待审核' || item.link === '/orders/refunds'),
+      );
+
+      if (urgentNotification) {
+        ElNotification({
+          duration: 0,
+          message: urgentNotification.message || '有新的退款申请需要处理',
+          title: '新的退款申请',
+          type: 'warning',
+        });
+      }
     }
-  }
 
-  hasLoadedNotifications = true;
+    hasLoadedNotifications = true;
+  } catch {
+    if (!silent) {
+      notifications.value = [];
+    }
+    hasLoadedNotifications = true;
+  }
 }
 
 async function handleLogout() {

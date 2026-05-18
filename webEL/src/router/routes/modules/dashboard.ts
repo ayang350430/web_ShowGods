@@ -71,6 +71,39 @@ const routes: RouteRecordRaw[] = [
     },
   },
   {
+    name: 'ReplenishmentRecords',
+    path: '/orders/replenishments',
+    component: () => import('#/views/orders/replenishments/index.vue'),
+    meta: {
+      authority: ['super', 'admin'],
+      icon: 'lucide:badge-check',
+      order: 4,
+      title: '补单列表',
+    },
+  },
+  {
+    name: 'OrderSearch',
+    path: '/orders/search',
+    component: () => import('#/views/orders/search/index.vue'),
+    meta: {
+      authority: ['super', 'admin', 'user'],
+      icon: 'lucide:search',
+      order: 1.5,
+      title: '批量查找',
+    },
+  },
+  {
+    name: 'OpenApiKeys',
+    path: '/open-api/keys',
+    component: () => import('#/views/open-api/keys/index.vue'),
+    meta: {
+      authority: ['super', 'admin', 'user'],
+      icon: 'lucide:key-round',
+      order: 5,
+      title: '开放接口',
+    },
+  },
+  {
     name: 'PermissionManage',
     path: '/system/permissions',
     component: () => import('#/views/system/permissions/index.vue'),

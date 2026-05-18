@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type { OrderApi } from '#/api';
 
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 
 import { createIconifyIcon } from '@vben/icons';
 
@@ -42,6 +42,7 @@ const checkingConnection = ref(false);
 const connectionOk = ref<boolean | undefined>();
 const connectionMessage = ref('尚未检测');
 const preview = ref<OrderApi.BatchOrderPreview>();
+const previewInputKey = ref('');
 const previewing = ref(false);
 const removedDrawerVisible = ref(false);
 const orderRecords = ref<OrderApi.BatchOrderRecord[]>([]);
@@ -57,6 +58,9 @@ const selectedCheckBatchNo = ref('');
 const latestPreviewBatchNo = ref('');
 const submitting = ref(false);
 const targetType = ref<'impression' | 'like' | 'view'>('view');
+const settlementLabels = {
+  totalQuantity: '\u603b\u6570',
+};
 
 const parsedLines = computed(() =>
   content.value
@@ -71,6 +75,35 @@ const canSubmit = computed(
     agreePolicy.value &&
     connectionOk.value === true,
 );
+
+const previewTotalQuantity = computed(() =>
+  (preview.value?.items ?? [])
+    .filter((item) => item.valid)
+    .reduce((total, item) => total + Number(item.ordered_quantity || 0), 0),
+);
+
+const previewPriceText = computed(() => {
+  const currentPreview = preview.value;
+  if (!currentPreview) {
+    return formatMoney(0);
+  }
+  if (currentPreview.price_mode === 'quantity') {
+    const baseQuantity = Math.max(Number(currentPreview.price_base_quantity) || 1, 1);
+    return `${baseQuantity.toLocaleString('zh-CN')} \u4e2a / ${formatMoney(currentPreview.discounted_unit_price)}`;
+  }
+  return formatMoney(currentPreview.discounted_unit_price);
+});
+
+const currentInputKey = computed(() => `${targetType.value}::${content.value}`);
+
+function getCurrentBatchContent() {
+  const textareaValue = document.querySelector<HTMLTextAreaElement>('.batch-textarea')?.value;
+  const value = textareaValue ?? content.value;
+  if (value !== content.value) {
+    content.value = value;
+  }
+  return value;
+}
 
 const statusType = computed(() => {
   if (connectionOk.value === true) {
@@ -266,6 +299,16 @@ function formatMoney(value?: number) {
   })}`;
 }
 
+function formatMoneyParts(value?: number) {
+  return {
+    amount: (Number(value) || 0).toLocaleString('zh-CN', {
+      maximumFractionDigits: 2,
+      minimumFractionDigits: 2,
+    }),
+    symbol: '\u00a5',
+  };
+}
+
 function formatDateTime(value?: string) {
   if (!value) {
     return '-';
@@ -284,8 +327,87 @@ function orderRecordStatusLabel(status: string) {
     failed: '失败',
     pending: '待处理',
     processing: '处理中',
+    refund_approved: '已退款',
+    refund_calculating: '退款中',
+    refund_rejected: '退款已拒绝',
+    refund_requested: '退款中',
+    stopping: '退款中',
   };
   return statusMap[status] || status || '-';
+}
+
+function isRefundedOrder(order: OrderApi.BatchOrderRecordItem) {
+  return (
+    order.order_status === 'refund_approved' ||
+    Number(order.refund_amount || 0) > 0 ||
+    Number((order as OrderApi.BatchOrderRecordItem & { refunded_quantity?: number })
+      .refunded_quantity || 0) > 0
+  );
+}
+
+function isRefundingOrder(order: OrderApi.BatchOrderRecordItem) {
+  return ['refund_requested', 'refund_calculating', 'stopping'].includes(order.order_status);
+}
+
+function isRefundRejectedOrder(order: OrderApi.BatchOrderRecordItem) {
+  return order.order_status === 'refund_rejected';
+}
+
+function hasRefundedOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some(isRefundedOrder);
+}
+
+function hasRefundingOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some(isRefundingOrder);
+}
+
+function hasRefundRejectedOrder(record: OrderApi.BatchOrderRecord) {
+  return (record.orders || []).some(isRefundRejectedOrder);
+}
+
+function batchDisplayStatusLabel(record: OrderApi.BatchOrderRecord) {
+  if (hasRefundedOrder(record)) {
+    return '已退款';
+  }
+  if (hasRefundingOrder(record)) {
+    return '退款中';
+  }
+  if (hasRefundRejectedOrder(record)) {
+    return '退款已拒绝';
+  }
+  return orderRecordStatusLabel(record.status);
+}
+
+function orderDrawerStatusLabel(order: OrderApi.BatchOrderRecordItem) {
+  if (isRefundedOrder(order)) {
+    return '已退款';
+  }
+  if (isRefundingOrder(order)) {
+    return '退款中';
+  }
+  if (isRefundRejectedOrder(order)) {
+    return '退款已拒绝';
+  }
+  if (order.order_status === 'failed') {
+    return '失败';
+  }
+  if (order.order_status === 'completed') {
+    return '成功';
+  }
+  return '进行中';
+}
+
+function orderDrawerStatusTagType(order: OrderApi.BatchOrderRecordItem) {
+  if (isRefundedOrder(order)) {
+    return 'warning';
+  }
+  if (isRefundRejectedOrder(order) || order.order_status === 'failed') {
+    return 'danger';
+  }
+  if (order.order_status === 'completed') {
+    return 'success';
+  }
+  return 'warning';
 }
 
 function fillExample() {
@@ -467,10 +589,11 @@ function openOrderRecords() {
 }
 
 async function removeProblemLinks() {
+  const batchContent = getCurrentBatchContent();
   previewing.value = true;
   try {
     preview.value = await previewBatchOrderSilentApi({
-      content: content.value,
+      content: batchContent,
       target_type: targetType.value,
     });
   } finally {
@@ -592,14 +715,21 @@ async function checkConnection(showSuccess = false) {
 }
 
 async function validateContent() {
+  const batchContent = getCurrentBatchContent();
   previewing.value = true;
   try {
     const result = await previewBatchOrderApi({
-      content: content.value,
+      content: batchContent,
+      target_type: targetType.value,
+    });
+    console.log('[Batch Preview] request', {
+      content_length: batchContent.length,
+      line_count: batchContent.split(/\r?\n/).filter((line) => line.trim()).length,
       target_type: targetType.value,
     });
     console.log('[Batch Preview] response', result);
     preview.value = result;
+    previewInputKey.value = currentInputKey.value;
     latestPreviewBatchNo.value = preview.value.check_batch_no;
     selectedCheckBatchNo.value = preview.value.check_batch_no;
     if (preview.value.invalid_count > 0 || preview.value.warnings.length > 0) {
@@ -625,10 +755,11 @@ async function submitOrder() {
 
   submitting.value = true;
   try {
+    const batchContent = getCurrentBatchContent();
     const result = await submitBatchOrderApi(
       {
         agree_policy: agreePolicy.value,
-        content: content.value,
+        content: batchContent,
         target_type: targetType.value,
       },
       { silent: true },
@@ -637,6 +768,7 @@ async function submitOrder() {
     ElMessage.success(`提交成功：${result.batch_no}`);
     content.value = '';
     preview.value = undefined;
+    previewInputKey.value = '';
     agreePolicy.value = false;
     latestPreviewBatchNo.value = '';
   } finally {
@@ -647,8 +779,17 @@ async function submitOrder() {
 function clearContent() {
   content.value = '';
   preview.value = undefined;
+  previewInputKey.value = '';
   agreePolicy.value = false;
 }
+
+watch(currentInputKey, (key) => {
+  if (preview.value && previewInputKey.value && key !== previewInputKey.value) {
+    preview.value = undefined;
+    previewInputKey.value = '';
+    latestPreviewBatchNo.value = '';
+  }
+});
 
 onMounted(() => {
   checkConnection();
@@ -738,6 +879,7 @@ onMounted(() => {
           </ElTag>
           <span v-if="connectionOk === false">连接检测失败，请先恢复后端服务</span>
           <span v-else-if="!content">请先输入批量下单内容</span>
+          <span v-else-if="!preview">请先手动预校验</span>
           <span v-else-if="preview?.warnings.length">{{ preview.warnings[0] }}</span>
           <span v-else-if="!agreePolicy">请确认公告内容</span>
           <span v-else>校验通过，可以提交</span>
@@ -782,7 +924,14 @@ onMounted(() => {
           <template v-if="preview">
             <div class="amount-main">
               <span>预计扣费</span>
-              <strong>{{ formatMoney(preview.total_amount) }}</strong>
+              <strong class="amount-value">
+                <span>{{ formatMoneyParts(preview.total_amount).symbol }}</span>
+                {{ formatMoneyParts(preview.total_amount).amount }}
+              </strong>
+              <small>
+                {{ settlementLabels.totalQuantity }}
+                {{ previewTotalQuantity.toLocaleString('zh-CN') }}
+              </small>
             </div>
             <div class="settlement-grid">
               <div>
@@ -801,7 +950,7 @@ onMounted(() => {
               </div>
               <div>
                 <span>单价</span>
-                <strong>{{ formatMoney(preview.discounted_unit_price) }}</strong>
+                <strong>{{ previewPriceText }}</strong>
               </div>
             </div>
             <div v-if="preview.warnings.length" class="warning-box">
@@ -853,7 +1002,7 @@ onMounted(() => {
             <div class="drawer-title-tags">
               <ElTag size="small" type="primary">确认提交</ElTag>
               <ElTag size="small">
-              {{ orderRecordStatusLabel(selectedOrderBatch.status) }}
+              {{ batchDisplayStatusLabel(selectedOrderBatch) }}
             </ElTag>
             </div>
           </div>
@@ -896,6 +1045,8 @@ onMounted(() => {
               class="order-record-drawer-item"
               :class="{
                 failed: order.order_status === 'failed',
+                refunded: isRefundedOrder(order),
+                refunding: isRefundingOrder(order),
                 success: order.order_status === 'completed',
               }"
             >
@@ -908,21 +1059,9 @@ onMounted(() => {
               <ElTag
                 class="order-status-tag"
                 size="small"
-                :type="
-                  order.order_status === 'failed'
-                    ? 'danger'
-                    : order.order_status === 'completed'
-                      ? 'success'
-                      : 'warning'
-                "
+                :type="orderDrawerStatusTagType(order)"
               >
-                {{
-                  order.order_status === 'failed'
-                    ? '失败'
-                    : order.order_status === 'completed'
-                      ? '成功'
-                      : '进行中'
-                }}
+                {{ orderDrawerStatusLabel(order) }}
               </ElTag>
             </div>
             <div
@@ -1336,7 +1475,11 @@ onMounted(() => {
 }
 
 .order-record-drawer-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(40px, auto) minmax(64px, auto);
   align-items: center;
+  width: 100%;
+  box-sizing: border-box;
   padding: 10px;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
@@ -1353,9 +1496,14 @@ onMounted(() => {
   background: color-mix(in srgb, var(--el-color-danger) 7%, var(--el-bg-color));
 }
 
+.order-record-drawer-item.refunded,
+.order-record-drawer-item.refunding {
+  border-color: var(--el-color-warning-light-5);
+  background: color-mix(in srgb, var(--el-color-warning) 12%, var(--el-bg-color));
+}
+
 .order-record-drawer-item > div {
   min-width: 0;
-  flex: 1;
 }
 
 .order-record-drawer-item span,
@@ -1379,6 +1527,8 @@ onMounted(() => {
 }
 
 .order-record-drawer-item strong {
+  min-width: 0;
+  justify-self: end;
   white-space: nowrap;
 }
 
@@ -1386,7 +1536,8 @@ onMounted(() => {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 52px;
+  justify-self: end;
+  min-width: 64px;
   height: 24px;
   padding: 0;
   line-height: 24px;
@@ -1508,33 +1659,99 @@ onMounted(() => {
   align-self: start;
   padding: 0;
   overflow: hidden;
+  box-shadow: 0 10px 28px rgb(15 23 42 / 6%);
 }
 
 .settlement-panel h2 {
-  padding: 22px 26px 16px;
+  padding: 22px 26px 18px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 
 .settlement-body {
-  padding: 24px 26px;
+  padding: 24px 26px 26px;
+}
+
+.amount-main {
+  position: relative;
+  padding: 18px 18px 16px;
+  border: 1px solid color-mix(in srgb, var(--el-color-primary) 14%, var(--el-border-color-light));
+  border-radius: 10px;
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 8%, transparent), transparent 58%),
+    var(--el-fill-color-blank);
+}
+
+.amount-main span {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .amount-main strong {
-  display: block;
-  margin-top: 8px;
-  font-size: 32px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--el-text-color-primary);
+  font-size: 34px;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.amount-main strong span {
+  color: inherit;
+  font-size: 26px;
+  font-weight: 800;
+}
+
+.amount-main small {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 12px;
+  padding: 4px 9px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--el-color-primary) 10%, var(--el-fill-color-light));
+  color: var(--el-color-primary);
+  font-size: 12px;
+  font-weight: 650;
 }
 
 .settlement-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
+  gap: 10px;
   margin-top: 18px;
+}
+
+.settlement-grid > div {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-lighter);
 }
 
 .settlement-grid strong,
 .settlement-grid span {
   display: block;
+}
+
+.settlement-grid span {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.settlement-grid strong {
+  overflow-wrap: anywhere;
+  margin-top: 5px;
+  color: var(--el-text-color-primary);
+  font-size: 15px;
+  line-height: 1.25;
+}
+
+.settlement-grid strong.red {
+  color: var(--el-color-danger);
 }
 
 .warning-box {
@@ -1598,6 +1815,15 @@ onMounted(() => {
 
   .status-select {
     width: 100%;
+  }
+
+  .order-record-drawer-item {
+    grid-template-columns: minmax(0, 1fr) minmax(40px, auto);
+  }
+
+  .order-status-tag {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
 }
 </style>

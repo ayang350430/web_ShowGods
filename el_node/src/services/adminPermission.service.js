@@ -1,7 +1,7 @@
 const { getPool } = require('../config/database');
 
 const ADMIN_ROLES = new Set(['super', 'admin']);
-const PRICE_MODES = new Set(['default', 'discount', 'fixed']);
+const PRICE_MODES = new Set(['default', 'discount', 'fixed', 'quantity']);
 
 let userPriceColumnsReady;
 
@@ -28,6 +28,15 @@ const ensureUserPriceColumns = async (db) => {
       await ensureColumn('impression_price_mode', "VARCHAR(32) NOT NULL DEFAULT 'discount'");
       await ensureColumn('fixed_unit_price', 'DECIMAL(18,4) DEFAULT NULL');
       await ensureColumn('impression_fixed_unit_price', 'DECIMAL(18,4) DEFAULT NULL');
+      await ensureColumn('quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
+      await ensureColumn('quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
+      await ensureColumn('impression_quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
+      await ensureColumn('impression_quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
+      await ensureColumn('like_discount_rate', 'DECIMAL(10,4) NOT NULL DEFAULT 1.0000');
+      await ensureColumn('like_price_mode', "VARCHAR(32) NOT NULL DEFAULT 'discount'");
+      await ensureColumn('like_fixed_unit_price', 'DECIMAL(18,4) DEFAULT NULL');
+      await ensureColumn('like_quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
+      await ensureColumn('like_quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
     })();
   }
 
@@ -132,11 +141,17 @@ const listUsers = async (actorUserId, query = {}) => {
         u.id, u.username, u.real_name, u.nickname, u.user_no, u.status, u.created_at,
         u.discount_rate, u.impression_discount_rate, u.price_mode, u.impression_price_mode,
         u.fixed_unit_price, u.impression_fixed_unit_price,
+        u.quantity_price_base, u.quantity_price_amount,
+        u.impression_quantity_price_base, u.impression_quantity_price_amount,
+        u.like_discount_rate, u.like_price_mode, u.like_fixed_unit_price,
+        u.like_quantity_price_base, u.like_quantity_price_amount,
+        COALESCE(ba.available_amount, 0) AS available_amount,
         GROUP_CONCAT(r.code ORDER BY FIELD(r.code, 'super', 'admin', 'user'), r.code) AS role_codes,
         GROUP_CONCAT(r.name ORDER BY FIELD(r.code, 'super', 'admin', 'user'), r.code) AS role_names
       FROM users u
       LEFT JOIN user_roles ur ON ur.user_id = u.id
       LEFT JOIN roles r ON r.id = ur.role_id
+      LEFT JOIN balance_accounts ba ON ba.user_id = u.id
       ${where}
       GROUP BY u.id
       ORDER BY u.id ASC
@@ -148,16 +163,34 @@ const listUsers = async (actorUserId, query = {}) => {
   const items = rows.map((row) => ({
     created_at: row.created_at,
     display_name: row.nickname || row.real_name || row.username,
+    available_amount: Number(row.available_amount) || 0,
     discount_rate: Number(row.discount_rate) || 1,
     fixed_unit_price: row.fixed_unit_price === null ? null : Number(row.fixed_unit_price),
     id: Number(row.id),
     impression_fixed_unit_price:
       row.impression_fixed_unit_price === null ? null : Number(row.impression_fixed_unit_price),
+    impression_quantity_price_amount:
+      row.impression_quantity_price_amount === null
+        ? null
+        : Number(row.impression_quantity_price_amount),
+    impression_quantity_price_base:
+      row.impression_quantity_price_base === null ? null : Number(row.impression_quantity_price_base),
     impression_discount_rate: Number(row.impression_discount_rate) || 1,
     impression_price_mode: PRICE_MODES.has(row.impression_price_mode)
       ? row.impression_price_mode
       : 'discount',
+    like_discount_rate: Number(row.like_discount_rate) || 1,
+    like_fixed_unit_price:
+      row.like_fixed_unit_price === null ? null : Number(row.like_fixed_unit_price),
+    like_price_mode: PRICE_MODES.has(row.like_price_mode) ? row.like_price_mode : 'discount',
+    like_quantity_price_amount:
+      row.like_quantity_price_amount === null ? null : Number(row.like_quantity_price_amount),
+    like_quantity_price_base:
+      row.like_quantity_price_base === null ? null : Number(row.like_quantity_price_base),
     price_mode: PRICE_MODES.has(row.price_mode) ? row.price_mode : 'discount',
+    quantity_price_amount:
+      row.quantity_price_amount === null ? null : Number(row.quantity_price_amount),
+    quantity_price_base: row.quantity_price_base === null ? null : Number(row.quantity_price_base),
     real_name: row.real_name || '',
     role_names: row.role_names ? row.role_names.split(',') : [],
     roles: row.role_codes ? row.role_codes.split(',') : [],
@@ -315,6 +348,19 @@ const normalizeFixedPriceInput = (value, fieldName) => {
   return Math.round(price * 10_000) / 10_000;
 };
 
+const normalizeQuantityBaseInput = (value, fieldName) => {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+  const quantity = Number(value);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    const error = new Error(`${fieldName} must be a positive integer`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return quantity;
+};
+
 const updateUserDiscounts = async (
   actorUserId,
   targetUserId,
@@ -324,7 +370,16 @@ const updateUserDiscounts = async (
     impression_discount_rate: impressionDiscountRate,
     impression_fixed_unit_price: impressionFixedUnitPrice,
     impression_price_mode: impressionPriceMode,
+    impression_quantity_price_amount: impressionQuantityPriceAmount,
+    impression_quantity_price_base: impressionQuantityPriceBase,
+    like_discount_rate: likeDiscountRate,
+    like_fixed_unit_price: likeFixedUnitPrice,
+    like_price_mode: likePriceMode,
+    like_quantity_price_amount: likeQuantityPriceAmount,
+    like_quantity_price_base: likeQuantityPriceBase,
     price_mode: viewPriceMode,
+    quantity_price_amount: viewQuantityPriceAmount,
+    quantity_price_base: viewQuantityPriceBase,
   } = {},
 ) => {
   const db = getPool();
@@ -343,13 +398,69 @@ const updateUserDiscounts = async (
     impressionDiscountRate,
     'impression_discount_rate',
   );
+  const nextLikeDiscountRate = normalizeDiscountRateInput(
+    likeDiscountRate === undefined ? viewDiscountRate : likeDiscountRate,
+    'like_discount_rate',
+  );
   const nextViewPriceMode = normalizePriceModeInput(viewPriceMode);
   const nextImpressionPriceMode = normalizePriceModeInput(impressionPriceMode);
+  const nextLikePriceMode = normalizePriceModeInput(likePriceMode, nextViewPriceMode);
   const nextViewFixedUnitPrice = normalizeFixedPriceInput(viewFixedUnitPrice, 'fixed_unit_price');
   const nextImpressionFixedUnitPrice = normalizeFixedPriceInput(
     impressionFixedUnitPrice,
     'impression_fixed_unit_price',
   );
+  const nextViewQuantityPriceBase = normalizeQuantityBaseInput(
+    viewQuantityPriceBase,
+    'quantity_price_base',
+  );
+  const nextViewQuantityPriceAmount = normalizeFixedPriceInput(
+    viewQuantityPriceAmount,
+    'quantity_price_amount',
+  );
+  const nextImpressionQuantityPriceBase = normalizeQuantityBaseInput(
+    impressionQuantityPriceBase,
+    'impression_quantity_price_base',
+  );
+  const nextImpressionQuantityPriceAmount = normalizeFixedPriceInput(
+    impressionQuantityPriceAmount,
+    'impression_quantity_price_amount',
+  );
+  const nextLikeFixedUnitPrice = normalizeFixedPriceInput(
+    likeFixedUnitPrice === undefined ? viewFixedUnitPrice : likeFixedUnitPrice,
+    'like_fixed_unit_price',
+  );
+  const nextLikeQuantityPriceBase = normalizeQuantityBaseInput(
+    likeQuantityPriceBase === undefined ? viewQuantityPriceBase : likeQuantityPriceBase,
+    'like_quantity_price_base',
+  );
+  const nextLikeQuantityPriceAmount = normalizeFixedPriceInput(
+    likeQuantityPriceAmount === undefined ? viewQuantityPriceAmount : likeQuantityPriceAmount,
+    'like_quantity_price_amount',
+  );
+
+  if (nextViewPriceMode === 'quantity' && (!nextViewQuantityPriceBase || !nextViewQuantityPriceAmount)) {
+    const error = new Error('quantity price requires quantity_price_base and quantity_price_amount');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (
+    nextImpressionPriceMode === 'quantity' &&
+    (!nextImpressionQuantityPriceBase || !nextImpressionQuantityPriceAmount)
+  ) {
+    const error = new Error(
+      'impression quantity price requires impression_quantity_price_base and impression_quantity_price_amount',
+    );
+    error.statusCode = 400;
+    throw error;
+  }
+  if (nextLikePriceMode === 'quantity' && (!nextLikeQuantityPriceBase || !nextLikeQuantityPriceAmount)) {
+    const error = new Error(
+      'like quantity price requires like_quantity_price_base and like_quantity_price_amount',
+    );
+    error.statusCode = 400;
+    throw error;
+  }
 
   const [result] = await db.execute(
     `
@@ -359,7 +470,16 @@ const updateUserDiscounts = async (
           price_mode = ?,
           impression_price_mode = ?,
           fixed_unit_price = ?,
-          impression_fixed_unit_price = ?
+          impression_fixed_unit_price = ?,
+          quantity_price_base = ?,
+          quantity_price_amount = ?,
+          impression_quantity_price_base = ?,
+          impression_quantity_price_amount = ?,
+          like_discount_rate = ?,
+          like_price_mode = ?,
+          like_fixed_unit_price = ?,
+          like_quantity_price_base = ?,
+          like_quantity_price_amount = ?
       WHERE id = ?
     `,
     [
@@ -369,6 +489,15 @@ const updateUserDiscounts = async (
       nextImpressionPriceMode,
       nextViewFixedUnitPrice,
       nextImpressionFixedUnitPrice,
+      nextViewQuantityPriceBase,
+      nextViewQuantityPriceAmount,
+      nextImpressionQuantityPriceBase,
+      nextImpressionQuantityPriceAmount,
+      nextLikeDiscountRate,
+      nextLikePriceMode,
+      nextLikeFixedUnitPrice,
+      nextLikeQuantityPriceBase,
+      nextLikeQuantityPriceAmount,
       targetId,
     ],
   );
@@ -384,15 +513,109 @@ const updateUserDiscounts = async (
     fixed_unit_price: nextViewFixedUnitPrice,
     impression_discount_rate: nextImpressionDiscountRate,
     impression_fixed_unit_price: nextImpressionFixedUnitPrice,
+    impression_quantity_price_amount: nextImpressionQuantityPriceAmount,
+    impression_quantity_price_base: nextImpressionQuantityPriceBase,
     impression_price_mode: nextImpressionPriceMode,
+    like_discount_rate: nextLikeDiscountRate,
+    like_fixed_unit_price: nextLikeFixedUnitPrice,
+    like_price_mode: nextLikePriceMode,
+    like_quantity_price_amount: nextLikeQuantityPriceAmount,
+    like_quantity_price_base: nextLikeQuantityPriceBase,
     price_mode: nextViewPriceMode,
+    quantity_price_amount: nextViewQuantityPriceAmount,
+    quantity_price_base: nextViewQuantityPriceBase,
     user_id: targetId,
   };
+};
+
+const updateUserBalance = async (actorUserId, targetUserId, { amount, reason } = {}) => {
+  const db = getPool();
+  await assertAdmin(db, actorUserId);
+  const targetId = Number(targetUserId);
+  const nextAmount = Number(amount);
+
+  if (!targetId) {
+    const error = new Error('Invalid target user');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!Number.isFinite(nextAmount) || nextAmount < 0) {
+    const error = new Error('Balance amount must be greater than or equal to 0');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const [[target]] = await db.execute('SELECT id, username FROM users WHERE id = ?', [targetId]);
+  if (!target) {
+    const error = new Error('Target user not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  const connection = await db.getConnection();
+  const now = new Date();
+  const roundedAmount = Math.round(nextAmount * 10_000) / 10_000;
+  try {
+    await connection.beginTransaction();
+    await connection.execute(
+      'INSERT INTO balance_accounts (user_id, available_amount) VALUES (?, 0) ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)',
+      [targetId],
+    );
+    const [[balance]] = await connection.execute(
+      'SELECT available_amount FROM balance_accounts WHERE user_id = ? FOR UPDATE',
+      [targetId],
+    );
+    const beforeAmount = Number(balance?.available_amount) || 0;
+    const delta = Math.round((roundedAmount - beforeAmount) * 10_000) / 10_000;
+    await connection.execute(
+      'UPDATE balance_accounts SET available_amount = ?, updated_at = ? WHERE user_id = ?',
+      [roundedAmount, now, targetId],
+    );
+    await connection.execute(
+      `
+        INSERT INTO account_records
+          (
+            record_no, user_id, record_type, direction, status, actual_paid_amount,
+            net_amount, before_available_amount, after_available_amount,
+            reason_code, reason_message, remark, created_at, updated_at
+          )
+        VALUES (?, ?, 'balance_adjustment', ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        `BAL-${Date.now()}-${targetId}`,
+        targetId,
+        delta >= 0 ? 'credit' : 'debit',
+        Math.abs(delta),
+        delta,
+        beforeAmount,
+        roundedAmount,
+        'admin_balance_update',
+        reason || `管理员调整余额为 ${roundedAmount.toFixed(4)}`,
+        `operator=${actorUserId}`,
+        now,
+        now,
+      ],
+    );
+    await connection.commit();
+
+    return {
+      after_available_amount: roundedAmount,
+      before_available_amount: beforeAmount,
+      delta_amount: delta,
+      user_id: targetId,
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 };
 
 module.exports = {
   listRoles,
   listUsers,
+  updateUserBalance,
   updateUserDiscounts,
   updateUserStatus,
   updateUserRoles,

@@ -498,6 +498,10 @@ const createGoodsTables = async (db) => {
       note_id VARCHAR(64) DEFAULT NULL,
       note_url VARCHAR(1024) DEFAULT NULL,
       target_type VARCHAR(32) NOT NULL DEFAULT 'view',
+      title VARCHAR(255) DEFAULT NULL,
+      author_name VARCHAR(128) DEFAULT NULL,
+      avatar_url VARCHAR(1024) DEFAULT NULL,
+      like_count BIGINT UNSIGNED DEFAULT NULL,
       ordered_quantity INT UNSIGNED NOT NULL DEFAULT 0,
       completed_quantity INT UNSIGNED NOT NULL DEFAULT 0,
       refunded_quantity INT UNSIGNED NOT NULL DEFAULT 0,
@@ -513,6 +517,11 @@ const createGoodsTables = async (db) => {
       reason_message VARCHAR(255) DEFAULT NULL,
       snapshot_current_read_count INT UNSIGNED DEFAULT NULL,
       snapshot_verified_read_count INT UNSIGNED DEFAULT NULL,
+      snapshot_current_read_payload LONGTEXT DEFAULT NULL,
+      snapshot_verified_read_payload LONGTEXT DEFAULT NULL,
+      snapshot_current_like_payload LONGTEXT DEFAULT NULL,
+      snapshot_verified_like_count INT UNSIGNED DEFAULT NULL,
+      snapshot_verified_like_payload LONGTEXT DEFAULT NULL,
       last_dispatch_at DATETIME DEFAULT NULL,
       last_verified_at DATETIME DEFAULT NULL,
       refund_lock_status VARCHAR(32) NOT NULL DEFAULT 'unlocked',
@@ -536,6 +545,19 @@ const createGoodsTables = async (db) => {
       KEY idx_orders_refund_calc_after_at (refund_calc_after_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
+
+  await ensureColumn(db, 'orders', 'title', 'VARCHAR(255) DEFAULT NULL AFTER target_type');
+  await ensureColumn(db, 'orders', 'author_name', 'VARCHAR(128) DEFAULT NULL AFTER title');
+  await ensureColumn(db, 'orders', 'avatar_url', 'VARCHAR(1024) DEFAULT NULL AFTER author_name');
+  await ensureColumn(db, 'orders', 'like_count', 'BIGINT UNSIGNED DEFAULT NULL AFTER avatar_url');
+  await ensureColumn(db, 'orders', 'snapshot_current_read_count', 'INT UNSIGNED DEFAULT NULL AFTER reason_message');
+  await ensureColumn(db, 'orders', 'snapshot_verified_read_count', 'INT UNSIGNED DEFAULT NULL AFTER snapshot_current_read_count');
+  await ensureColumn(db, 'orders', 'snapshot_current_read_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_verified_read_count');
+  await ensureColumn(db, 'orders', 'snapshot_verified_read_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_current_read_payload');
+  await ensureColumn(db, 'orders', 'snapshot_current_like_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_verified_read_payload');
+  await ensureColumn(db, 'orders', 'snapshot_verified_like_count', 'INT UNSIGNED DEFAULT NULL AFTER snapshot_current_like_payload');
+  await ensureColumn(db, 'orders', 'snapshot_verified_like_payload', 'LONGTEXT DEFAULT NULL AFTER snapshot_verified_like_count');
+  await ensureColumn(db, 'orders', 'repair_count', 'INT UNSIGNED NOT NULL DEFAULT 0 AFTER refund_amount_total');
 
   await db.execute(`
     CREATE TABLE IF NOT EXISTS batch_problem_link_records (
@@ -1177,6 +1199,40 @@ const initializeDatabase = async () => {
     'impression_fixed_unit_price',
     'DECIMAL(18,4) DEFAULT NULL',
   );
+  await ensureColumn(db, 'users', 'quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
+  await ensureColumn(db, 'users', 'quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
+  await ensureColumn(
+    db,
+    'users',
+    'impression_quantity_price_base',
+    'INT UNSIGNED DEFAULT NULL',
+  );
+  await ensureColumn(
+    db,
+    'users',
+    'impression_quantity_price_amount',
+    'DECIMAL(18,4) DEFAULT NULL',
+  );
+  await ensureColumn(
+    db,
+    'users',
+    'like_discount_rate',
+    'DECIMAL(10,4) NOT NULL DEFAULT 1.0000',
+  );
+  await ensureColumn(
+    db,
+    'users',
+    'like_price_mode',
+    "VARCHAR(32) NOT NULL DEFAULT 'discount'",
+  );
+  await ensureColumn(
+    db,
+    'users',
+    'like_fixed_unit_price',
+    'DECIMAL(18,4) DEFAULT NULL',
+  );
+  await ensureColumn(db, 'users', 'like_quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
+  await ensureColumn(db, 'users', 'like_quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
 
   await db.execute(
     "UPDATE users SET home_path = '/analytics' WHERE home_path IN ('/dashboard/workspace', '/workspace')",
@@ -1228,6 +1284,7 @@ const initializeDatabase = async () => {
 
   await seedRolesAndPermissions(db);
   await createGoodsTables(db);
+  await require('../services/openApi.service').ensureOpenApiKeyTable(db);
   await seedGoodsConfigs(db);
   await applySchemaComments(db);
 

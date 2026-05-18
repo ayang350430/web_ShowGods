@@ -1,7 +1,8 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import type { OrderApi } from '#/api';
 
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
+import { useRoute } from 'vue-router';
 
 import { useUserStore } from '@vben/stores';
 
@@ -21,6 +22,7 @@ import {
 import { getConsumptionRecordsApi, requestOrderRefundApi } from '#/api';
 
 const loading = ref(false);
+const route = useRoute();
 const records = ref<OrderApi.ConsumptionRecord[]>([]);
 const userStore = useUserStore();
 const summary = ref<OrderApi.ConsumptionRecordSummary>({
@@ -42,6 +44,13 @@ const pagination = reactive({
   page_size: 10,
   total: 0,
 });
+
+function applyRouteKeyword() {
+  const keyword = route.query.keyword;
+  if (typeof keyword === 'string') {
+    filters.keyword = keyword;
+  }
+}
 
 const stats = computed(() => [
   {
@@ -84,6 +93,17 @@ function formatUnitPrice(value?: number) {
   })}`;
 }
 
+function recordDisplayPrice(row: OrderApi.ConsumptionRecord) {
+  if (row.record_type === 'refund') {
+    return Number(row.refund_amount || 0);
+  }
+  return Number(row.actual_paid_amount || row.payable_amount || row.discounted_unit_price || 0);
+}
+
+function recordOriginalPrice(row: OrderApi.ConsumptionRecord) {
+  return Number(row.original_total_amount || row.original_unit_price || 0);
+}
+
 function formatDateTime(value?: string) {
   if (!value) {
     return '-';
@@ -103,11 +123,16 @@ function formatDateTime(value?: string) {
 function recordTypeLabel(type: string) {
   const map: Record<string, string> = {
     adjustment: '人工调整',
+    balance_adjustment: '余额调整',
     order_charge: '下单扣费',
     recharge: '余额充值',
     refund: '订单退款',
   };
   return map[type] || type || '-';
+}
+
+function isBalanceAdjustment(row: OrderApi.ConsumptionRecord) {
+  return row.record_type === 'balance_adjustment';
 }
 
 function directionLabel(direction: string) {
@@ -146,7 +171,7 @@ function orderStatusLabel(status: string) {
     refund_calculating: '退款中',
     refund_rejected: '退款拒绝',
     refund_requested: '退款中',
-    repair_review: '补量审核',
+    repair_review: '待补单',
     running: '进行中',
     stopping: '停止中',
   };
@@ -166,7 +191,17 @@ function orderStatusTagType(status: string) {
   return 'info';
 }
 
-function canRequestRefund(status: string) {
+function isRepairVerifyWaiting(
+  item: OrderApi.ConsumptionRecord['order_items'][number],
+) {
+  return (
+    item.order_status === 'running' &&
+    item.external_status === 'completed' &&
+    Number(item.repair_count || 0) > 0
+  );
+}
+
+function canRequestRefund(item: OrderApi.ConsumptionRecord['order_items'][number]) {
   return ![
     'completed',
     'failed',
@@ -175,7 +210,23 @@ function canRequestRefund(status: string) {
     'refund_rejected',
     'refund_requested',
     'stopping',
-  ].includes(status);
+  ].includes(item.order_status);
+}
+
+function disabledRefundLabel(item: OrderApi.ConsumptionRecord['order_items'][number]) {
+  if (item.order_status === 'repair_review') {
+    return '申请补单';
+  }
+  if (isRepairVerifyWaiting(item)) {
+    return '补单复查中';
+  }
+  if (item.order_status === 'refund_requested') {
+    return '退款中';
+  }
+  if (item.order_status === 'refund_approved') {
+    return '已退款';
+  }
+  return '不可申请';
 }
 
 async function requestRefund(orderId: number) {
@@ -228,7 +279,19 @@ function handlePageSizeChange(pageSize: number) {
   loadRecords();
 }
 
-onMounted(loadRecords);
+onMounted(() => {
+  applyRouteKeyword();
+  void loadRecords();
+});
+
+watch(
+  () => route.query.keyword,
+  () => {
+    applyRouteKeyword();
+    pagination.page = 1;
+    void loadRecords();
+  },
+);
 </script>
 
 <template>
@@ -318,7 +381,7 @@ onMounted(loadRecords);
                   {{ orderStatusLabel(item.order_status) }}
                 </ElTag>
                 <ElPopconfirm
-                  v-if="canManageRefund && canRequestRefund(item.order_status)"
+                  v-if="canManageRefund && canRequestRefund(item)"
                   title="确认申请这条订单退款？申请后需要管理员审核。"
                   confirm-button-text="申请退款"
                   cancel-button-text="取消"
@@ -329,13 +392,7 @@ onMounted(loadRecords);
                   </template>
                 </ElPopconfirm>
                 <ElButton v-else-if="canManageRefund" disabled size="small">
-                  {{
-                    item.order_status === 'refund_requested'
-                      ? '退款中'
-                      : item.order_status === 'refund_approved'
-                        ? '已退款'
-                        : '不可申请'
-                  }}
+                  {{ disabledRefundLabel(item) }}
                 </ElButton>
               </div>
             </div>
@@ -364,7 +421,7 @@ onMounted(loadRecords);
         <ElTableColumn label="关联订单" min-width="190">
           <template #default="{ row }">
             <div class="muted-cell">
-              <strong>{{ row.order_no || '-' }}</strong>
+              <strong>{{ isBalanceAdjustment(row) ? '余额调整' : row.order_no || '-' }}</strong>
               <span>{{ row.reason_message || row.remark || '-' }}</span>
             </div>
           </template>
@@ -372,16 +429,24 @@ onMounted(loadRecords);
         <ElTableColumn label="数量" min-width="100">
           <template #default="{ row }">
             <div class="number-cell">
-              <strong>{{ row.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              <span v-if="row.refunded_quantity">退 {{ row.refunded_quantity }}</span>
+              <strong>{{ isBalanceAdjustment(row) ? '-' : row.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+              <span v-if="!isBalanceAdjustment(row) && row.refunded_quantity">
+                退 {{ row.refunded_quantity }}
+              </span>
             </div>
           </template>
         </ElTableColumn>
         <ElTableColumn label="价格" min-width="140">
           <template #default="{ row }">
             <div class="muted-cell">
-              <strong>{{ formatUnitPrice(row.discounted_unit_price) }}</strong>
-              <span>原价 {{ formatUnitPrice(row.original_unit_price) }}</span>
+              <template v-if="isBalanceAdjustment(row)">
+                <strong>-</strong>
+                <span>不涉及单价</span>
+              </template>
+              <template v-else>
+                <strong>{{ formatUnitPrice(recordDisplayPrice(row)) }}</strong>
+                <span>原价 {{ formatUnitPrice(recordOriginalPrice(row)) }}</span>
+              </template>
             </div>
           </template>
         </ElTableColumn>
@@ -661,3 +726,4 @@ onMounted(loadRecords);
   }
 }
 </style>
+

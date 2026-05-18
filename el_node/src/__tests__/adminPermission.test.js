@@ -123,6 +123,115 @@ describe('admin permission management', () => {
     expect(Number(user.impression_discount_rate)).toBe(0.8);
   });
 
+  test('allows admin to update quantity based prices', async () => {
+    const registerResponse = await request(app).post('/api/auth/register').send({
+      password: 'userpass123',
+      username: `quantity_price_${Date.now()}`,
+    });
+    const targetUserId = registerResponse.body.data.id;
+
+    const response = await request(app)
+      .put(`/api/v1/admin/permissions/users/${targetUserId}/discounts`)
+      .send({
+        discount_rate: 1,
+        fixed_unit_price: null,
+        impression_discount_rate: 1,
+        impression_fixed_unit_price: null,
+        impression_price_mode: 'quantity',
+        impression_quantity_price_amount: 12.5,
+        impression_quantity_price_base: 1000,
+        like_discount_rate: 1,
+        like_fixed_unit_price: null,
+        like_price_mode: 'quantity',
+        like_quantity_price_amount: 8,
+        like_quantity_price_base: 100,
+        price_mode: 'quantity',
+        quantity_price_amount: 30,
+        quantity_price_base: 1000,
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toMatchObject({
+      impression_price_mode: 'quantity',
+      impression_quantity_price_amount: 12.5,
+      impression_quantity_price_base: 1000,
+      like_price_mode: 'quantity',
+      like_quantity_price_amount: 8,
+      like_quantity_price_base: 100,
+      price_mode: 'quantity',
+      quantity_price_amount: 30,
+      quantity_price_base: 1000,
+      user_id: targetUserId,
+    });
+
+    const db = getPool();
+    const [[user]] = await db.execute(
+      `
+        SELECT price_mode, quantity_price_base, quantity_price_amount,
+          impression_price_mode, impression_quantity_price_base, impression_quantity_price_amount,
+          like_price_mode, like_quantity_price_base, like_quantity_price_amount
+        FROM users
+        WHERE id = ?
+      `,
+      [targetUserId],
+    );
+    expect(user.price_mode).toBe('quantity');
+    expect(Number(user.quantity_price_base)).toBe(1000);
+    expect(Number(user.quantity_price_amount)).toBe(30);
+    expect(user.impression_price_mode).toBe('quantity');
+    expect(Number(user.impression_quantity_price_base)).toBe(1000);
+    expect(Number(user.impression_quantity_price_amount)).toBe(12.5);
+    expect(user.like_price_mode).toBe('quantity');
+    expect(Number(user.like_quantity_price_base)).toBe(100);
+    expect(Number(user.like_quantity_price_amount)).toBe(8);
+  });
+
+  test('allows admin to set user balance and writes an account record', async () => {
+    const registerResponse = await request(app).post('/api/auth/register').send({
+      password: 'userpass123',
+      username: `balance_${Date.now()}`,
+    });
+    const targetUserId = registerResponse.body.data.id;
+
+    const response = await request(app)
+      .put(`/api/v1/admin/permissions/users/${targetUserId}/balance`)
+      .send({ amount: 1234.56, reason: 'test balance set' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data).toMatchObject({
+      after_available_amount: 1234.56,
+      before_available_amount: 0,
+      delta_amount: 1234.56,
+      user_id: targetUserId,
+    });
+
+    const db = getPool();
+    const [[balance]] = await db.execute(
+      'SELECT available_amount FROM balance_accounts WHERE user_id = ?',
+      [targetUserId],
+    );
+    expect(Number(balance.available_amount)).toBe(1234.56);
+
+    const [[record]] = await db.execute(
+      `
+        SELECT record_type, direction, net_amount, before_available_amount, after_available_amount, reason_message
+        FROM account_records
+        WHERE user_id = ? AND record_type = 'balance_adjustment'
+        ORDER BY id DESC
+        LIMIT 1
+      `,
+      [targetUserId],
+    );
+    expect(record).toMatchObject({
+      direction: 'credit',
+      reason_message: 'test balance set',
+      record_type: 'balance_adjustment',
+    });
+    expect(Number(record.net_amount)).toBe(1234.56);
+    expect(Number(record.before_available_amount)).toBe(0);
+    expect(Number(record.after_available_amount)).toBe(1234.56);
+  });
+
   test('rejects invalid user discounts', async () => {
     const response = await request(app)
       .put('/api/v1/admin/permissions/users/2/discounts')

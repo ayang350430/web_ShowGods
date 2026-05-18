@@ -133,6 +133,20 @@ const getMenus = async (userId) => {
 
   if (roles.has('super') || roles.has('admin')) {
     menus.push({
+      component: '/orders/replenishments/index',
+      meta: {
+        authority: ['super', 'admin'],
+        icon: 'lucide:badge-check',
+        order: 4,
+        title: '补单列表',
+      },
+      name: 'ReplenishmentRecords',
+      path: '/orders/replenishments',
+    });
+  }
+
+  if (roles.has('super') || roles.has('admin')) {
+    menus.push({
       component: '/system/permissions/index',
       meta: {
         authority: ['super', 'admin'],

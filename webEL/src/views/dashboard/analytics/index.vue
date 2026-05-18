@@ -256,6 +256,9 @@ async function loadDashboard() {
     .catch(() => getTodayWeatherApi())
     .then((weatherData) => {
       weather.value = weatherData;
+    })
+    .catch(() => {
+      weather.value = undefined;
     });
 
   summary.value = await getDashboardSummaryApi({ ranking_period: 'all' });
