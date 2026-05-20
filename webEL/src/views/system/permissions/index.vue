@@ -12,6 +12,7 @@ import {
   ElOption,
   ElPagination,
   ElSelect,
+  ElSwitch,
   ElTag,
 } from 'element-plus';
 
@@ -20,6 +21,7 @@ import {
   getAdminPermissionUsersApi,
   updateAdminUserBalanceApi,
   updateAdminUserDiscountsApi,
+  updateAdminUserOrderTypesApi,
   updateAdminUserRolesApi,
   updateAdminUserStatusApi,
 } from '#/api';
@@ -110,7 +112,7 @@ function statusTagType(status: string) {
 }
 
 function formatDiscount(rate: number) {
-  return `${(Number(rate || 1) * 10).toFixed(1)} ?`;
+  return `${(Number(rate || 1) * 10).toFixed(1)} 折`;
 }
 
 function priceValueLabel(
@@ -127,7 +129,8 @@ function priceValueLabel(
     return `${Number(quantityBase) || 0} 个 / ${formatMoney(Number(quantityAmount) || 0)}`;
   }
   if (mode === 'default') {
-    return '默认价格';
+    const price = Number(fixedPrice) > 0 ? formatMoney(fixedPrice) : '系统默认';
+    return `${price}/单`;
   }
   return `${formatMoney(Number(fixedPrice) || 0)} / 单`;
 }
@@ -402,6 +405,29 @@ async function saveAllDiscounts() {
   }
 }
 
+const orderTypeSavingUserId = ref<number>();
+
+async function toggleOrderType(
+  user: UserApi.AdminUserPermission,
+  field: 'order_impression_enabled' | 'order_like_enabled' | 'order_view_enabled',
+) {
+  const next = !user[field];
+  orderTypeSavingUserId.value = user.id;
+  try {
+    await updateAdminUserOrderTypesApi(user.id, {
+      order_impression_enabled: field === 'order_impression_enabled' ? next : user.order_impression_enabled,
+      order_like_enabled: field === 'order_like_enabled' ? next : user.order_like_enabled,
+      order_view_enabled: field === 'order_view_enabled' ? next : user.order_view_enabled,
+    });
+    user[field] = next;
+    ElMessage.success(`已${next ? '启用' : '禁用'}${field === 'order_view_enabled' ? '阅读' : field === 'order_like_enabled' ? '点赞' : '曝光'}下单`);
+  } catch {
+    ElMessage.error('更新失败');
+  } finally {
+    orderTypeSavingUserId.value = undefined;
+  }
+}
+
 async function toggleUserStatus(user: UserApi.AdminUserPermission) {
   const nextStatus = user.status === 'disabled' ? 'active' : 'disabled';
   statusSavingUserId.value = user.id;
@@ -454,7 +480,15 @@ onMounted(loadData);
             <ElOption label="按数量计价" value="quantity" />
           </ElSelect>
           <ElInputNumber
-            v-if="batchDiscounts.price_mode === 'discount'"
+            v-if="batchDiscounts.price_mode === 'default'"
+            v-model="batchDiscounts.fixed_unit_price"
+            :min="0.0001"
+            :precision="4"
+            :step="0.01"
+            controls-position="right"
+          />
+          <ElInputNumber
+            v-else-if="batchDiscounts.price_mode === 'discount'"
             v-model="batchDiscounts.discount_rate"
             :max="1"
             :min="0.0001"
@@ -497,7 +531,15 @@ onMounted(loadData);
             <ElOption label="按数量计价" value="quantity" />
           </ElSelect>
           <ElInputNumber
-            v-if="batchDiscounts.like_price_mode === 'discount'"
+            v-if="batchDiscounts.like_price_mode === 'default'"
+            v-model="batchDiscounts.like_fixed_unit_price"
+            :min="0.0001"
+            :precision="4"
+            :step="0.01"
+            controls-position="right"
+          />
+          <ElInputNumber
+            v-else-if="batchDiscounts.like_price_mode === 'discount'"
             v-model="batchDiscounts.like_discount_rate"
             :max="1"
             :min="0.0001"
@@ -543,7 +585,15 @@ onMounted(loadData);
             <ElOption label="按数量计价" value="quantity" />
           </ElSelect>
           <ElInputNumber
-            v-if="batchDiscounts.impression_price_mode === 'discount'"
+            v-if="batchDiscounts.impression_price_mode === 'default'"
+            v-model="batchDiscounts.impression_fixed_unit_price"
+            :min="0.0001"
+            :precision="4"
+            :step="0.01"
+            controls-position="right"
+          />
+          <ElInputNumber
+            v-else-if="batchDiscounts.impression_price_mode === 'discount'"
             v-model="batchDiscounts.impression_discount_rate"
             :max="1"
             :min="0.0001"
@@ -601,6 +651,7 @@ onMounted(loadData);
         <span>余额</span>
         <span>当前角色 / 权限修改</span>
         <span>折扣设置</span>
+        <span>下单权限</span>
         <span>操作</span>
       </div>
 
@@ -639,6 +690,35 @@ onMounted(loadData);
             <b>曝光</b>
             {{ impressionPriceLabel(getEditedDiscounts(user)) }}
           </span>
+        </div>
+        <div class="order-type-switches">
+          <label>
+            <span>阅读</span>
+            <ElSwitch
+              :model-value="user.order_view_enabled"
+              :loading="orderTypeSavingUserId === user.id"
+              size="small"
+              @change="toggleOrderType(user, 'order_view_enabled')"
+            />
+          </label>
+          <label>
+            <span>点赞</span>
+            <ElSwitch
+              :model-value="user.order_like_enabled"
+              :loading="orderTypeSavingUserId === user.id"
+              size="small"
+              @change="toggleOrderType(user, 'order_like_enabled')"
+            />
+          </label>
+          <label>
+            <span>曝光</span>
+            <ElSwitch
+              :model-value="user.order_impression_enabled"
+              :loading="orderTypeSavingUserId === user.id"
+              size="small"
+              @change="toggleOrderType(user, 'order_impression_enabled')"
+            />
+          </label>
         </div>
         <div class="row-actions">
           <ElButton
@@ -715,6 +795,16 @@ onMounted(loadData);
               <ElOption label="按数量计价" value="quantity" />
             </ElSelect>
           </label>
+          <label v-if="activeDiscounts.price_mode === 'default'">
+            <span>默认单价</span>
+            <ElInputNumber
+              v-model="activeDiscounts.fixed_unit_price"
+              :min="0.0001"
+              :precision="4"
+              :step="0.01"
+              controls-position="right"
+            />
+          </label>
           <label v-if="activeDiscounts.price_mode === 'discount'">
             <span>折扣</span>
             <ElInputNumber
@@ -775,6 +865,16 @@ onMounted(loadData);
               <ElOption label="按数量计价" value="quantity" />
             </ElSelect>
           </label>
+          <label v-if="activeDiscounts.like_price_mode === 'default'">
+            <span>默认单价</span>
+            <ElInputNumber
+              v-model="activeDiscounts.like_fixed_unit_price"
+              :min="0.0001"
+              :precision="4"
+              :step="0.01"
+              controls-position="right"
+            />
+          </label>
           <label v-if="activeDiscounts.like_price_mode === 'discount'">
             <span>折扣</span>
             <ElInputNumber
@@ -832,6 +932,16 @@ onMounted(loadData);
               <ElOption label="固定金额" value="fixed" />
               <ElOption label="按数量计价" value="quantity" />
             </ElSelect>
+          </label>
+          <label v-if="activeDiscounts.impression_price_mode === 'default'">
+            <span>默认单价</span>
+            <ElInputNumber
+              v-model="activeDiscounts.impression_fixed_unit_price"
+              :min="0.0001"
+              :precision="4"
+              :step="0.01"
+              controls-position="right"
+            />
           </label>
           <label v-if="activeDiscounts.impression_price_mode === 'discount'">
             <span>折扣</span>
@@ -999,7 +1109,7 @@ onMounted(loadData);
 
 .table-row {
   display: grid;
-  grid-template-columns: minmax(104px, 0.7fr) 96px 72px 100px minmax(220px, 1.05fr) minmax(180px, 0.8fr) 184px;
+  grid-template-columns: minmax(104px, 0.7fr) 96px 72px 100px minmax(220px, 1.05fr) minmax(180px, 0.8fr) 160px 184px;
   gap: 10px;
   align-items: center;
   padding: 12px 16px;
@@ -1053,6 +1163,24 @@ onMounted(loadData);
   margin-left: 0;
   width: 54px;
   padding-inline: 0;
+}
+
+.order-type-switches {
+  display: grid;
+  gap: 6px;
+}
+
+.order-type-switches label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-blank);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
 }
 
 .discount-summary {
@@ -1128,6 +1256,18 @@ onMounted(loadData);
   grid-template-columns: repeat(2, minmax(72px, 1fr));
   gap: 6px;
   min-width: 0;
+}
+
+.labeled-input {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+
+  small {
+    font-size: 11px;
+    color: #909399;
+    line-height: 1;
+  }
 }
 
 .discount-dialog-body {

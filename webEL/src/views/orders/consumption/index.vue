@@ -10,6 +10,7 @@ import {
   ElButton,
   ElInput,
   ElMessage,
+  ElMessageBox,
   ElOption,
   ElPagination,
   ElPopconfirm,
@@ -19,9 +20,14 @@ import {
   ElTag,
 } from 'element-plus';
 
-import { getConsumptionRecordsApi, requestOrderRefundApi } from '#/api';
+import {
+  getConsumptionRecordsApi,
+  requestBatchRefundApi,
+  requestOrderRefundApi,
+} from '#/api';
 
 const loading = ref(false);
+const tableRef = ref<InstanceType<typeof ElTable>>();
 const route = useRoute();
 const records = ref<OrderApi.ConsumptionRecord[]>([]);
 const userStore = useUserStore();
@@ -76,7 +82,7 @@ const stats = computed(() => [
 ]);
 
 const canManageRefund = computed(() =>
-  (userStore.userInfo?.roles ?? []).some((role) => ['admin', 'super'].includes(role)),
+  (userStore.userInfo?.roles ?? []).some((role) => ['admin', 'super', 'user'].includes(role)),
 );
 
 function formatMoney(value?: number) {
@@ -94,14 +100,30 @@ function formatUnitPrice(value?: number) {
 }
 
 function recordDisplayPrice(row: OrderApi.ConsumptionRecord) {
+  const unitPrice = Number(row.discounted_unit_price || 0);
+  if (unitPrice > 0) return unitPrice;
+  // fallback: calculate from totals
   if (row.record_type === 'refund') {
-    return Number(row.refund_amount || 0);
+    const qty = Number(row.refunded_quantity) || Number(row.ordered_quantity) || 1;
+    return Number(row.refund_amount || 0) / qty;
   }
-  return Number(row.actual_paid_amount || row.payable_amount || row.discounted_unit_price || 0);
+  const qty = Number(row.ordered_quantity) || 1;
+  return Number(row.actual_paid_amount || 0) / qty;
 }
 
 function recordOriginalPrice(row: OrderApi.ConsumptionRecord) {
-  return Number(row.original_total_amount || row.original_unit_price || 0);
+  const unitPrice = Number(row.original_unit_price || 0);
+  if (unitPrice > 0) return unitPrice;
+  // fallback: same as display price
+  return recordDisplayPrice(row);
+}
+
+function recordMainAmount(row: OrderApi.ConsumptionRecord) {
+  // refund records have actual_paid_amount=0 in DB, use refund_amount instead
+  if (row.record_type === 'refund') {
+    return Number(row.refund_amount || 0);
+  }
+  return Number(row.actual_paid_amount || 0);
 }
 
 function formatDateTime(value?: string) {
@@ -215,7 +237,7 @@ function canRequestRefund(item: OrderApi.ConsumptionRecord['order_items'][number
 
 function disabledRefundLabel(item: OrderApi.ConsumptionRecord['order_items'][number]) {
   if (item.order_status === 'repair_review') {
-    return '申请补单';
+    return '补单审批中';
   }
   if (isRepairVerifyWaiting(item)) {
     return '补单复查中';
@@ -229,9 +251,56 @@ function disabledRefundLabel(item: OrderApi.ConsumptionRecord['order_items'][num
   return '不可申请';
 }
 
+const batchRefundLoading = ref(false);
+
 async function requestRefund(orderId: number) {
   await requestOrderRefundApi(orderId);
   ElMessage.success('已提交退款申请，等待管理员审核');
+  await loadRecords();
+}
+
+function batchRefundableOrders(row: OrderApi.ConsumptionRecord) {
+  return (row.order_items || []).filter((item) => {
+    const blocked = [
+      'failed',
+      'refund_approved',
+      'refund_calculating',
+      'refund_rejected',
+      'refund_requested',
+      'stopping',
+    ];
+    return !blocked.includes(item.order_status);
+  });
+}
+
+async function handleBatchRefund(row: OrderApi.ConsumptionRecord) {
+  const eligible = batchRefundableOrders(row);
+  if (eligible.length === 0) {
+    ElMessage.warning('该批次没有可退款的订单');
+    return;
+  }
+  try {
+    await ElMessageBox.confirm(
+      `该批次共 ${row.order_items.length} 条订单，其中 ${eligible.length} 条可退款。确定全部申请退款吗？`,
+      '批次全额退款',
+      { confirmButtonText: '确定退款', cancelButtonText: '取消', type: 'warning' },
+    );
+  } catch {
+    return;
+  }
+  batchRefundLoading.value = true;
+  try {
+    const result = await requestBatchRefundApi(row.batch_id);
+    if (result.failed_count === 0) {
+      ElMessage.success(`已成功提交 ${result.success_count} 条退款申请`);
+    } else {
+      ElMessage.warning(`提交完成：${result.success_count} 条成功，${result.failed_count} 条失败`);
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || '批量退款失败');
+  } finally {
+    batchRefundLoading.value = false;
+  }
   await loadRecords();
 }
 
@@ -349,15 +418,28 @@ watch(
       </div>
 
       <ElTable
+        ref="tableRef"
         v-loading="loading"
         :data="records"
         row-key="id"
         class="record-table"
         empty-text="暂无消费记录"
+        @row-click="(row: OrderApi.ConsumptionRecord) => tableRef?.toggleRowExpansion(row)"
       >
         <ElTableColumn type="expand" width="44">
           <template #default="{ row }">
             <div v-if="row.order_items?.length" class="order-items">
+              <div v-if="canManageRefund && batchRefundableOrders(row).length > 0" class="batch-refund-bar">
+                <span>该批次共 {{ row.order_items.length }} 条订单，{{ batchRefundableOrders(row).length }} 条可退款</span>
+                <ElButton
+                  type="danger"
+                  size="small"
+                  :loading="batchRefundLoading"
+                  @click.stop="handleBatchRefund(row)"
+                >
+                  批次全额退款
+                </ElButton>
+              </div>
               <div
                 v-for="item in row.order_items"
                 :key="item.order_id"
@@ -453,9 +535,15 @@ watch(
         <ElTableColumn label="金额" min-width="170">
           <template #default="{ row }">
             <div class="amount-cell">
-              <strong>{{ formatMoney(row.actual_paid_amount) }}</strong>
-              <span>退款 {{ formatMoney(row.refund_amount) }}</span>
-              <span>净额 {{ formatMoney(row.net_amount) }}</span>
+              <template v-if="row.record_type === 'refund'">
+                <strong class="text-success">+{{ formatMoney(row.refund_amount) }}</strong>
+                <span>净额 {{ formatMoney(row.net_amount) }}</span>
+              </template>
+              <template v-else>
+                <strong>{{ formatMoney(row.actual_paid_amount) }}</strong>
+                <span>退款 {{ formatMoney(row.refund_amount) }}</span>
+                <span>净额 {{ formatMoney(row.net_amount) }}</span>
+              </template>
             </div>
           </template>
         </ElTableColumn>
@@ -582,6 +670,10 @@ watch(
   width: 100%;
 }
 
+.record-table :deep(.el-table__row) {
+  cursor: pointer;
+}
+
 .main-cell,
 .muted-cell,
 .amount-cell,
@@ -640,11 +732,30 @@ watch(
   font-size: 16px;
 }
 
+.amount-cell .text-success {
+  color: #2fbf71;
+}
+
 .order-items {
   display: flex;
   flex-direction: column;
   gap: 10px;
   padding: 10px 16px 12px 64px;
+}
+
+.batch-refund-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border: 1px dashed var(--el-color-danger-light-3);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--el-color-danger) 6%, transparent);
+}
+
+.batch-refund-bar > span {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
 .order-item-row {

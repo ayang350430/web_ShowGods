@@ -69,12 +69,46 @@ const parsedLines = computed(() =>
     .filter(Boolean),
 );
 
+const formatErrorCount = computed(() => {
+  const lines = parsedLines.value;
+  if (!lines.length) return 0;
+  let errors = 0;
+  for (const line of lines) {
+    const parts = line.split(/\s+/);
+    if (parts.length < 2 || !/^\d+$/.test(parts[parts.length - 1]!)) {
+      errors++;
+    }
+  }
+  return errors;
+});
+
 const canSubmit = computed(
   () =>
     Boolean(preview.value?.can_submit) &&
     agreePolicy.value &&
     connectionOk.value === true,
 );
+
+const invalidItemsSummary = computed(() => {
+  const items = preview.value?.items ?? [];
+  const invalidItems = items.filter((item) => !item.valid);
+  if (!invalidItems.length) return null;
+  const errorMap = new Map<string, { count: number; links: string[] }>();
+  for (const item of invalidItems) {
+    for (const err of item.errors) {
+      const entry = errorMap.get(err) || { count: 0, links: [] };
+      entry.count++;
+      entry.links.push(item.raw || item.note_url || item.note_id || `#${item.line_no}`);
+      errorMap.set(err, entry);
+    }
+  }
+  return {
+    count: invalidItems.length,
+    groups: [...errorMap.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .map(([reason, { count, links }]) => ({ count, links, reason })),
+  };
+});
 
 const previewTotalQuantity = computed(() =>
   (preview.value?.items ?? [])
@@ -85,13 +119,13 @@ const previewTotalQuantity = computed(() =>
 const previewPriceText = computed(() => {
   const currentPreview = preview.value;
   if (!currentPreview) {
-    return formatMoney(0);
+    return formatMoney(0, 4);
   }
   if (currentPreview.price_mode === 'quantity') {
     const baseQuantity = Math.max(Number(currentPreview.price_base_quantity) || 1, 1);
-    return `${baseQuantity.toLocaleString('zh-CN')} \u4e2a / ${formatMoney(currentPreview.discounted_unit_price)}`;
+    return `${baseQuantity.toLocaleString('zh-CN')} \u4e2a / ${formatMoney(currentPreview.discounted_unit_price, 4)}`;
   }
-  return formatMoney(currentPreview.discounted_unit_price);
+  return formatMoney(currentPreview.discounted_unit_price, 4);
 });
 
 const currentInputKey = computed(() => `${targetType.value}::${content.value}`);
@@ -292,10 +326,10 @@ const visibleCheckRecords = computed(() => {
   });
 });
 
-function formatMoney(value?: number) {
+function formatMoney(value?: number, decimals = 2) {
   return `￥ ${(Number(value) || 0).toLocaleString('zh-CN', {
-    maximumFractionDigits: 2,
-    minimumFractionDigits: 2,
+    maximumFractionDigits: decimals,
+    minimumFractionDigits: decimals,
   })}`;
 }
 
@@ -684,6 +718,7 @@ async function removeProblemLinks() {
   }
   syncSelectedDrawerBatch(`problem-${savedBatchNo}`);
   preview.value = undefined;
+  removedDrawerVisible.value = true;
   ElMessage.success(`已删除 ${invalidItems.length} 条问题链接，已入库 ${saveResult.saved_count} 条`);
 }
 
@@ -833,7 +868,12 @@ onMounted(() => {
 
         <label class="field-label">
           批量内容（{{ targetType === 'view' ? '阅读' : '曝光' }}）
-          <span>已输入 {{ parsedLines.length }} 行</span>
+          <span>
+            已输入 {{ parsedLines.length }} 行
+            <span v-if="formatErrorCount > 0" style="color: var(--el-color-danger)">
+              （{{ formatErrorCount }} 行格式有误，需要：链接 + 数量）
+            </span>
+          </span>
         </label>
         <textarea
           v-model="content"
@@ -848,7 +888,7 @@ onMounted(() => {
             一键删除问题链接并记录
           </ElButton>
           <ElButton @click="openOrderRecords">
-            下单记录（{{ orderRecordTotal }} 批）
+            下单记录（{{ orderRecordTotal + checkBatchGroups.length }} 批）
           </ElButton>
           <ElButton @click="clearContent">清空</ElButton>
           <ElButton
@@ -883,6 +923,20 @@ onMounted(() => {
           <span v-else-if="preview?.warnings.length">{{ preview.warnings[0] }}</span>
           <span v-else-if="!agreePolicy">请确认公告内容</span>
           <span v-else>校验通过，可以提交</span>
+        </div>
+
+        <div v-if="invalidItemsSummary" class="invalid-summary">
+          <div class="invalid-summary-head">
+            <component :is="AlertIcon" />
+            <strong>{{ invalidItemsSummary.count }} 条链接校验失败，无法提交</strong>
+          </div>
+          <div v-for="(group, idx) in invalidItemsSummary.groups" :key="idx" class="invalid-group">
+            <div class="invalid-group-reason">{{ group.reason }}（{{ group.count }}条）</div>
+            <ul class="invalid-group-links">
+              <li v-for="(link, li) in group.links" :key="li">{{ link }}</li>
+            </ul>
+          </div>
+          <span class="invalid-summary-tip">请修正问题链接或使用「一键删除问题链接并记录」移除后再提交</span>
         </div>
 
         <div v-if="preview?.items.length" class="result-list">
@@ -1310,6 +1364,54 @@ onMounted(() => {
   border: 1px solid var(--el-border-color-light);
   border-radius: 8px;
   background: var(--el-fill-color-blank);
+}
+
+.invalid-summary {
+  margin-top: 14px;
+  padding: 14px 18px;
+  border: 1px solid var(--el-color-danger-light-5);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--el-color-danger) 8%, var(--el-bg-color));
+}
+
+.invalid-summary-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--el-color-danger);
+  font-size: 15px;
+}
+
+.invalid-summary-head strong {
+  font-weight: 600;
+}
+
+.invalid-group {
+  margin-top: 10px;
+  padding-left: 24px;
+}
+
+.invalid-group-reason {
+  color: var(--el-color-danger);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.invalid-group-links {
+  margin: 4px 0 0 16px;
+  padding: 0;
+  color: var(--el-text-color-primary);
+  font-size: 12px;
+  line-height: 1.8;
+  word-break: break-all;
+}
+
+.invalid-summary-tip {
+  display: block;
+  margin-top: 4px;
+  padding-left: 24px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 
 .result-list {

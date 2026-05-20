@@ -101,11 +101,30 @@ const updateUserBalance = async (req, res, next) => {
   }
 };
 
+const updateUserOrderTypes = async (req, res, next) => {
+  try {
+    const data = await adminPermissionService.updateUserOrderTypes(
+      getCurrentUserId(req),
+      req.params.userId,
+      req.body,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   listRoles,
   listUsers,
   updateUserBalance,
   updateUserDiscounts,
+  updateUserOrderTypes,
   updateUserStatus,
   updateUserRoles,
 };

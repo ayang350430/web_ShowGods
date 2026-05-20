@@ -1,6 +1,7 @@
 const authService = require('../services/auth.service');
 const permissionService = require('../services/permission.service');
 const { getCurrentUserId } = require('../utils/currentUser');
+const { signAccessToken, signRefreshToken, verifyTokenIgnoreExpiry } = require('../utils/jwt');
 
 const login = async (req, res, next) => {
   try {
@@ -23,7 +24,8 @@ const login = async (req, res, next) => {
     return res.json({
       code: 0,
       data: {
-        accessToken: `dev-token-${user.id}`,
+        accessToken: signAccessToken(user.id),
+        refreshToken: signRefreshToken(user.id),
       },
       message: 'ok',
     });
@@ -69,11 +71,24 @@ const getAccessCodes = async (req, res, next) => {
 };
 
 const refreshToken = (req, res) => {
-  res.json({
-    code: 0,
-    data: 'dev-token-1',
-    message: 'ok',
-  });
+  const authorization = req.headers.authorization || '';
+  const token = authorization.replace(/^Bearer\s+/i, '');
+
+  try {
+    const payload = verifyTokenIgnoreExpiry(token);
+    const userId = Number(payload.uid) || 0;
+    if (!userId) {
+      return res.status(401).json({ message: 'Invalid token' });
+    }
+
+    return res.json({
+      code: 0,
+      data: signAccessToken(userId),
+      message: 'ok',
+    });
+  } catch {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
 };
 
 const logout = (req, res) => {

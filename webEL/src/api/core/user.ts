@@ -91,6 +91,9 @@ export namespace UserApi {
     like_price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
     like_quantity_price_amount: null | number;
     like_quantity_price_base: null | number;
+    order_view_enabled: boolean;
+    order_like_enabled: boolean;
+    order_impression_enabled: boolean;
     price_mode: 'default' | 'discount' | 'fixed' | 'quantity';
     quantity_price_amount: null | number;
     quantity_price_base: null | number;
@@ -175,6 +178,22 @@ export async function updateAdminUserBalanceApi(
     delta_amount: number;
     user_id: number;
   }>(`/v1/admin/permissions/users/${userId}/balance`, data);
+}
+
+export async function updateAdminUserOrderTypesApi(
+  userId: number,
+  data: {
+    order_impression_enabled: boolean;
+    order_like_enabled: boolean;
+    order_view_enabled: boolean;
+  },
+) {
+  return requestClient.put<{
+    order_impression_enabled: boolean;
+    order_like_enabled: boolean;
+    order_view_enabled: boolean;
+    user_id: number;
+  }>(`/v1/admin/permissions/users/${userId}/order-types`, data);
 }
 
 export async function updateAdminUserDiscountsApi(

@@ -37,6 +37,9 @@ const ensureUserPriceColumns = async (db) => {
       await ensureColumn('like_fixed_unit_price', 'DECIMAL(18,4) DEFAULT NULL');
       await ensureColumn('like_quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
       await ensureColumn('like_quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
+      await ensureColumn('order_view_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
+      await ensureColumn('order_like_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
+      await ensureColumn('order_impression_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
     })();
   }
 
@@ -145,6 +148,7 @@ const listUsers = async (actorUserId, query = {}) => {
         u.impression_quantity_price_base, u.impression_quantity_price_amount,
         u.like_discount_rate, u.like_price_mode, u.like_fixed_unit_price,
         u.like_quantity_price_base, u.like_quantity_price_amount,
+        u.order_view_enabled, u.order_like_enabled, u.order_impression_enabled,
         COALESCE(ba.available_amount, 0) AS available_amount,
         GROUP_CONCAT(r.code ORDER BY FIELD(r.code, 'super', 'admin', 'user'), r.code) AS role_codes,
         GROUP_CONCAT(r.name ORDER BY FIELD(r.code, 'super', 'admin', 'user'), r.code) AS role_names
@@ -187,6 +191,9 @@ const listUsers = async (actorUserId, query = {}) => {
       row.like_quantity_price_amount === null ? null : Number(row.like_quantity_price_amount),
     like_quantity_price_base:
       row.like_quantity_price_base === null ? null : Number(row.like_quantity_price_base),
+    order_view_enabled: row.order_view_enabled !== 0,
+    order_like_enabled: row.order_like_enabled !== 0,
+    order_impression_enabled: row.order_impression_enabled !== 0,
     price_mode: PRICE_MODES.has(row.price_mode) ? row.price_mode : 'discount',
     quantity_price_amount:
       row.quantity_price_amount === null ? null : Number(row.quantity_price_amount),
@@ -612,11 +619,47 @@ const updateUserBalance = async (actorUserId, targetUserId, { amount, reason } =
   }
 };
 
+const updateUserOrderTypes = async (actorUserId, targetUserId, { order_view_enabled, order_like_enabled, order_impression_enabled } = {}) => {
+  const db = getPool();
+  await ensureUserPriceColumns(db);
+  await assertAdmin(db, actorUserId);
+  const targetId = Number(targetUserId);
+
+  if (!targetId) {
+    const error = new Error('Invalid target user');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const viewEnabled = order_view_enabled === false ? 0 : 1;
+  const likeEnabled = order_like_enabled === false ? 0 : 1;
+  const impressionEnabled = order_impression_enabled === false ? 0 : 1;
+
+  const [result] = await db.execute(
+    'UPDATE users SET order_view_enabled = ?, order_like_enabled = ?, order_impression_enabled = ? WHERE id = ?',
+    [viewEnabled, likeEnabled, impressionEnabled, targetId],
+  );
+
+  if (result.affectedRows === 0) {
+    const error = new Error('Target user not found');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  return {
+    order_impression_enabled: impressionEnabled === 1,
+    order_like_enabled: likeEnabled === 1,
+    order_view_enabled: viewEnabled === 1,
+    user_id: targetId,
+  };
+};
+
 module.exports = {
   listRoles,
   listUsers,
   updateUserBalance,
   updateUserDiscounts,
+  updateUserOrderTypes,
   updateUserStatus,
   updateUserRoles,
 };

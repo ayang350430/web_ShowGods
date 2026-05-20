@@ -31,6 +31,20 @@ const previewBatchOrderSilent = async (req, res, next) => {
   }
 };
 
+const getBatchOrders = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.getBatchOrders(getCurrentUserId(req), req.params.batchId);
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const submitBatchOrder = async (req, res, next) => {
   try {
     const data = await batchOrderService.submitBatch(getCurrentUserId(req), req.body);
@@ -245,6 +259,23 @@ const requestOrderRefund = async (req, res, next) => {
   }
 };
 
+const requestBatchRefund = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.requestBatchRefund(
+      getCurrentUserId(req),
+      req.params.batchId,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const reviewOrderRefund = async (req, res, next) => {
   try {
     const data = await batchOrderService.reviewOrderRefund(
@@ -263,7 +294,26 @@ const reviewOrderRefund = async (req, res, next) => {
   }
 };
 
+const batchApproveRefunds = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.batchApproveRefunds(
+      getCurrentUserId(req),
+      req.body,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
+  batchApproveRefunds,
+  getBatchOrders,
   listBatchOrderRecords,
   listCheckRecords,
   listConsumptionRecords,
@@ -274,6 +324,7 @@ module.exports = {
   previewBatchOrder,
   previewBatchOrderSilent,
   replenishBatchOrder,
+  requestBatchRefund,
   requestReplenishBatchOrder,
   retryBatchOrder,
   requestOrderRefund,

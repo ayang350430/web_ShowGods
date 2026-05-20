@@ -121,7 +121,7 @@ async function loadNotifications(silent = false) {
 
       if (urgentNotification) {
         ElNotification({
-          duration: 0,
+          duration: 2000,
           message: urgentNotification.message || '有新的退款申请需要处理',
           title: '新的退款申请',
           type: 'warning',

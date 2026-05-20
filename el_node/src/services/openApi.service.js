@@ -1,4 +1,4 @@
-﻿const crypto = require('node:crypto');
+const crypto = require('node:crypto');
 
 const { getPool } = require('../config/database');
 const batchOrderService = require('./batchOrder.service');
@@ -26,7 +26,7 @@ const ensureOpenApiKeyTable = async (db = getPool()) => {
         KEY idx_open_api_keys_user_created_at (user_id, created_at),
         KEY idx_open_api_keys_prefix_status (key_prefix, status),
         CONSTRAINT fk_open_api_keys_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
   }
   await openApiKeyTableReady;
@@ -104,7 +104,7 @@ const createApiKey = async (userId, { name } = {}) => {
     [targetUserId],
   );
   if (existingActiveKey) {
-    const error = new Error('褰撳墠璐﹀彿宸叉湁鍙敤 Open API key锛岃鍒犻櫎鍚庡啀閲嶆柊鐢宠');
+    const error = new Error('当前账号已有可用 Open API key，请删除后再重新申请');
     error.statusCode = 400;
     throw error;
   }
@@ -237,7 +237,7 @@ const assertProgressRateLimit = (keyId) => {
   const previous = progressRateLimitMap.get(keyId) || 0;
   const waitMs = PROGRESS_RATE_LIMIT_MS - (now - previous);
   if (waitMs > 0) {
-    const error = new Error(`杩涘害鏌ヨ鎺ュ彛姣忎釜 key 10 绉掑彧鑳借皟鐢ㄤ竴娆★紝璇?${Math.ceil(waitMs / 1000)} 绉掑悗鍐嶈瘯`);
+    const error = new Error(`进度查询接口每个 key 10 秒只能调用一次，请 ${Math.ceil(waitMs / 1000)} 秒后再试`);
     error.statusCode = 429;
     error.retryAfter = Math.ceil(waitMs / 1000);
     throw error;
@@ -258,6 +258,12 @@ const previewOpenBatch = async (req) => {
 
 const submitOpenBatch = async (req) => {
   const auth = await authenticateOpenApiKey(req);
+  const remark = String(req.body?.remark || req.body?.source || '').trim();
+  if (!remark) {
+    const error = new Error('remark（备注）为必填项');
+    error.statusCode = 400;
+    throw error;
+  }
   const preview = await batchOrderService.buildPreview(auth.user_id, req.body, {
     persistCheckRecords: false,
   });
@@ -266,7 +272,7 @@ const submitOpenBatch = async (req) => {
       preview.items?.find((item) => Array.isArray(item.errors) && item.errors.length > 0)
         ?.errors?.[0] ||
       preview.warnings?.[0] ||
-      '棰勬牎楠屾湭閫氳繃';
+      '预校验未通过';
     const error = new Error(`Open API preview validation failed: ${message}`);
     error.statusCode = 400;
     error.details = preview;
@@ -276,6 +282,7 @@ const submitOpenBatch = async (req) => {
   try {
     data = await batchOrderService.submitBatch(auth.user_id, {
       ...req.body,
+      source: `goodsAdmin:${remark}`,
       agree_policy: req.body?.agree_policy ?? true,
     });
   } catch (error) {
@@ -284,7 +291,7 @@ const submitOpenBatch = async (req) => {
       details &&
       Number(details.total_amount) > Number(details.available_balance)
     ) {
-      const insufficientError = new Error('褰撳墠 Open API key 璐﹀彿浣欓涓嶈冻');
+      const insufficientError = new Error('当前 Open API key 账号余额不足');
       insufficientError.statusCode = 400;
       insufficientError.details = details;
       throw insufficientError;
@@ -534,7 +541,7 @@ const stopOpenOrderTasks = async (req) => {
 
     try {
       const upstream = await batchOrderService._private.stopXhsTask({
-        reason: `goods_order=${order.order_no} ${reason}`,
+        reason: `goodsAdmin:order=${order.order_no} ${reason}`,
         taskId: order.external_task_id,
         targetType: order.target_type,
         userId: auth.user_id,
@@ -655,4 +662,5 @@ module.exports = {
     hashKey,
   },
 };
+
 

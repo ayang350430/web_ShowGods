@@ -105,24 +105,24 @@ const apiDocs = [
         type: 'boolean',
       },
       {
-        desc: '外部系统备注，会记录到订单和消费流水里，便于对账。',
+        desc: '外部系统备注（必填），会作为任务来源标识记录，格式为 goodsAdmin:{remark}。',
         example: 'merchant_order=MO202605180001',
         name: 'remark',
         place: 'body',
-        required: '否',
+        required: '是',
         type: 'string',
       },
     ],
     path: '/api/open/orders/submit',
     requestExample: `{
   // 必填：业务类型，view=阅读，like=点赞，impression=曝光
-  "target_type": "like",
+  “target_type”: “like”,
   // 选填：是否确认平台公告和下单规则，外部调用建议传 true
-  "agree_policy": true,
-  // 选填：外部系统备注，方便后续对账
-  "remark": "merchant_order=MO202605180001",
-  // 必填：批量内容，每行格式为“链接 数量”
-  "content": "https://www.xiaohongshu.com/explore/6a081953000000003501efc6 20"
+  “agree_policy”: true,
+  // 必填：外部系统备注，作为任务来源标识（goodsAdmin:{remark}）
+  “remark”: “merchant_order=MO202605180001”,
+  // 必填：批量内容，每行格式为”链接 数量”
+  “content”: “https://www.xiaohongshu.com/explore/6a081953000000003501efc6 20”
 }`,
     responseExample: `{
   "code": 0,

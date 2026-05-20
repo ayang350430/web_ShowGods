@@ -8,6 +8,7 @@ router.get('/roles', adminPermissionController.listRoles);
 router.get('/users', adminPermissionController.listUsers);
 router.put('/users/:userId/balance', adminPermissionController.updateUserBalance);
 router.put('/users/:userId/discounts', adminPermissionController.updateUserDiscounts);
+router.put('/users/:userId/order-types', adminPermissionController.updateUserOrderTypes);
 router.put('/users/:userId/roles', adminPermissionController.updateUserRoles);
 router.put('/users/:userId/status', adminPermissionController.updateUserStatus);
 

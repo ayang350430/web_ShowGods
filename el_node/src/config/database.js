@@ -21,7 +21,7 @@ const getPool = () => {
   return pool;
 };
 
-// 确保数据库表存在指定列
+// 确保数据库表存在指定�?
 const ensureColumn = async (db, tableName, columnName, definition) => {
   const [columns] = await db.execute(
     `
@@ -41,7 +41,7 @@ const ensureColumn = async (db, tableName, columnName, definition) => {
 
 const quoteIdentifier = (value) => `\`${String(value).replaceAll('`', '``')}\``;
 
-// 转义SQL字符串中的特殊字符
+// 转义SQL字符串中的特殊字�?
 const escapeSqlString = (value) =>
   `'${String(value).replaceAll('\\', '\\\\').replaceAll("'", "''")}'`;
 
@@ -56,7 +56,7 @@ const parseBooleanEnv = (value) => {
   return undefined;
 };
 
-// 是否初始化演示数据
+// 是否初始化演示数�?
 const shouldSeedDemoData = () => {
   const explicitSeedFlag = parseBooleanEnv(process.env.SEED_DEMO_DATA);
   if (explicitSeedFlag !== undefined) {
@@ -73,43 +73,43 @@ const schemaComments = {
       actual_paid_amount: ['DECIMAL(18,4) DEFAULT NULL', '实际支付金额'],
       after_available_amount: [
         'DECIMAL(18,4) NOT NULL DEFAULT 0.0000',
-        '变更后可用余额',
+        'Available balance after change',
       ],
       before_available_amount: [
         'DECIMAL(18,4) NOT NULL DEFAULT 0.0000',
-        '变更前可用余额',
+        'Available balance before change',
       ],
-      calc_snapshot: ['JSON DEFAULT NULL', '计费或退款计算快照'],
+      calc_snapshot: ['JSON DEFAULT NULL', 'Calculation snapshot'],
       completed_quantity: ['INT UNSIGNED DEFAULT NULL', '完成数量快照'],
       created_at: ['DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP', '创建时间'],
       direction: ['VARCHAR(16) NOT NULL', '资金方向'],
       discount_amount: ['DECIMAL(18,4) DEFAULT NULL', '优惠金额'],
-      discount_rate: ['DECIMAL(10,4) DEFAULT NULL', '折扣率'],
+      discount_rate: ['DECIMAL(10,4) DEFAULT NULL', 'Discount rate'],
       discounted_unit_price: ['DECIMAL(18,4) DEFAULT NULL', '折后单价'],
       id: ['BIGINT UNSIGNED NOT NULL AUTO_INCREMENT', '主键ID'],
       net_amount: ['DECIMAL(18,4) NOT NULL DEFAULT 0.0000', '本次净变动金额'],
       order_id: ['BIGINT UNSIGNED DEFAULT NULL', '关联订单ID'],
       order_no: ['VARCHAR(40) DEFAULT NULL', '关联订单编号'],
       ordered_quantity: ['INT UNSIGNED DEFAULT NULL', '下单数量快照'],
-      original_total_amount: ['DECIMAL(18,4) DEFAULT NULL', '原价总金额'],
+      original_total_amount: ['DECIMAL(18,4) DEFAULT NULL', 'Original total amount'],
       original_unit_price: ['DECIMAL(18,4) DEFAULT NULL', '原始单价'],
       payable_amount: ['DECIMAL(18,4) DEFAULT NULL', '应付金额'],
       reason_code: ['VARCHAR(64) DEFAULT NULL', '原因编码'],
       reason_message: ['VARCHAR(255) DEFAULT NULL', '原因说明'],
       record_no: ['VARCHAR(40) NOT NULL', '流水编号'],
       record_type: ['VARCHAR(32) NOT NULL', '流水类型'],
-      refund_amount: ['DECIMAL(18,4) DEFAULT NULL', '退款金额'],
-      refunded_quantity: ['INT UNSIGNED DEFAULT NULL', '退款数量快照'],
+      refund_amount: ['DECIMAL(18,4) DEFAULT NULL', 'Refund amount'],
+      refunded_quantity: ['INT UNSIGNED DEFAULT NULL', 'Refunded quantity snapshot'],
       related_record_id: ['BIGINT UNSIGNED DEFAULT NULL', '关联原流水ID'],
       remark: ['VARCHAR(255) DEFAULT NULL', '备注'],
-      status: ["VARCHAR(32) NOT NULL DEFAULT 'success'", '流水状态'],
+      status: ["VARCHAR(32) NOT NULL DEFAULT 'success'", 'Record status'],
       updated_at: [
         'DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
         '更新时间',
       ],
       user_id: ['BIGINT UNSIGNED NOT NULL', '用户ID'],
     },
-    table: '账户流水记录表',
+    table: 'Account record table',
   },
   balance_accounts: {
     columns: {
@@ -123,7 +123,7 @@ const schemaComments = {
       user_id: ['BIGINT UNSIGNED NOT NULL', '用户ID'],
       version: ['BIGINT UNSIGNED NOT NULL DEFAULT 0', '乐观锁版本号'],
     },
-    table: '用户余额账户表',
+    table: 'Balance account table',
   },
   order_batches: {
     columns: {
@@ -137,30 +137,30 @@ const schemaComments = {
       failed_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '失败数量'],
       finished_at: ['DATETIME DEFAULT NULL', '完成时间'],
       id: ['BIGINT UNSIGNED NOT NULL AUTO_INCREMENT', '主键ID'],
-      pending_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '待处理数量'],
-      processing_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '处理中数量'],
+      pending_count: ['INT UNSIGNED NOT NULL DEFAULT 0', 'Pending count'],
+      processing_count: ['INT UNSIGNED NOT NULL DEFAULT 0', 'Processing count'],
       raw_content: ['LONGTEXT DEFAULT NULL', '原始提交内容'],
-      retryable_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '可重试数量'],
+      retryable_count: ['INT UNSIGNED NOT NULL DEFAULT 0', 'Retryable count'],
       source_type: ["VARCHAR(32) NOT NULL DEFAULT 'manual'", '提交来源类型'],
-      status: ["VARCHAR(32) NOT NULL DEFAULT 'pending'", '批次状态'],
+      status: ["VARCHAR(32) NOT NULL DEFAULT 'pending'", 'Batch status'],
       submit_mode: ["VARCHAR(32) NOT NULL DEFAULT 'single'", '提交模式'],
       submitted_at: ['DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP', '提交时间'],
       succeeded_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '成功数量'],
-      total_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '总数量'],
+      total_count: ['INT UNSIGNED NOT NULL DEFAULT 0', 'Total count'],
       updated_at: [
         'DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
         '更新时间',
       ],
       user_id: ['BIGINT UNSIGNED NOT NULL', '用户ID'],
     },
-    table: '订单批次表',
+    table: 'Order batch table',
   },
   orders: {
     columns: {
       archived_at: ['DATETIME DEFAULT NULL', '归档时间'],
       batch_id: ['BIGINT UNSIGNED NOT NULL DEFAULT 0', '来源批次ID'],
       batch_item_id: ['BIGINT UNSIGNED NOT NULL DEFAULT 0', '来源批次明细ID'],
-      completed_quantity: ['INT UNSIGNED NOT NULL DEFAULT 0', '已完成数量'],
+      completed_quantity: ['INT UNSIGNED NOT NULL DEFAULT 0', 'Completed quantity'],
       created_at: ['DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP', '创建时间'],
       external_completed_quantity: [
         'INT UNSIGNED NOT NULL DEFAULT 0',
@@ -168,30 +168,30 @@ const schemaComments = {
       ],
       external_last_synced_at: ['DATETIME DEFAULT NULL', '外部进度同步时间'],
       external_progress: ['DECIMAL(10,4) DEFAULT NULL', '外部任务进度'],
-      external_status: ['VARCHAR(64) DEFAULT NULL', '外部任务状态'],
+      external_status: ['VARCHAR(64) DEFAULT NULL', 'External task status'],
       external_task_id: ['VARCHAR(128) DEFAULT NULL', '外部任务ID'],
       id: ['BIGINT UNSIGNED NOT NULL AUTO_INCREMENT', '主键ID'],
-      last_dispatch_at: ['DATETIME DEFAULT NULL', '最近投递时间'],
-      last_verified_at: ['DATETIME DEFAULT NULL', '最近验收时间'],
+      last_dispatch_at: ['DATETIME DEFAULT NULL', 'Last dispatch time'],
+      last_verified_at: ['DATETIME DEFAULT NULL', 'Last verification time'],
       note_id: ['VARCHAR(64) DEFAULT NULL', '小红书笔记ID'],
-      note_url: ['VARCHAR(1024) DEFAULT NULL', '小红书笔记链接'],
+      note_url: ['VARCHAR(1024) DEFAULT NULL', 'Note URL'],
       order_no: ['VARCHAR(40) NOT NULL', '订单编号'],
-      order_status: ["VARCHAR(32) NOT NULL DEFAULT 'running'", '订单状态'],
+      order_status: ["VARCHAR(32) NOT NULL DEFAULT 'running'", 'Order status'],
       ordered_quantity: ['INT UNSIGNED NOT NULL DEFAULT 0', '下单数量'],
       reason_code: ['VARCHAR(64) DEFAULT NULL', '原因编码'],
       reason_message: ['VARCHAR(255) DEFAULT NULL', '原因说明'],
       refund_amount_total: [
         'DECIMAL(18,4) NOT NULL DEFAULT 0.0000',
-        '累计退款金额',
+        'Total refunded amount',
       ],
       refund_calc_after_at: ['DATETIME DEFAULT NULL', '退款计算时间点'],
       refund_lock_status: [
         "VARCHAR(32) NOT NULL DEFAULT 'unlocked'",
-        '退款锁状态',
+        'Refund lock status',
       ],
-      refund_locked_at: ['DATETIME DEFAULT NULL', '退款锁定时间'],
-      refund_requested_at: ['DATETIME DEFAULT NULL', '申请退款时间'],
-      refunded_quantity: ['INT UNSIGNED NOT NULL DEFAULT 0', '已退款数量'],
+      refund_locked_at: ['DATETIME DEFAULT NULL', 'Refund locked time'],
+      refund_requested_at: ['DATETIME DEFAULT NULL', 'Refund requested time'],
+      refunded_quantity: ['INT UNSIGNED NOT NULL DEFAULT 0', 'Refunded quantity'],
       repair_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '补单次数'],
       snapshot_current_read_count: ['INT UNSIGNED DEFAULT NULL', '下单时阅读数快照'],
       snapshot_verified_read_count: ['INT UNSIGNED DEFAULT NULL', '验收时阅读数快照'],
@@ -209,38 +209,38 @@ const schemaComments = {
   system_configs: {
     columns: {
       config_group: ['VARCHAR(64) NOT NULL', '配置分组'],
-      config_key: ['VARCHAR(128) NOT NULL', '配置键'],
-      config_value: ['JSON NOT NULL', '配置值'],
+      config_key: ['VARCHAR(128) NOT NULL', 'Config key'],
+      config_value: ['JSON NOT NULL', 'Config value'],
       created_at: ['DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP', '创建时间'],
       description: ['VARCHAR(255) DEFAULT NULL', '配置说明'],
       id: ['BIGINT UNSIGNED NOT NULL AUTO_INCREMENT', '主键ID'],
-      status: ["VARCHAR(32) NOT NULL DEFAULT 'active'", '配置状态'],
+      status: ["VARCHAR(32) NOT NULL DEFAULT 'active'", 'Config status'],
       updated_at: [
         'DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
         '更新时间',
       ],
       version: ['BIGINT UNSIGNED NOT NULL DEFAULT 1', '配置版本'],
     },
-    table: '系统配置表',
+    table: 'System config table',
   },
   users: {
     columns: {
       discount_rate: [
         'DECIMAL(10,4) NOT NULL DEFAULT 1.0000',
-        '阅读业务折扣率',
+        'View discount rate',
       ],
-      home_path: ["VARCHAR(255) NOT NULL DEFAULT '/analytics'", '登录后首页路径'],
+      home_path: ["VARCHAR(255) NOT NULL DEFAULT '/analytics'", 'Home path after login'],
       impression_discount_rate: [
         'DECIMAL(10,4) NOT NULL DEFAULT 1.0000',
-        '曝光业务折扣率',
+        'Impression discount rate',
       ],
       nickname: ['VARCHAR(64) DEFAULT NULL', '用户昵称'],
       real_name: ["VARCHAR(100) NOT NULL DEFAULT ''", '真实姓名'],
-      status: ["VARCHAR(32) NOT NULL DEFAULT 'active'", '用户状态'],
+      status: ["VARCHAR(32) NOT NULL DEFAULT 'active'", 'User status'],
       user_no: ['VARCHAR(32) DEFAULT NULL', '用户业务编号'],
-      username: ['VARCHAR(100) NOT NULL', '登录用户名'],
+      username: ['VARCHAR(100) NOT NULL', 'Login username'],
     },
-    table: '系统用户表',
+    table: 'System user table',
   },
   xhs_query_accounts: {
     columns: {
@@ -252,22 +252,22 @@ const schemaComments = {
       ],
       cookie_encrypted: ['LONGTEXT DEFAULT NULL', '加密后的 Cookie'],
       created_at: ['DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP', '创建时间'],
-      deleted_at: ['DATETIME DEFAULT NULL', '软删除时间'],
+      deleted_at: ['DATETIME DEFAULT NULL', 'Soft delete time'],
       enabled: ['TINYINT(1) NOT NULL DEFAULT 1', '是否启用'],
       failure_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '失败次数'],
       id: ['BIGINT UNSIGNED NOT NULL AUTO_INCREMENT', '主键ID'],
-      last_error_code: ['VARCHAR(64) DEFAULT NULL', '最近错误编码'],
-      last_error_message: ['VARCHAR(255) DEFAULT NULL', '最近错误说明'],
-      last_failure_at: ['DATETIME DEFAULT NULL', '最近失败时间'],
-      last_success_at: ['DATETIME DEFAULT NULL', '最近成功时间'],
-      last_used_at: ['DATETIME DEFAULT NULL', '最近使用时间'],
+      last_error_code: ['VARCHAR(64) DEFAULT NULL', 'Last error code'],
+      last_error_message: ['VARCHAR(255) DEFAULT NULL', 'Last error message'],
+      last_failure_at: ['DATETIME DEFAULT NULL', 'Last failure time'],
+      last_success_at: ['DATETIME DEFAULT NULL', 'Last success time'],
+      last_used_at: ['DATETIME DEFAULT NULL', 'Last used time'],
       login_identifier: ['VARCHAR(128) DEFAULT NULL', '登录标识'],
       next_available_at: ['DATETIME DEFAULT NULL', '下次可用时间'],
       proxy_url: ['VARCHAR(512) DEFAULT NULL', '代理地址'],
       remark: ['VARCHAR(255) DEFAULT NULL', '备注'],
       risk_level: ["VARCHAR(32) NOT NULL DEFAULT 'normal'", '风险等级'],
       sid_encrypted: ['TEXT NOT NULL', '加密后的 SID'],
-      status: ["VARCHAR(32) NOT NULL DEFAULT 'active'", '账号状态'],
+      status: ["VARCHAR(32) NOT NULL DEFAULT 'active'", 'Account status'],
       success_count: ['INT UNSIGNED NOT NULL DEFAULT 0', '成功次数'],
       updated_at: [
         'DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP',
@@ -275,7 +275,7 @@ const schemaComments = {
       ],
       user_agent: ['VARCHAR(512) DEFAULT NULL', '请求 User-Agent'],
     },
-    table: '小红书查询账号池表',
+    table: 'XHS query account pool table',
   },
 };
 
@@ -348,7 +348,7 @@ const seedRolesAndPermissions = async (db) => {
   }
 };
 
-// 创建商品表
+// 创建商品�?
 const createGoodsTables = async (db) => {
   await db.execute(`
     CREATE TABLE IF NOT EXISTS balance_accounts (
@@ -363,7 +363,7 @@ const createGoodsTables = async (db) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  // XHS 查询账号表
+  // XHS 查询账号�?
   await db.execute(`
     CREATE TABLE IF NOT EXISTS xhs_query_accounts (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -399,7 +399,7 @@ const createGoodsTables = async (db) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  // 系统配置表
+  // 系统配置�?
   await db.execute(`
     CREATE TABLE IF NOT EXISTS system_configs (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -416,7 +416,7 @@ const createGoodsTables = async (db) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  // 账户记录表
+  // 账户记录�?
   await db.execute(`
     CREATE TABLE IF NOT EXISTS account_records (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -457,7 +457,7 @@ const createGoodsTables = async (db) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  // 订单批次表
+  // 订单批次�?
   await db.execute(`
     CREATE TABLE IF NOT EXISTS order_batches (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -487,7 +487,7 @@ const createGoodsTables = async (db) => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
   `);
 
-  // 订单表
+  // 订单�?
   await db.execute(`
     CREATE TABLE IF NOT EXISTS orders (
       id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -604,11 +604,12 @@ const createGoodsTables = async (db) => {
   `);
 };
 
-// 初始化商品配置
+// 初始化商品配�?
 const seedGoodsConfigs = async (db) => {
   const configs = [
     ['pricing', 'view_unit_price', JSON.stringify({ value: 0.01 }), 'View unit price'],
     ['pricing', 'impression_unit_price', JSON.stringify({ value: 0.01 }), 'Impression unit price'],
+    ['order', 'min_order_quantity', JSON.stringify({ value: 10 }), '单条最低下单量'],
     ['system', 'view_submit_enabled', JSON.stringify({ enabled: true }), 'Enable view orders'],
     [
       'system',
@@ -638,10 +639,10 @@ const hoursAgo = (hours) => new Date(Date.now() - hours * 60 * 60 * 1000);
 const seedDemoUsers = async (db) => {
   const passwordHash = await bcrypt.hash('demo123', 10);
   const users = [
-    ['demo_rednote_ops', '小红书爆文运营', 0.95, 0.9],
-    ['demo_brand_growth', '品牌增长组', 0.9, 0.88],
-    ['demo_kol_launch', '达人投放组', 0.98, 0.96],
-    ['demo_content_boost', '内容加热组', 0.92, 0.89],
+    ['demo_rednote_ops', 'Rednote ops demo', 0.95, 0.9],
+    ['demo_brand_growth', 'Brand growth demo', 0.9, 0.88],
+    ['demo_kol_launch', 'KOL launch demo', 0.98, 0.96],
+    ['demo_content_boost', 'Content boost demo', 0.92, 0.89],
   ];
   const balances = {
     demo_brand_growth: 5280.25,
@@ -766,7 +767,7 @@ const seedDemoXhsAccounts = async (db) => {
         riskLevel,
         failures > 0 ? 'DEMO_RISK' : null,
         failures > 0 ? '模拟账号最近查询失败，用于首页风险提醒' : null,
-        '首页演示账号池数据',
+        'Dashboard demo account pool data',
       ],
     );
   }
@@ -1044,8 +1045,8 @@ const seedDemoDashboardData = async (db) => {
     ['DEMO-ORDER-002', 'DEMO-RECORD-002', users.demo_rednote_ops, batchMap['00000000-0000-0000-0000-000000000101'], 1002, 'impression', 8_000, 3_200, 'running', 72, 0.9, hoursAgo(1), hoursAgo(1), null],
     ['DEMO-ORDER-003', 'DEMO-RECORD-003', users.demo_brand_growth, batchMap['00000000-0000-0000-0000-000000000102'], 1003, 'view', 6_500, 6_500, 'completed', 58.5, 0.9, hoursAgo(26), hoursAgo(24), null],
     ['DEMO-ORDER-004', 'DEMO-RECORD-004', users.demo_brand_growth, batchMap['00000000-0000-0000-0000-000000000102'], 1004, 'impression', 15_000, 15_000, 'completed', 132, 0.88, hoursAgo(4), hoursAgo(2), null],
-    ['DEMO-ORDER-005', null, users.demo_kol_launch, batchMap['00000000-0000-0000-0000-000000000103'], 1005, 'view', 3_500, 0, 'failed', 0, 0.98, hoursAgo(3), hoursAgo(2), '模拟失败：笔记不可访问'],
-    ['DEMO-ORDER-006', 'DEMO-RECORD-006', users.demo_kol_launch, batchMap['00000000-0000-0000-0000-000000000103'], 1006, 'impression', 9_000, 0, 'manual_review', 86.4, 0.96, hoursAgo(30), hoursAgo(3), '模拟审核：内容需要人工确认'],
+    ['DEMO-ORDER-005', null, users.demo_kol_launch, batchMap['00000000-0000-0000-0000-000000000103'], 1005, 'view', 3_500, 0, 'failed', 0, 0.98, hoursAgo(3), hoursAgo(2), 'Demo failed: note unavailable'],
+    ['DEMO-ORDER-006', 'DEMO-RECORD-006', users.demo_kol_launch, batchMap['00000000-0000-0000-0000-000000000103'], 1006, 'impression', 9_000, 0, 'manual_review', 86.4, 0.96, hoursAgo(30), hoursAgo(3), 'Demo review: content needs manual confirmation'],
     ['DEMO-ORDER-007', 'DEMO-RECORD-007', users.demo_content_boost, batchMap['00000000-0000-0000-0000-000000000104'], 1007, 'view', 5_000, 2_800, 'refund_requested', 46, 0.92, hoursAgo(6), hoursAgo(2), '模拟退款：用户申请停止'],
     ['DEMO-ORDER-008', 'DEMO-RECORD-008', users.demo_content_boost, batchMap['00000000-0000-0000-0000-000000000104'], 1008, 'impression', 12_000, 12_000, 'completed', 106.8, 0.89, hoursAgo(72), hoursAgo(70), null],
   ];
@@ -1115,7 +1116,7 @@ const seedDemoDashboardData = async (db) => {
         reasonMessage,
         recordNo,
         refundedQuantity: 0,
-        remark: '首页分析页演示消费流水',
+        remark: 'Dashboard demo consumption record',
         targetType,
         updatedAt,
         userId,
@@ -1150,7 +1151,7 @@ const initializeDatabase = async () => {
       home_path VARCHAR(255) NOT NULL DEFAULT '/analytics',
       created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
   await ensureColumn(db, 'users', 'real_name', "VARCHAR(100) NOT NULL DEFAULT ''");
@@ -1233,6 +1234,9 @@ const initializeDatabase = async () => {
   );
   await ensureColumn(db, 'users', 'like_quantity_price_base', 'INT UNSIGNED DEFAULT NULL');
   await ensureColumn(db, 'users', 'like_quantity_price_amount', 'DECIMAL(18,4) DEFAULT NULL');
+  await ensureColumn(db, 'users', 'order_view_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
+  await ensureColumn(db, 'users', 'order_like_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
+  await ensureColumn(db, 'users', 'order_impression_enabled', 'TINYINT(1) NOT NULL DEFAULT 1');
 
   await db.execute(
     "UPDATE users SET home_path = '/analytics' WHERE home_path IN ('/dashboard/workspace', '/workspace')",
@@ -1250,7 +1254,7 @@ const initializeDatabase = async () => {
       code VARCHAR(50) NOT NULL UNIQUE,
       name VARCHAR(100) NOT NULL,
       PRIMARY KEY (id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
   await db.execute(`
@@ -1259,7 +1263,7 @@ const initializeDatabase = async () => {
       code VARCHAR(100) NOT NULL UNIQUE,
       name VARCHAR(100) NOT NULL,
       PRIMARY KEY (id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
   await db.execute(`
@@ -1269,7 +1273,7 @@ const initializeDatabase = async () => {
       PRIMARY KEY (user_id, role_id),
       CONSTRAINT fk_user_roles_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
       CONSTRAINT fk_user_roles_role FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
   await db.execute(`
@@ -1279,7 +1283,7 @@ const initializeDatabase = async () => {
       PRIMARY KEY (role_id, permission_id),
       CONSTRAINT fk_role_permissions_role FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
       CONSTRAINT fk_role_permissions_permission FOREIGN KEY (permission_id) REFERENCES permissions(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
   await seedRolesAndPermissions(db);
@@ -1344,3 +1348,4 @@ module.exports = {
   initializeDatabase,
   shouldSeedDemoData,
 };
+

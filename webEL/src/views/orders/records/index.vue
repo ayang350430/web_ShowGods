@@ -8,23 +8,25 @@ import {
   ElButton,
   ElInput,
   ElMessage,
+  ElMessageBox,
   ElOption,
   ElPagination,
   ElSelect,
+  ElTag,
 } from 'element-plus';
 
 import {
   getBatchLinkCheckRecordsApi,
   getBatchOrderRecordsApi,
+  getBatchOrdersApi,
   getProblemLinkRecordsApi,
-  requestReplenishBatchOrderApi,
+  requestOrderRefundApi,
 } from '#/api';
 
 type OrderStatusFilter = 'all' | 'failed' | 'running' | 'success';
 
 const loading = ref(false);
 const polling = ref(false);
-const replenishLoading = ref(false);
 const router = useRouter();
 const records = ref<OrderApi.BatchOrderRecord[]>([]);
 const checkRecords = ref<OrderApi.ProblemLinkRecord[]>([]);
@@ -33,6 +35,98 @@ const selectedProblemBatchNo = ref('');
 const batchKeyword = ref('');
 const orderKeyword = ref('');
 const orderStatusFilter = ref<OrderStatusFilter>('all');
+const expandedOrderIds = ref(new Set<number>());
+const expandedProblemIds = ref(new Set<number>());
+const batchOrders = ref<OrderApi.BatchOrderRecordItem[]>([]);
+const batchOrdersLoading = ref(false);
+const refundLoadingId = ref<number>();
+
+function canRequestRefund(order: OrderApi.BatchOrderRecordItem) {
+  const blocked = [
+    'failed',
+    'refund_approved',
+    'refund_calculating',
+    'refund_rejected',
+    'refund_requested',
+    'stopping',
+  ];
+  if (blocked.includes(order.order_status)) return false;
+  if (Number(order.refund_amount || 0) > 0) return false;
+  return true;
+}
+
+async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
+  try {
+    await ElMessageBox.confirm(
+      `确定要对订单 ${order.order_no} 申请退款吗？提交后将停止任务并进入退款流程。`,
+      '申请退款',
+      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
+    );
+  } catch {
+    return;
+  }
+  refundLoadingId.value = order.id;
+  try {
+    await requestOrderRefundApi(order.id);
+    ElMessage.success('退款申请已提交');
+    await loadRecords();
+  } catch (error: any) {
+    ElMessage.error(error?.message || '退款申请失败');
+  } finally {
+    refundLoadingId.value = undefined;
+  }
+}
+
+function toggleOrderExpand(id: number) {
+  const set = expandedOrderIds.value;
+  if (set.has(id)) {
+    set.delete(id);
+  } else {
+    set.add(id);
+  }
+}
+
+function toggleProblemExpand(id: number) {
+  const set = expandedProblemIds.value;
+  if (set.has(id)) {
+    set.delete(id);
+  } else {
+    set.add(id);
+  }
+}
+
+function expandEnter(el: Element) {
+  const htmlEl = el as HTMLElement;
+  htmlEl.style.overflow = 'hidden';
+  htmlEl.style.height = '0';
+  htmlEl.style.opacity = '0';
+  void htmlEl.offsetHeight;
+  htmlEl.style.transition = 'height 0.3s ease-out, opacity 0.25s ease-out';
+  htmlEl.style.height = `${htmlEl.scrollHeight}px`;
+  htmlEl.style.opacity = '1';
+}
+function expandAfterEnter(el: Element) {
+  const htmlEl = el as HTMLElement;
+  htmlEl.style.height = '';
+  htmlEl.style.overflow = '';
+  htmlEl.style.transition = '';
+}
+function expandLeave(el: Element) {
+  const htmlEl = el as HTMLElement;
+  htmlEl.style.overflow = 'hidden';
+  htmlEl.style.height = `${htmlEl.scrollHeight}px`;
+  void htmlEl.offsetHeight;
+  htmlEl.style.transition = 'height 0.25s ease-in, opacity 0.2s ease-in';
+  htmlEl.style.height = '0';
+  htmlEl.style.opacity = '0';
+}
+function expandAfterLeave(el: Element) {
+  const htmlEl = el as HTMLElement;
+  htmlEl.style.height = '';
+  htmlEl.style.overflow = '';
+  htmlEl.style.transition = '';
+  htmlEl.style.opacity = '';
+}
 const pagination = ref({
   page: 1,
   page_size: 10,
@@ -149,11 +243,11 @@ const selectedProblemBatch = computed(() =>
 );
 
 const selectedBatchNeedsReplenish = computed(() =>
-  (selectedBatch.value?.orders ?? []).some((order) => order.order_status === 'repair_review'),
+  batchOrders.value.some((order) => order.order_status === 'repair_review'),
 );
 
 const filteredOrders = computed(() => {
-  const orders = selectedBatch.value?.orders ?? [];
+  const orders = batchOrders.value;
   const keyword = orderKeyword.value.trim().toLowerCase();
 
   return orders.filter((order) => {
@@ -262,9 +356,27 @@ function openConsumptionBatch(record: OrderApi.BatchOrderRecord) {
   });
 }
 
+async function loadBatchOrders(batchId: number) {
+  batchOrdersLoading.value = true;
+  try {
+    batchOrders.value = await getBatchOrdersApi(batchId);
+  } catch {
+    batchOrders.value = [];
+    ElMessage.error('加载订单失败');
+  } finally {
+    batchOrdersLoading.value = false;
+  }
+}
+
 watch([selectedBatchId, selectedProblemBatchNo], () => {
   orderKeyword.value = '';
   orderStatusFilter.value = 'all';
+  expandedOrderIds.value.clear();
+  expandedProblemIds.value.clear();
+  batchOrders.value = [];
+  if (selectedBatchId.value) {
+    loadBatchOrders(selectedBatchId.value);
+  }
 });
 
 function formatMoney(value?: number) {
@@ -328,6 +440,18 @@ function orderStatusLabel(status: string) {
   return statusMap[status] || status || '-';
 }
 
+function externalStatusLabel(status: string) {
+  const map: Record<string, string> = {
+    completed: '已完成',
+    failed: '失败',
+    pending: '等待中',
+    running: '进行中',
+    stopped: '已停止',
+    stopping: '停止中',
+  };
+  return map[status] || status || '-';
+}
+
 function orderDisplayStatusLabel(order: OrderApi.BatchOrderRecordItem) {
   if (order.order_status === 'running' && order.external_status === 'completed') {
     return '上游完成';
@@ -376,18 +500,36 @@ function isRefundRejectedOrder(order: OrderApi.BatchOrderRecordItem) {
 }
 
 function hasRefundedOrder(record: OrderApi.BatchOrderRecord) {
+  const s = record.order_status_summary;
+  if (s) {
+    return (s.refund_approved || 0) > 0;
+  }
   return (record.orders || []).some(isRefundedOrder);
 }
 
 function hasRefundingOrder(record: OrderApi.BatchOrderRecord) {
+  const s = record.order_status_summary;
+  if (s) {
+    return (
+      (s.refund_requested || 0) + (s.refund_calculating || 0) + (s.stopping || 0) > 0
+    );
+  }
   return (record.orders || []).some(isRefundingOrder);
 }
 
 function hasRefundRejectedOrder(record: OrderApi.BatchOrderRecord) {
+  const s = record.order_status_summary;
+  if (s) {
+    return (s.refund_rejected || 0) > 0;
+  }
   return (record.orders || []).some(isRefundRejectedOrder);
 }
 
 function hasRepairReviewOrder(record: OrderApi.BatchOrderRecord) {
+  const s = record.order_status_summary;
+  if (s) {
+    return (s.repair_review || 0) > 0;
+  }
   return (record.orders || []).some((order) => order.order_status === 'repair_review');
 }
 
@@ -475,21 +617,6 @@ async function copySelectedProblemBatchLinks() {
   }
 }
 
-async function replenishSelectedBatch() {
-  if (!selectedBatch.value) {
-    return;
-  }
-  replenishLoading.value = true;
-  try {
-    await requestReplenishBatchOrderApi(selectedBatch.value.id);
-    ElMessage.success('已提交补单申请，等待管理员同意');
-    await loadRecords({ silent: true });
-  } catch (error: any) {
-    ElMessage.error(error?.message || '补单申请失败，请稍后重试');
-  } finally {
-    replenishLoading.value = false;
-  }
-}
 
 async function loadRecords(options: { silent?: boolean } = {}) {
   if (polling.value) {
@@ -559,7 +686,7 @@ function pollRecords() {
 
 function startPolling() {
   stopPolling();
-  pollingTimer = setInterval(pollRecords, 5000);
+  pollingTimer = setInterval(pollRecords, 5 * 60 * 1000);
 }
 
 function stopPolling() {
@@ -612,7 +739,7 @@ onUnmounted(() => {
           默认显示批次，确认提交和问题链接批次会分开标记。
         </p>
         <p v-else-if="selectedBatch">
-          {{ selectedBatch.batch_no }} 内共有 {{ selectedBatch.orders.length }} 条订单。
+          {{ selectedBatch.batch_no }} 内共有 {{ batchOrdersLoading ? '...' : batchOrders.length }} 条订单。
         </p>
         <p v-else-if="selectedProblemBatch">
           {{ selectedProblemBatch.batchNo }} 内共有 {{ selectedProblemBatch.total }} 条问题链接检测记录。
@@ -635,15 +762,13 @@ onUnmounted(() => {
         >
           一键复制问题链接
         </ElButton>
-        <ElButton
+        <ElTag
           v-if="selectedBatchNeedsReplenish"
-          :loading="replenishLoading"
           type="warning"
-          @click="replenishSelectedBatch"
         >
-          申请补单
-        </ElButton>
-        <ElButton :loading="loading" type="primary" @click="() => loadRecords()">
+          补单已自动申请，等待管理员审批
+        </ElTag>
+        <ElButton :loading="loading || batchOrdersLoading" type="primary" @click="() => { loadRecords(); if (selectedBatchId) loadBatchOrders(selectedBatchId); }">
           刷新
         </ElButton>
       </div>
@@ -752,6 +877,7 @@ onUnmounted(() => {
           >
             {{ batchDisplayStatusLabel(record) }}
           </span>
+          <span class="row-arrow">›</span>
         </article>
 
         <article
@@ -792,10 +918,13 @@ onUnmounted(() => {
           <span class="batch-kind-tag batch-type-tag danger">
             放弃
           </span>
+          <span class="row-arrow">›</span>
         </article>
       </template>
 
       <template v-else-if="selectedBatch">
+        <div v-if="batchOrdersLoading" class="empty-state">加载订单中...</div>
+        <template v-else>
         <div class="detail-head">
           <span>商品</span>
           <span>标签</span>
@@ -804,57 +933,156 @@ onUnmounted(() => {
           <span>订单状态</span>
           <span>售后退款</span>
           <span>实际付款金额</span>
+          <span></span>
         </div>
 
-        <article
-          v-for="order in filteredOrders"
-          :key="order.id"
-          class="order-detail-row"
-          :class="{
-            refunded: isRefundedOrder(order),
-            refunding: isRefundingOrder(order),
-            'refund-rejected': isRefundRejectedOrder(order),
-          }"
-          :style="{ '--progress': `${orderProgress(order)}%` }"
-        >
-        <!-- {{ order }} -->
-          <div class="product-cell">
-            <div class="product-thumb">
-              <img v-if="order.avatar_url" :src="order.avatar_url" alt="" />
-              <span v-else>{{ targetTypeLabel(order.target_type) }}</span>
+        <div v-for="order in filteredOrders" :key="order.id">
+          <article
+            class="order-detail-row"
+            :class="{
+              refunded: isRefundedOrder(order),
+              refunding: isRefundingOrder(order),
+              'refund-rejected': isRefundRejectedOrder(order),
+              expanded: expandedOrderIds.has(order.id),
+            }"
+            :style="{ '--progress': `${orderProgress(order)}%` }"
+            @click="toggleOrderExpand(order.id)"
+          >
+            <div class="product-cell">
+              <div class="product-thumb">
+                <img v-if="order.avatar_url" :src="order.avatar_url" alt="" />
+                <span v-else>{{ targetTypeLabel(order.target_type) }}</span>
+              </div>
+              <div>
+                <p>
+                  订单编号：{{ order.order_no }}
+                  <span>订单创建时间：{{ formatDateTime(order.created_at) }}</span>
+                </p>
+                <strong>{{ order.title || order.note_id || '未记录笔记ID' }}</strong>
+                <span v-if="order.author_name" class="author-line">
+                  {{ order.author_name }} / {{ order.note_id }}
+                </span>
+                <em>{{ order.source_note_url || order.note_url || '-' }}</em>
+              </div>
             </div>
-            <div>
-              <p>
-                订单编号：{{ order.order_no }}
-                <span>订单创建时间：{{ formatDateTime(order.created_at) }}</span>
-              </p>
-              <strong>{{ order.title || order.note_id || '未记录笔记ID' }}</strong>
-              <span v-if="order.author_name" class="author-line">
-                {{ order.author_name }} / {{ order.note_id }}
-              </span>
-              <em>{{ order.source_note_url || order.note_url || '-' }}</em>
+            <div class="tag-cell">
+              <span>{{ targetTypeLabel(order.target_type) }}服务</span>
+              <span>订单ID：{{ order.id }}</span>
+              <span>批次：{{ selectedBatch.batch_no }}</span>
+              <span>明细：#{{ order.batch_item_id }}</span>
+            </div>
+            <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
+            <div class="quantity-cell">
+              <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+            </div>
+            <div class="order-status-cell">
+              <span>{{ orderDisplayStatusLabel(order) }}</span>
+              <small v-if="order.order_status === 'failed' && order.reason_message">
+                失败原因：{{ order.reason_message }}
+              </small>
+            </div>
+            <span>{{ refundLabel(order) }}</span>
+            <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
+            <span class="row-expand-arrow" :class="{ rotated: expandedOrderIds.has(order.id) }">▾</span>
+          </article>
+          <Transition @enter="expandEnter" @after-enter="expandAfterEnter" @leave="expandLeave" @after-leave="expandAfterLeave">
+          <div v-if="expandedOrderIds.has(order.id)" class="expand-panel">
+            <div class="expand-grid">
+              <div class="expand-item">
+                <span>订单编号</span><strong>{{ order.order_no }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>订单ID</span><strong>{{ order.id }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>笔记ID</span><strong>{{ order.note_id || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>博主ID</span><strong>{{ order.author_id || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>博主昵称</span><strong>{{ order.author_name || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>笔记标题</span><strong>{{ order.title || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>服务类型</span><strong>{{ targetTypeLabel(order.target_type) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>订单状态</span><strong>{{ orderDisplayStatusLabel(order) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>原始链接</span><strong>{{ order.source_note_url || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>解析链接</span><strong>{{ order.note_url || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>下单数量</span><strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>完成数量</span><strong>{{ (order.completed_quantity || 0).toLocaleString('zh-CN') }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>应付金额</span><strong>{{ formatMoney(order.payable_amount) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>实付金额</span><strong>{{ formatMoney(order.actual_paid_amount) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>退款金额</span><strong>{{ formatMoney(order.refund_amount) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>售后退款</span><strong>{{ refundLabel(order) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>外部任务ID</span><strong>{{ order.external_task_id || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>外部状态</span><strong>{{ externalStatusLabel(order.external_status) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>外部进度</span><strong>{{ order.external_progress ? `${(order.external_progress * 100).toFixed(1)}%` : '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>补单次数</span><strong>{{ order.repair_count || 0 }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>阅读数快照</span><strong>{{ order.snapshot_current_read_count ?? '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>验收阅读数</span><strong>{{ order.snapshot_verified_read_count ?? '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>验收点赞数</span><strong>{{ order.snapshot_verified_like_count ?? '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>点赞数</span><strong>{{ order.like_count ?? '-' }}</strong>
+              </div>
+              <div v-if="order.reason_message" class="expand-item expand-full">
+                <span>备注/原因</span><strong>{{ order.reason_message }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>创建时间</span><strong>{{ formatDateTime(order.created_at) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>更新时间</span><strong>{{ formatDateTime(order.updated_at) }}</strong>
+              </div>
+            </div>
+            <div v-if="canRequestRefund(order)" class="expand-actions">
+              <ElButton
+                type="danger"
+                :loading="refundLoadingId === order.id"
+                @click.stop="handleRequestRefund(order)"
+              >
+                申请退款
+              </ElButton>
             </div>
           </div>
-          <div class="tag-cell">
-            <span>{{ targetTypeLabel(order.target_type) }}服务</span>
-            <span>订单ID：{{ order.id }}</span>
-            <span>批次：{{ selectedBatch.batch_no }}</span>
-            <span>明细：#{{ order.batch_item_id }}</span>
-          </div>
-          <!-- formatMoney(order.actual_paid_amount / Math.max(order.ordered_quantity, 1)) -->
-          <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
-          <div class="quantity-cell">
-            <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-          </div>
-          <div class="order-status-cell">
-            <span>{{ orderDisplayStatusLabel(order) }}</span>
-            <small v-if="order.order_status === 'failed' && order.reason_message">
-              失败原因：{{ order.reason_message }}
-            </small>
-          </div>
-          <span>{{ refundLabel(order) }}</span>
-          <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
-        </article>
+          </Transition>
+        </div>
+        </template>
       </template>
 
       <template v-else-if="selectedProblemBatch">
@@ -866,37 +1094,95 @@ onUnmounted(() => {
           <span>处理状态</span>
           <span>放弃原因</span>
           <span>预估金额</span>
+          <span></span>
         </div>
 
-        <article
-          v-for="record in filteredProblemRecords"
-          :key="record.id"
-          class="order-detail-row problem-detail-row"
-        >
-          <div class="product-cell">
-            <div class="product-thumb problem-thumb">
-              <span>问题</span>
+        <div v-for="record in filteredProblemRecords" :key="record.id">
+          <article
+            class="order-detail-row problem-detail-row"
+            :class="{ expanded: expandedProblemIds.has(record.id) }"
+            @click="toggleProblemExpand(record.id)"
+          >
+            <div class="product-cell">
+              <div class="product-thumb problem-thumb">
+                <span>问题</span>
+              </div>
+              <div>
+                <p>
+                  检测批次：{{ selectedProblemBatch.batchNo }}
+                  <span>检测时间：{{ formatDateTime(record.created_at) }}</span>
+                </p>
+                <strong>{{ record.title || record.note_id || '未解析到笔记ID' }}</strong>
+                <em>{{ record.raw }}</em>
+              </div>
             </div>
-            <div>
-              <p>
-                检测批次：{{ selectedProblemBatch.batchNo }}
-                <span>检测时间：{{ formatDateTime(record.created_at) }}</span>
-              </p>
-              <strong>{{ record.title || record.note_id || '未解析到笔记ID' }}</strong>
-              <em>{{ record.raw }}</em>
+            <div class="tag-cell">
+              <span>问题链接</span>
+              <span>{{ targetTypeLabel(record.target_type) }}检测</span>
+              <span>明细：#{{ record.line_no }}</span>
+            </div>
+            <strong>{{ formatMoney(record.payable_amount / Math.max(record.ordered_quantity, 1)) }}</strong>
+            <strong>{{ record.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+            <span>{{ record.valid ? '成功' : '放弃' }}</span>
+            <span>{{ record.valid ? '无' : record.errors.join('、') || '未知问题' }}</span>
+            <strong>{{ formatMoney(record.payable_amount) }}</strong>
+            <span class="row-expand-arrow" :class="{ rotated: expandedProblemIds.has(record.id) }">▾</span>
+          </article>
+          <Transition @enter="expandEnter" @after-enter="expandAfterEnter" @leave="expandLeave" @after-leave="expandAfterLeave">
+          <div v-if="expandedProblemIds.has(record.id)" class="expand-panel">
+            <div class="expand-grid">
+              <div class="expand-item">
+                <span>记录ID</span><strong>{{ record.id }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>行号</span><strong>#{{ record.line_no }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>笔记ID</span><strong>{{ record.note_id || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>博主昵称</span><strong>{{ record.author_name || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>笔记标题</span><strong>{{ record.title || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>检测类型</span><strong>{{ targetTypeLabel(record.target_type) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>原始输入</span><strong>{{ record.raw }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>原始链接</span><strong>{{ record.note_url || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>解析链接</span><strong>{{ record.resolved_note_url || '-' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>下单数量</span><strong>{{ record.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>预估单价</span><strong>{{ formatMoney(record.payable_amount / Math.max(record.ordered_quantity, 1)) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>预估金额</span><strong>{{ formatMoney(record.payable_amount) }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>处理状态</span><strong>{{ record.valid ? '成功' : '放弃' }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>检测批次</span><strong>{{ record.check_batch_no }}</strong>
+              </div>
+              <div v-if="record.errors.length" class="expand-item expand-full">
+                <span>放弃原因</span><strong>{{ record.errors.join('、') }}</strong>
+              </div>
+              <div class="expand-item">
+                <span>检测时间</span><strong>{{ formatDateTime(record.created_at) }}</strong>
+              </div>
             </div>
           </div>
-          <div class="tag-cell">
-            <span>问题链接</span>
-            <span>{{ targetTypeLabel(record.target_type) }}检测</span>
-            <span>明细：#{{ record.line_no }}</span>
-          </div>
-          <strong>{{ formatMoney(record.payable_amount / Math.max(record.ordered_quantity, 1)) }}</strong>
-          <strong>{{ record.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-          <span>{{ record.valid ? '成功' : '放弃' }}</span>
-          <span>{{ record.valid ? '无' : record.errors.join('、') || '未知问题' }}</span>
-          <strong>{{ formatMoney(record.payable_amount) }}</strong>
-        </article>
+          </Transition>
+        </div>
       </template>
 
       <div
@@ -933,7 +1219,7 @@ onUnmounted(() => {
           :page-sizes="[10, 20, 50, 100]"
           :total="pagination.total"
           background
-          layout="total, sizes, prev, pager, next, jumper"
+          layout="sizes, prev, pager, next, jumper"
           @current-change="handleBatchPageChange"
           @size-change="handleBatchPageSizeChange"
         />
@@ -1030,7 +1316,7 @@ onUnmounted(() => {
 .batch-row {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(80px, 0.5fr)) minmax(150px, 0.8fr) 110px;
+  grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(80px, 0.5fr)) minmax(150px, 0.8fr) 110px 28px;
   gap: 14px;
   align-items: center;
   overflow: hidden;
@@ -1174,7 +1460,7 @@ onUnmounted(() => {
 .detail-head,
 .order-detail-row {
   display: grid;
-  grid-template-columns: minmax(360px, 2fr) minmax(170px, 1fr) 110px 90px 110px 110px 140px;
+  grid-template-columns: minmax(360px, 2fr) minmax(170px, 1fr) 110px 90px 110px 110px 140px 28px;
   gap: 16px;
   align-items: center;
 }
@@ -1337,6 +1623,100 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
+.order-detail-row {
+  cursor: pointer;
+}
+
+.order-detail-row.expanded {
+  border-color: var(--el-color-primary-light-5);
+}
+
+.row-arrow {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-text-color-placeholder);
+  font-size: 22px;
+  font-weight: 300;
+  line-height: 1;
+  transition: color 0.2s;
+}
+
+.batch-row:hover .row-arrow {
+  color: var(--el-color-primary);
+}
+
+.row-expand-arrow {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-text-color-placeholder);
+  font-size: 18px;
+  line-height: 1;
+  transition:
+    transform 0.25s ease,
+    color 0.2s;
+}
+
+.row-expand-arrow.rotated {
+  transform: rotate(180deg);
+  color: var(--el-color-primary);
+}
+
+.order-detail-row:hover .row-expand-arrow {
+  color: var(--el-color-primary);
+}
+
+.expand-panel {
+  padding: 16px 20px;
+  border: 1px solid var(--el-border-color-light);
+  border-top: none;
+  border-radius: 0 0 8px 8px;
+  background: var(--el-fill-color-blank);
+  margin-top: -8px;
+  margin-bottom: 4px;
+}
+
+.expand-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px 24px;
+}
+
+.expand-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.expand-item > span {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.expand-item > strong {
+  font-size: 14px;
+  font-weight: 500;
+  word-break: break-all;
+}
+
+.expand-full {
+  grid-column: 1 / -1;
+}
+
+.expand-actions {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 12px;
+  border-top: 1px solid var(--el-border-color-lighter);
+  margin-top: 4px;
+}
+
 .empty-state {
   padding: 56px 16px;
   color: var(--el-text-color-secondary);
@@ -1357,6 +1737,11 @@ onUnmounted(() => {
   }
 
   .detail-head {
+    display: none;
+  }
+
+  .row-arrow,
+  .row-expand-arrow {
     display: none;
   }
 }

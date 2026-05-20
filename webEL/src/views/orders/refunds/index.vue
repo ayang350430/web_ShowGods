@@ -1,4 +1,4 @@
-﻿<script setup lang="ts">
+<script setup lang="ts">
 import type { OrderApi } from '#/api';
 
 import { computed, onMounted, reactive, ref } from 'vue';
@@ -7,6 +7,7 @@ import { useUserStore } from '@vben/stores';
 
 import {
   ElButton,
+  ElDialog,
   ElInput,
   ElMessage,
   ElOption,
@@ -18,11 +19,16 @@ import {
   ElTag,
 } from 'element-plus';
 
-import { getRefundRecordsApi, reviewOrderRefundApi } from '#/api';
+import {
+  batchApproveRefundsApi,
+  getRefundRecordsApi,
+  reviewOrderRefundApi,
+} from '#/api';
 
 const loading = ref(false);
 const records = ref<OrderApi.RefundRecord[]>([]);
 const reviewingOrderId = ref<number>();
+const batchApprovingNo = ref<string>();
 const userStore = useUserStore();
 
 const filters = reactive({
@@ -59,6 +65,38 @@ const summary = computed(() => {
 const canReviewRefund = computed(() =>
   (userStore.userInfo?.roles ?? []).some((role) => ['admin', 'super'].includes(role)),
 );
+
+const pendingBatches = ref<Array<{ batch_no: string; count: number; user: string }>>([]);
+
+async function loadPendingBatches() {
+  try {
+    const statuses = ['refund_requested', 'refund_calculating', 'stopping'];
+    const results = await Promise.all(
+      statuses.map((s) => getRefundRecordsApi({ status: s, page: 1, page_size: 500 })),
+    );
+    const allPending = results.flatMap((r) => r.items);
+    const map = new Map<string, { count: number; user: string }>();
+    for (const r of allPending) {
+      if (!r.batch_no) continue;
+      const existing = map.get(r.batch_no);
+      if (existing) {
+        existing.count++;
+      } else {
+        map.set(r.batch_no, {
+          count: 1,
+          user: r.display_name || r.username || '',
+        });
+      }
+    }
+    pendingBatches.value = [...map.entries()].map(([batchNo, info]) => ({
+      batch_no: batchNo,
+      count: info.count,
+      user: info.user,
+    }));
+  } catch {
+    pendingBatches.value = [];
+  }
+}
 
 function formatMoney(value?: number) {
   return `￥ ${(Number(value) || 0).toLocaleString('zh-CN', {
@@ -131,6 +169,21 @@ function canReviewStatus(status: string) {
   return ['refund_requested', 'refund_calculating', 'stopping'].includes(status);
 }
 
+async function batchApproveByBatchNo(batchNo: string) {
+  batchApprovingNo.value = batchNo;
+  try {
+    const result = await batchApproveRefundsApi({ batch_no: batchNo });
+    ElMessage.success(
+      `批量退款完成：共 ${result.total} 条，成功 ${result.succeeded} 条${result.failed > 0 ? `，失败 ${result.failed} 条` : ''}`,
+    );
+    await loadRecords();
+  } catch {
+    ElMessage.error('批量退款失败');
+  } finally {
+    batchApprovingNo.value = undefined;
+  }
+}
+
 async function reviewRefund(record: OrderApi.RefundRecord, approved: boolean) {
   reviewingOrderId.value = record.order_id;
   try {
@@ -165,7 +218,37 @@ async function loadRecords() {
   } finally {
     loading.value = false;
   }
+  loadPendingBatches();
 }
+
+const detailVisible = ref(false);
+const detailBatchNo = ref('');
+const detailLoading = ref(false);
+const detailRecords = ref<OrderApi.RefundRecord[]>([]);
+
+async function viewBatchDetail(batchNo: string) {
+  detailBatchNo.value = batchNo;
+  detailVisible.value = true;
+  detailLoading.value = true;
+  try {
+    const result = await getRefundRecordsApi({
+      keyword: batchNo,
+      page: 1,
+      page_size: 200,
+    });
+    detailRecords.value = result.items;
+  } catch {
+    detailRecords.value = [];
+  } finally {
+    detailLoading.value = false;
+  }
+}
+
+const detailSummary = computed(() => {
+  const paid = detailRecords.value.reduce((s, r) => s + Number(r.actual_paid_amount || 0), 0);
+  const refunded = detailRecords.value.reduce((s, r) => s + Number(r.refund_amount_total || 0), 0);
+  return { paid, refunded, count: detailRecords.value.length };
+});
 
 function searchRecords() {
   pagination.page = 1;
@@ -224,6 +307,46 @@ onMounted(loadRecords);
       </div>
     </section>
 
+    <!-- 批量操作区域 -->
+    <section
+      v-if="canReviewRefund && pendingBatches.length > 0"
+      class="batch-approve-panel"
+    >
+      <div class="batch-approve-title">
+        <span>待审核批次</span>
+        <small>以下批次有退款待审核，可一键通过整个批次</small>
+      </div>
+      <div class="batch-approve-list">
+        <div
+          v-for="batch in pendingBatches"
+          :key="batch.batch_no"
+          class="batch-approve-item"
+        >
+          <div class="batch-approve-info">
+            <span class="batch-no batch-no-link" @click="viewBatchDetail(batch.batch_no)">{{ batch.batch_no }}</span>
+            <span class="batch-meta">{{ batch.user }} / {{ batch.count }} 条待审核</span>
+          </div>
+          <ElPopconfirm
+            :title="`确认通过批次 ${batch.batch_no} 的全部 ${batch.count} 条退款申请？`"
+            confirm-button-text="全部通过"
+            cancel-button-text="取消"
+            width="360"
+            @confirm="batchApproveByBatchNo(batch.batch_no)"
+          >
+            <template #reference>
+              <ElButton
+                :loading="batchApprovingNo === batch.batch_no"
+                size="small"
+                type="primary"
+              >
+                一键通过 ({{ batch.count }})
+              </ElButton>
+            </template>
+          </ElPopconfirm>
+        </div>
+      </div>
+    </section>
+
     <section class="record-panel">
       <div class="filter-bar">
         <ElInput
@@ -250,7 +373,7 @@ onMounted(loadRecords);
         row-key="order_id"
         empty-text="暂无退款记录"
       >
-        <ElTableColumn label="订单信息" min-width="240">
+        <ElTableColumn label="订单信息" min-width="260">
           <template #default="{ row }">
             <div class="main-cell">
               <strong>{{ row.order_no }}</strong>
@@ -259,7 +382,7 @@ onMounted(loadRecords);
             </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="笔记" min-width="260">
+        <ElTableColumn label="笔记" min-width="280">
           <template #default="{ row }">
             <div class="note-cell">
               <img
@@ -275,17 +398,17 @@ onMounted(loadRecords);
             </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="业务" width="100">
+        <ElTableColumn label="业务" width="80" align="center">
           <template #default="{ row }">
             {{ targetTypeLabel(row.target_type) }}
           </template>
         </ElTableColumn>
-        <ElTableColumn label="数量" width="110">
+        <ElTableColumn label="数量" width="90" align="right">
           <template #default="{ row }">
             {{ row.ordered_quantity.toLocaleString('zh-CN') }}
           </template>
         </ElTableColumn>
-        <ElTableColumn label="付款/退款" min-width="150">
+        <ElTableColumn label="付款/退款" min-width="160">
           <template #default="{ row }">
             <div class="amount-cell">
               <strong>{{ formatMoney(row.actual_paid_amount) }}</strong>
@@ -296,12 +419,12 @@ onMounted(loadRecords);
             </div>
           </template>
         </ElTableColumn>
-        <ElTableColumn label="申请时间" min-width="170">
+        <ElTableColumn label="申请时间" width="170" align="center">
           <template #default="{ row }">
             {{ formatDateTime(row.refund_requested_at) }}
           </template>
         </ElTableColumn>
-        <ElTableColumn label="状态" width="130" align="center">
+        <ElTableColumn label="状态" width="110" align="center">
           <template #default="{ row }">
             <ElTag :type="statusTagType(row.order_status)" effect="plain" size="small">
               {{ statusLabel(row.order_status) }}
@@ -311,8 +434,9 @@ onMounted(loadRecords);
         <ElTableColumn
           v-if="canReviewRefund"
           label="审核"
-          width="170"
+          width="160"
           align="center"
+          fixed="right"
         >
           <template #default="{ row }">
             <div v-if="canReviewStatus(row.order_status)" class="review-actions">
@@ -367,6 +491,70 @@ onMounted(loadRecords);
         />
       </div>
     </section>
+
+    <!-- 批次详情弹窗 -->
+    <ElDialog
+      v-model="detailVisible"
+      width="720px"
+      destroy-on-close
+      :show-close="true"
+      class="batch-detail-dialog"
+    >
+      <template #header>
+        <div class="detail-header">
+          <div class="detail-header-top">
+            <h3>{{ detailBatchNo }}</h3>
+            <ElTag size="small" effect="plain">{{ detailSummary.count }} 条订单</ElTag>
+          </div>
+          <div class="detail-header-stats">
+            <div class="stat-chip">
+              <span>付款合计</span>
+              <strong>{{ formatMoney(detailSummary.paid) }}</strong>
+            </div>
+            <div class="stat-chip">
+              <span>退款合计</span>
+              <strong class="refund-amount">{{ formatMoney(detailSummary.refunded) }}</strong>
+            </div>
+          </div>
+        </div>
+      </template>
+      <div v-loading="detailLoading" class="detail-list">
+        <div v-if="!detailLoading && detailRecords.length === 0" class="detail-empty">暂无记录</div>
+        <div
+          v-for="item in detailRecords"
+          :key="item.order_id"
+          class="detail-card"
+        >
+          <div class="detail-card-left">
+            <img v-if="item.avatar_url" :src="item.avatar_url" alt="" class="detail-avatar" />
+            <div v-else class="detail-avatar-placeholder">{{ (item.author_name || '?')[0] }}</div>
+            <div class="detail-card-info">
+              <div class="detail-card-title">{{ item.title || item.note_id || '-' }}</div>
+              <div class="detail-card-meta">
+                <span>{{ item.author_name || '-' }}</span>
+                <span class="dot">·</span>
+                <span>{{ targetTypeLabel(item.target_type) }}</span>
+                <span class="dot">·</span>
+                <span>{{ item.ordered_quantity.toLocaleString('zh-CN') }} 个</span>
+              </div>
+              <div class="detail-card-sub">{{ item.order_no }}</div>
+            </div>
+          </div>
+          <div class="detail-card-right">
+            <div class="detail-card-amounts">
+              <span class="paid">{{ formatMoney(item.actual_paid_amount) }}</span>
+              <span v-if="Number(item.refund_amount_total || 0) > 0" class="refunded">
+                退 {{ formatMoney(item.refund_amount_total) }}
+              </span>
+            </div>
+            <ElTag :type="statusTagType(item.order_status)" effect="plain" size="small">
+              {{ statusLabel(item.order_status) }}
+            </ElTag>
+            <div class="detail-card-time">{{ formatDateTime(item.refund_requested_at) }}</div>
+          </div>
+        </div>
+      </div>
+    </ElDialog>
   </div>
 </template>
 
@@ -383,6 +571,7 @@ onMounted(loadRecords);
 
 .page-head,
 .record-panel,
+.batch-approve-panel,
 .summary-grid > div {
   border: 1px solid hsl(var(--border));
   border-radius: 8px;
@@ -434,6 +623,74 @@ onMounted(loadRecords);
   font-size: 24px;
 }
 
+/* --- 批量操作区域 --- */
+.batch-approve-panel {
+  padding: 16px 20px;
+}
+
+.batch-approve-title {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.batch-approve-title > span {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.batch-approve-title > small {
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.batch-approve-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.batch-approve-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border: 1px solid hsl(var(--border));
+  border-radius: 6px;
+  background: hsl(var(--accent) / 0.35);
+}
+
+.batch-approve-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.batch-no {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: var(--font-family-mono, monospace);
+  color: hsl(var(--foreground));
+}
+
+.batch-no-link {
+  color: hsl(var(--primary));
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+
+.batch-no-link:hover {
+  opacity: 0.75;
+  text-decoration: underline;
+}
+
+.batch-meta {
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+/* --- 记录面板 --- */
 .record-panel {
   padding: 16px;
 }
@@ -449,7 +706,16 @@ onMounted(loadRecords);
 .amount-cell {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+}
+
+.main-cell strong {
+  font-size: 13px;
+}
+
+.main-cell span,
+.main-cell small {
+  font-size: 12px;
 }
 
 .review-actions {
@@ -467,17 +733,26 @@ onMounted(loadRecords);
 }
 
 .note-cell img {
-  width: 38px;
-  height: 38px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   object-fit: cover;
+  flex-shrink: 0;
 }
 
 .note-cell > div {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
   min-width: 0;
+}
+
+.note-cell strong {
+  font-size: 13px;
+}
+
+.note-cell span {
+  font-size: 12px;
 }
 
 .note-cell strong,
@@ -485,6 +760,18 @@ onMounted(loadRecords);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.note-cell small {
+  font-size: 11px;
+}
+
+.amount-cell strong {
+  font-size: 13px;
+}
+
+.amount-cell span {
+  font-size: 12px;
 }
 
 .pagination-bar {
@@ -514,6 +801,185 @@ onMounted(loadRecords);
   .filter-bar {
     grid-template-columns: 1fr;
   }
+
+  .batch-approve-list {
+    flex-direction: column;
+  }
+}
+
+/* --- 批次详情弹窗 --- */
+.detail-header {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.detail-header-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.detail-header-top h3 {
+  font-size: 16px;
+  font-weight: 600;
+  font-family: var(--font-family-mono, monospace);
+  margin: 0;
+}
+
+.detail-header-stats {
+  display: flex;
+  gap: 16px;
+}
+
+.stat-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  background: hsl(var(--accent) / 0.5);
+  font-size: 13px;
+}
+
+.stat-chip span {
+  color: hsl(var(--muted-foreground));
+}
+
+.stat-chip strong {
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.stat-chip .refund-amount {
+  color: #e6a23c;
+}
+
+.detail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 480px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.detail-empty {
+  text-align: center;
+  padding: 40px 0;
+  color: hsl(var(--muted-foreground));
+  font-size: 14px;
+}
+
+.detail-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid hsl(var(--border));
+  background: hsl(var(--card, var(--background)));
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.detail-card:hover {
+  border-color: hsl(var(--primary) / 0.3);
+  box-shadow: 0 1px 4px hsl(var(--primary) / 0.06);
+}
+
+.detail-card-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  flex: 1;
+}
+
+.detail-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.detail-avatar-placeholder {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: hsl(var(--primary) / 0.1);
+  color: hsl(var(--primary));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+
+.detail-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.detail-card-title {
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: hsl(var(--foreground));
+}
+
+.detail-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: hsl(var(--muted-foreground));
+}
+
+.detail-card-meta .dot {
+  opacity: 0.4;
+}
+
+.detail-card-sub {
+  font-size: 11px;
+  font-family: var(--font-family-mono, monospace);
+  color: hsl(var(--muted-foreground) / 0.7);
+}
+
+.detail-card-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.detail-card-amounts {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 1px;
+}
+
+.detail-card-amounts .paid {
+  font-size: 14px;
+  font-weight: 600;
+  color: hsl(var(--foreground));
+}
+
+.detail-card-amounts .refunded {
+  font-size: 11px;
+  color: #e6a23c;
+}
+
+.detail-card-time {
+  font-size: 11px;
+  color: hsl(var(--muted-foreground) / 0.7);
 }
 </style>
-

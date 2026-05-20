@@ -5,7 +5,7 @@ const FALLBACK_LOCATION = {
 };
 
 const WEATHER_CACHE_TTL = 10 * 60 * 1000;
-const WEATHER_FETCH_TIMEOUT = 1500;
+const WEATHER_FETCH_TIMEOUT = 8000;
 const weatherCache = new Map();
 
 const toCoordinate = (value) => {
@@ -53,26 +53,27 @@ const getTodayWeather = async (options = {}) => {
   const timer = setTimeout(() => controller.abort(), WEATHER_FETCH_TIMEOUT);
   let response;
 
+  const fallback = {
+    city: location.name,
+    current_temperature: 0,
+    temperature_max: 0,
+    temperature_min: 0,
+    unit: '°C',
+    weather_code: -1,
+  };
+
   try {
     response = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`, {
       signal: controller.signal,
     });
-  } catch (error) {
-    if (cached) {
-      return cached.data;
-    }
-    throw error;
+  } catch {
+    return cached ? cached.data : fallback;
   } finally {
     clearTimeout(timer);
   }
 
   if (!response.ok) {
-    if (cached) {
-      return cached.data;
-    }
-    const error = new Error('Failed to fetch weather');
-    error.statusCode = 502;
-    throw error;
+    return cached ? cached.data : fallback;
   }
 
   const data = await response.json();

@@ -55,6 +55,7 @@ export namespace OrderApi {
   export interface BatchOrderRecordItem {
     actual_paid_amount: number;
     after_available_amount: null | number;
+    author_id: string;
     author_name: string;
     avatar_url: string;
     batch_item_id: number;
@@ -63,6 +64,7 @@ export namespace OrderApi {
     external_completed_quantity: number;
     external_progress: number;
     external_status: string;
+    external_task_id: string;
     id: number;
     like_count: null | number;
     note_id: string;
@@ -78,6 +80,7 @@ export namespace OrderApi {
     target_type: 'impression' | 'like' | 'view';
     snapshot_current_read_count: null | number;
     snapshot_verified_read_count: null | number;
+    snapshot_verified_like_count: null | number;
     source_note_url: string;
     title: string;
     updated_at: string;
@@ -91,6 +94,7 @@ export namespace OrderApi {
     failed_count: number;
     finished_at: null | string;
     id: number;
+    order_status_summary?: Record<string, number>;
     orders: BatchOrderRecordItem[];
     processing_count: number;
     raw_content: string;
@@ -142,6 +146,7 @@ export namespace OrderApi {
   export interface ConsumptionRecord {
     actual_paid_amount: number;
     after_available_amount: number;
+    batch_id: number;
     before_available_amount: number;
     completed_quantity: number;
     created_at: string;
@@ -398,6 +403,16 @@ export async function getRefundRecordsApi(params?: {
   );
 }
 
+export async function getBatchOrdersApi(
+  batchId: number,
+  options?: { silent?: boolean },
+) {
+  return requestClient.get<OrderApi.BatchOrderRecordItem[]>(
+    `/v1/orders/batch/${batchId}/orders`,
+    { skipBackendLoading: options?.silent } as any,
+  );
+}
+
 export async function retryBatchOrderApi(batchId: number) {
   return requestClient.post<{
     batch_id: number;
@@ -458,6 +473,23 @@ export async function requestOrderRefundApi(orderId: number) {
   }>(`/v1/orders/${orderId}/refund-request`);
 }
 
+export async function requestBatchRefundApi(batchId: number) {
+  return requestClient.post<{
+    batch_id: number;
+    batch_no: string;
+    eligible_count: number;
+    failed_count: number;
+    results: Array<{
+      message?: string;
+      order_id: number;
+      order_no: string;
+      status: string;
+    }>;
+    success_count: number;
+    total_count: number;
+  }>(`/v1/orders/batch/${batchId}/refund-request`);
+}
+
 export async function reviewOrderRefundApi(
   orderId: number,
   data: { approved: boolean; reason?: string },
@@ -468,6 +500,24 @@ export async function reviewOrderRefundApi(
     order_status: string;
     refunded_amount: number;
   }>(`/v1/orders/${orderId}/refund-review`, data);
+}
+
+export async function batchApproveRefundsApi(data: {
+  batch_no?: string;
+  order_ids?: number[];
+}) {
+  return requestClient.post<{
+    failed: number;
+    results: Array<{
+      error?: string;
+      order_id: number;
+      order_no: string;
+      refunded_amount?: number;
+      success: boolean;
+    }>;
+    succeeded: number;
+    total: number;
+  }>('/v1/orders/refund-batch-approve', data);
 }
 
 export async function saveProblemLinkRecordsApi(
