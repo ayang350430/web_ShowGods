@@ -1,4 +1,6 @@
-import { baseRequestClient, requestClient } from '#/api/request';
+import { useAccessStore } from '@vben/stores';
+
+import { apiURL, baseRequestClient, requestClient } from '#/api/request';
 
 export namespace OrderApi {
   export interface BatchOrderParams {
@@ -82,6 +84,7 @@ export namespace OrderApi {
     snapshot_verified_read_count: null | number;
     snapshot_verified_like_count: null | number;
     source_note_url: string;
+    stop_response_message: string;
     title: string;
     updated_at: string;
   }
@@ -341,6 +344,59 @@ export async function previewBatchOrderSilentApi(
   );
 }
 
+export async function previewBatchOrderStreamApi(
+  data: OrderApi.BatchOrderParams,
+  callbacks: {
+    onItem?: (item: OrderApi.BatchOrderItem) => void;
+    onStart?: (info: { total_count: number }) => void;
+  },
+): Promise<OrderApi.BatchOrderPreview> {
+  const accessStore = useAccessStore();
+  const response = await fetch(`${apiURL}/v1/orders/batch/preview-stream`, {
+    body: JSON.stringify(data),
+    headers: {
+      'Authorization': `Bearer ${accessStore.accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    method: 'POST',
+  });
+
+  if (!response.ok || !response.body) {
+    throw new Error(`Preview stream failed: ${response.status}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let result: OrderApi.BatchOrderPreview | undefined;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop()!;
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const payload = JSON.parse(line.slice(6));
+      if (payload.type === 'start') {
+        callbacks.onStart?.(payload.data);
+      } else if (payload.type === 'item') {
+        callbacks.onItem?.(payload.data);
+      } else if (payload.type === 'done') {
+        result = payload.data;
+      } else if (payload.type === 'error') {
+        throw new Error(payload.message);
+      }
+    }
+  }
+
+  if (!result) throw new Error('Preview stream ended without result');
+  return result;
+}
+
 export async function submitBatchOrderApi(
   data: OrderApi.BatchOrderParams,
   options?: { silent?: boolean },
@@ -348,7 +404,7 @@ export async function submitBatchOrderApi(
   return requestClient.post<OrderApi.BatchOrderSubmitResult>(
     '/v1/orders/batch/submit',
     data,
-    { skipBackendLoading: options?.silent, timeout: 60_000 } as any,
+    { skipBackendLoading: options?.silent, timeout: 0 } as any,
   );
 }
 
@@ -518,6 +574,24 @@ export async function batchApproveRefundsApi(data: {
     succeeded: number;
     total: number;
   }>('/v1/orders/refund-batch-approve', data);
+}
+
+export async function batchRejectRefundsApi(data: {
+  batch_no?: string;
+  order_ids?: number[];
+  reason?: string;
+}) {
+  return requestClient.post<{
+    failed: number;
+    results: Array<{
+      order_id: number;
+      order_no: string;
+      order_status: string;
+      success: boolean;
+    }>;
+    succeeded: number;
+    total: number;
+  }>('/v1/orders/refund-batch-reject', data);
 }
 
 export async function saveProblemLinkRecordsApi(

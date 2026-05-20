@@ -38,8 +38,8 @@ const apiDocs = [
     method: 'POST',
     params: [
       {
-        desc: '批量内容，每行一条，格式为“链接 数量”。支持阅读、点赞、曝光下单链接。',
-        example: 'https://www.xiaohongshu.com/explore/6a081953000000003501efc6 100',
+        desc: '批量内容，每行一条，格式为”链接 数量”，多条链接用 \\n 换行拼接。支持阅读、点赞、曝光下单链接。',
+        example: 'http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000',
         name: 'content',
         place: 'body',
         required: '是',
@@ -57,9 +57,12 @@ const apiDocs = [
     path: '/api/open/orders/preview',
     requestExample: `{
   // 必填：业务类型，view=阅读，like=点赞，impression=曝光
-  "target_type": "view",
-  // 必填：批量内容，每行格式为“链接 数量”
-  "content": "https://www.xiaohongshu.com/explore/6a081953000000003501efc6 100"
+  “target_type”: “view”,
+  // 必填：批量内容，每行格式为”链接 数量”，多条用 \\n 换行
+  // 单条示例：
+  “content”: “https://www.xiaohongshu.com/explore/6a081953000000003501efc6 100”
+  // 多条示例：
+  // “content”: “http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000\\nhttp://xhslink.com/o/ghi789 500”
 }`,
     responseExample: `{
   // 0 表示成功，非 0 表示失败
@@ -81,8 +84,8 @@ const apiDocs = [
     method: 'POST',
     params: [
       {
-        desc: '批量内容，每行一条，格式为“链接 数量”。一条链接会创建一条订单并提交一次上游任务。',
-        example: 'https://www.xiaohongshu.com/explore/6a081953000000003501efc6 100',
+        desc: '批量内容，每行一条，格式为”链接 数量”，多条链接用 \\n 换行拼接。一条链接会创建一条订单并提交一次上游任务。',
+        example: 'http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000',
         name: 'content',
         place: 'body',
         required: '是',
@@ -121,8 +124,11 @@ const apiDocs = [
   “agree_policy”: true,
   // 必填：外部系统备注，作为任务来源标识（goodsAdmin:{remark}）
   “remark”: “merchant_order=MO202605180001”,
-  // 必填：批量内容，每行格式为”链接 数量”
+  // 必填：批量内容，每行格式为”链接 数量”，多条用 \\n 换行
+  // 单条示例：
   “content”: “https://www.xiaohongshu.com/explore/6a081953000000003501efc6 20”
+  // 多条示例：
+  // “content”: “http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000\\nhttp://xhslink.com/o/ghi789 500”
 }`,
     responseExample: `{
   "code": 0,

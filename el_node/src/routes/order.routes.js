@@ -7,6 +7,7 @@ const router = express.Router();
 // 预览批量订单路由
 router.post('/batch/preview', batchOrderController.previewBatchOrder);
 router.post('/batch/preview-silent', batchOrderController.previewBatchOrderSilent);
+router.post('/batch/preview-stream', batchOrderController.previewBatchOrderStream);
 router.post('/batch/search', batchOrderController.searchBatchOrders);
 router.get('/batch/check-records', batchOrderController.listCheckRecords);
 router.get('/batch/records', batchOrderController.listBatchOrderRecords);
@@ -24,6 +25,7 @@ router.post('/batch/submit', batchOrderController.submitBatchOrder);
 router.post('/batch/:batchId/refund-request', batchOrderController.requestBatchRefund);
 router.post('/:orderId/refund-request', batchOrderController.requestOrderRefund);
 router.post('/refund-batch-approve', batchOrderController.batchApproveRefunds);
+router.post('/refund-batch-reject', batchOrderController.batchRejectRefunds);
 router.post('/:orderId/refund-review', batchOrderController.reviewOrderRefund);
 
 module.exports = router;

@@ -23,12 +23,30 @@ import {
   checkBackendConnectionApi,
   getBatchLinkCheckRecordsApi,
   getBatchOrderRecordsApi,
+  getBatchOrdersApi,
   getProblemLinkRecordsApi,
-  previewBatchOrderApi,
   previewBatchOrderSilentApi,
+  previewBatchOrderStreamApi,
   saveProblemLinkRecordsApi,
   submitBatchOrderApi,
 } from '#/api';
+
+const vReveal = {
+  mounted(el: HTMLElement) {
+    el.classList.add('reveal-hidden');
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting) {
+          el.classList.remove('reveal-hidden');
+          el.classList.add('reveal-visible');
+          observer.disconnect();
+        }
+      },
+      { threshold: 0.15 },
+    );
+    observer.observe(el);
+  },
+};
 
 const AlertIcon = createIconifyIcon('lucide:triangle-alert');
 const CheckIcon = createIconifyIcon('lucide:circle-check');
@@ -44,9 +62,12 @@ const connectionMessage = ref('尚未检测');
 const preview = ref<OrderApi.BatchOrderPreview>();
 const previewInputKey = ref('');
 const previewing = ref(false);
+const streamTotal = ref(0);
+const streamResolved = ref(0);
 const removedDrawerVisible = ref(false);
 const orderRecords = ref<OrderApi.BatchOrderRecord[]>([]);
 const orderRecordTotal = ref(0);
+const batchOrdersCache = ref<Map<number, OrderApi.BatchOrderRecordItem[]>>(new Map());
 const selectedDrawerBatchKey = ref('');
 const orderDrawerKeyword = ref('');
 const orderDrawerStatus = ref<'all' | 'failed' | 'success'>('all');
@@ -163,7 +184,9 @@ const selectedProblemBatch = computed(() =>
 
 const visibleOrderDrawerItems = computed(() => {
   const keyword = orderDrawerKeyword.value.trim().toLowerCase();
-  return (selectedOrderBatch.value?.orders ?? []).filter((order) => {
+  const batchId = selectedOrderBatch.value?.id;
+  const orders = (batchId ? batchOrdersCache.value.get(batchId) : undefined) ?? [];
+  return orders.filter((order) => {
     const statusMatched =
       orderDrawerStatus.value === 'all' ||
       (orderDrawerStatus.value === 'success' && order.order_status === 'completed') ||
@@ -598,6 +621,7 @@ async function loadOrderRecords(
     );
     orderRecords.value = result.items;
     orderRecordTotal.value = result.total;
+    batchOrdersCache.value.clear();
     if (preferredBatchNo) {
       const preferredRecord = orderRecords.value.find(
         (record) => record.batch_no === preferredBatchNo,
@@ -752,17 +776,36 @@ async function checkConnection(showSuccess = false) {
 async function validateContent() {
   const batchContent = getCurrentBatchContent();
   previewing.value = true;
+  streamTotal.value = 0;
+  streamResolved.value = 0;
+  preview.value = {
+    available_balance: 0,
+    can_submit: false,
+    check_batch_no: '',
+    discount_rate: 0,
+    discounted_unit_price: 0,
+    invalid_count: 0,
+    items: [],
+    target_type: targetType.value,
+    total_amount: 0,
+    total_count: 0,
+    unit_price: 0,
+    valid_count: 0,
+    warnings: [],
+  } as OrderApi.BatchOrderPreview;
   try {
-    const result = await previewBatchOrderApi({
-      content: batchContent,
-      target_type: targetType.value,
-    });
-    console.log('[Batch Preview] request', {
-      content_length: batchContent.length,
-      line_count: batchContent.split(/\r?\n/).filter((line) => line.trim()).length,
-      target_type: targetType.value,
-    });
-    console.log('[Batch Preview] response', result);
+    const result = await previewBatchOrderStreamApi(
+      { content: batchContent, target_type: targetType.value },
+      {
+        onStart: (info) => {
+          streamTotal.value = info.total_count;
+        },
+        onItem: (item) => {
+          streamResolved.value += 1;
+          preview.value!.items.push(item);
+        },
+      },
+    );
     preview.value = result;
     previewInputKey.value = currentInputKey.value;
     latestPreviewBatchNo.value = preview.value.check_batch_no;
@@ -777,6 +820,8 @@ async function validateContent() {
     throw error;
   } finally {
     previewing.value = false;
+    streamTotal.value = 0;
+    streamResolved.value = 0;
   }
 }
 
@@ -817,6 +862,16 @@ function clearContent() {
   previewInputKey.value = '';
   agreePolicy.value = false;
 }
+
+watch(selectedOrderBatch, async (batch) => {
+  if (!batch?.id || batchOrdersCache.value.has(batch.id)) return;
+  try {
+    const orders = await getBatchOrdersApi(batch.id, { silent: true });
+    batchOrdersCache.value.set(batch.id, orders);
+  } catch {
+    batchOrdersCache.value.set(batch.id, []);
+  }
+}, { immediate: true });
 
 watch(currentInputKey, (key) => {
   if (preview.value && previewInputKey.value && key !== previewInputKey.value) {
@@ -867,7 +922,7 @@ onMounted(() => {
         </div>
 
         <label class="field-label">
-          批量内容（{{ targetType === 'view' ? '阅读' : '曝光' }}）
+          批量内容（{{ { view: '阅读', like: '点赞', impression: '曝光' }[targetType] }}）
           <span>
             已输入 {{ parsedLines.length }} 行
             <span v-if="formatErrorCount > 0" style="color: var(--el-color-danger)">
@@ -882,7 +937,9 @@ onMounted(() => {
         />
 
         <div class="actions">
-          <ElButton :loading="previewing" @click="validateContent">手动预校验</ElButton>
+          <ElButton :loading="previewing" @click="validateContent">
+            {{ previewing && streamTotal > 0 ? `校验中 ${streamResolved}/${streamTotal}` : '手动预校验' }}
+          </ElButton>
           <ElButton @click="fillExample">填充示例</ElButton>
           <ElButton :disabled="!preview?.invalid_count" @click="removeProblemLinks">
             一键删除问题链接并记录
@@ -894,9 +951,10 @@ onMounted(() => {
           <ElButton
             type="primary"
             :disabled="!canSubmit || submitting"
+            :loading="submitting"
             @click="submitOrder"
           >
-            确认提交{{ targetType === 'view' ? '阅读' : '曝光' }}
+            {{ submitting ? '提交中...' : `确认提交${{ view: '阅读', like: '点赞', impression: '曝光' }[targetType]}` }}
           </ElButton>
         </div>
 
@@ -925,23 +983,10 @@ onMounted(() => {
           <span v-else>校验通过，可以提交</span>
         </div>
 
-        <div v-if="invalidItemsSummary" class="invalid-summary">
-          <div class="invalid-summary-head">
-            <component :is="AlertIcon" />
-            <strong>{{ invalidItemsSummary.count }} 条链接校验失败，无法提交</strong>
-          </div>
-          <div v-for="(group, idx) in invalidItemsSummary.groups" :key="idx" class="invalid-group">
-            <div class="invalid-group-reason">{{ group.reason }}（{{ group.count }}条）</div>
-            <ul class="invalid-group-links">
-              <li v-for="(link, li) in group.links" :key="li">{{ link }}</li>
-            </ul>
-          </div>
-          <span class="invalid-summary-tip">请修正问题链接或使用「一键删除问题链接并记录」移除后再提交</span>
-        </div>
-
         <div v-if="preview?.items.length" class="result-list">
           <div
             v-for="item in preview.items"
+            v-reveal
             :key="item.line_no"
             class="result-row"
             :class="{ invalid: !item.valid }"
@@ -972,49 +1017,45 @@ onMounted(() => {
 
       </section>
 
+      <div class="right-panels">
       <aside class="panel settlement-panel">
         <h2>结算与余额</h2>
         <div class="settlement-body">
-          <template v-if="preview">
-            <div class="amount-main">
-              <span>预计扣费</span>
-              <strong class="amount-value">
-                <span>{{ formatMoneyParts(preview.total_amount).symbol }}</span>
-                {{ formatMoneyParts(preview.total_amount).amount }}
+          <div class="amount-main">
+            <span>预计扣费</span>
+            <strong class="amount-value">
+              <span>{{ preview ? formatMoneyParts(preview.total_amount).symbol : '￥' }}</span>
+              {{ preview ? formatMoneyParts(preview.total_amount).amount : '0.00' }}
+            </strong>
+            <small>
+              {{ settlementLabels.totalQuantity }}
+              {{ preview ? previewTotalQuantity.toLocaleString('zh-CN') : '0' }}
+            </small>
+          </div>
+          <div class="settlement-grid">
+            <div>
+              <span>有效行</span>
+              <strong>{{ preview ? preview.valid_count : 0 }}</strong>
+            </div>
+            <div>
+              <span>失败行</span>
+              <strong :class="{ red: preview && preview.invalid_count > 0 }">
+                {{ preview ? preview.invalid_count : 0 }}
               </strong>
-              <small>
-                {{ settlementLabels.totalQuantity }}
-                {{ previewTotalQuantity.toLocaleString('zh-CN') }}
-              </small>
             </div>
-            <div class="settlement-grid">
-              <div>
-                <span>有效行</span>
-                <strong>{{ preview.valid_count }}</strong>
-              </div>
-              <div>
-                <span>失败行</span>
-                <strong :class="{ red: preview.invalid_count > 0 }">
-                  {{ preview.invalid_count }}
-                </strong>
-              </div>
-              <div>
-                <span>可用余额</span>
-                <strong>{{ formatMoney(preview.available_balance) }}</strong>
-              </div>
-              <div>
-                <span>单价</span>
-                <strong>{{ previewPriceText }}</strong>
-              </div>
+            <div>
+              <span>可用余额</span>
+              <strong>{{ preview ? formatMoney(preview.available_balance) : formatMoney(0) }}</strong>
             </div>
-            <div v-if="preview.warnings.length" class="warning-box">
-              <component :is="AlertIcon" />
-              <span>{{ preview.warnings.join('；') }}</span>
+            <div>
+              <span>单价</span>
+              <strong>{{ preview ? previewPriceText : '￥ 0.0000' }}</strong>
             </div>
-          </template>
-          <p v-else>
-            输入有效内容后会自动预校验，金额以服务端计算为准。
-          </p>
+          </div>
+          <div v-if="preview && preview.warnings.length" class="warning-box">
+            <component :is="AlertIcon" />
+            <span>{{ preview.warnings.join('；') }}</span>
+          </div>
         </div>
 
         <div class="connection-summary" :class="statusType">
@@ -1022,6 +1063,33 @@ onMounted(() => {
           <span>{{ connectionMessage }}</span>
         </div>
       </aside>
+
+      <div v-if="invalidItemsSummary" class="invalid-panel">
+        <div class="invalid-panel-head">
+          <component :is="AlertIcon" />
+          <strong>{{ invalidItemsSummary.count }} 条校验失败</strong>
+        </div>
+        <div v-for="(group, idx) in invalidItemsSummary.groups" :key="idx" class="invalid-group">
+          <ElTag size="small" type="danger" effect="dark">
+            {{ group.reason }}
+          </ElTag>
+          <span class="invalid-group-count">{{ group.count }} 条</span>
+          <div class="invalid-group-links">
+            <div
+              v-for="(link, li) in group.links"
+              :key="li"
+              class="invalid-link-item"
+            >
+              <span class="invalid-link-no">{{ li + 1 }}</span>
+              <span class="invalid-link-url">{{ link }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="invalid-panel-tip">
+          请修正问题链接或使用「一键删除问题链接并记录」移除后再提交
+        </div>
+      </div>
+      </div>
     </div>
 
     <ElDrawer
@@ -1215,15 +1283,32 @@ onMounted(() => {
 <style scoped>
 .batch-order-page {
   min-height: 100%;
-  padding: 16px;
-  background: var(--el-fill-color-lighter);
+  padding: 24px;
+  max-width: 1680px;
+  margin: 0 auto;
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--el-color-primary) 4%, transparent), transparent 30%),
+    radial-gradient(circle at top right, color-mix(in srgb, var(--el-color-success) 3%, transparent), transparent 28%),
+    linear-gradient(180deg, var(--el-fill-color-lighter), color-mix(in srgb, var(--el-bg-color) 92%, var(--el-fill-color-lighter)));
   color: var(--el-text-color-primary);
+  position: relative;
+}
+
+.batch-order-page::before {
+  content: '';
+  position: fixed;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: 4px;
+  background: linear-gradient(90deg, var(--el-color-primary), color-mix(in srgb, var(--el-color-primary) 20%, var(--el-color-success)));
+  opacity: 0.35;
+  pointer-events: none;
 }
 
 .connection-card,
 .panel {
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 14px;
   background: var(--el-bg-color);
 }
 
@@ -1231,9 +1316,21 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  margin-bottom: 16px;
-  padding: 14px 18px;
+  gap: 20px;
+  margin-bottom: 20px;
+  padding: 18px 22px;
+  box-shadow: 0 10px 30px rgb(15 23 42 / 4%);
+  position: relative;
+  overflow: hidden;
+}
+
+.connection-card::after {
+  content: '';
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--el-color-primary) 35%, transparent), transparent);
+  opacity: 0.8;
 }
 
 .connection-card.danger {
@@ -1256,14 +1353,17 @@ onMounted(() => {
 }
 
 .connection-main {
-  gap: 10px;
+  gap: 14px;
 }
 
 .connection-main svg,
 .connection-summary svg,
 .warning-box svg {
-  width: 20px;
-  height: 20px;
+  width: 17px;
+  height: 17px;
+  padding: 7px;
+  border-radius: 10px;
+  background: var(--el-fill-color-light);
 }
 
 .connection-card.danger .connection-main svg,
@@ -1278,8 +1378,16 @@ onMounted(() => {
   display: block;
 }
 
+.connection-main strong {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
 .connection-main span {
   color: var(--el-text-color-secondary);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .button-icon {
@@ -1290,12 +1398,30 @@ onMounted(() => {
 
 .order-layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 420px;
-  gap: 64px;
+  grid-template-columns: minmax(0, 1fr) 396px;
+  gap: 24px;
 }
 
 .panel {
-  padding: 26px 32px;
+  padding: 28px 30px;
+  box-shadow: 0 12px 34px rgb(15 23 42 / 4%);
+  position: relative;
+  overflow: hidden;
+}
+
+.input-panel {
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--el-bg-color) 96%, var(--el-color-primary)), var(--el-bg-color) 28%),
+    var(--el-bg-color);
+}
+
+.panel::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--el-color-primary) 70%, transparent), color-mix(in srgb, var(--el-color-success) 45%, transparent));
+  opacity: 0.45;
 }
 
 .panel-head {
@@ -1305,9 +1431,30 @@ onMounted(() => {
   gap: 16px;
 }
 
+.input-panel .panel-head {
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
 .panel h2 {
   margin: 0 0 10px;
-  font-size: 20px;
+  font-size: 17px;
+  line-height: 1.25;
+  letter-spacing: 0.01em;
+  position: relative;
+  padding-left: 12px;
+}
+
+.panel h2::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0.2em;
+  width: 3px;
+  height: 0.9em;
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--el-color-primary), color-mix(in srgb, var(--el-color-primary) 25%, var(--el-color-success)));
 }
 
 .panel p,
@@ -1318,10 +1465,17 @@ onMounted(() => {
   color: var(--el-text-color-secondary);
 }
 
+.panel p {
+  font-size: 12px;
+  line-height: 1.6;
+}
+
 .field-label {
   display: block;
-  margin: 28px 0 10px;
-  font-weight: 650;
+  margin: 24px 0 10px;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.01em;
 }
 
 .field-label span {
@@ -1332,101 +1486,229 @@ onMounted(() => {
 
 .batch-textarea {
   width: 100%;
-  min-height: 276px;
-  padding: 14px;
+  min-height: 300px;
+  padding: 18px 16px;
   resize: vertical;
   border: 1px solid var(--el-border-color);
-  border-radius: 8px;
+  border-radius: 12px;
   outline: none;
-  background: var(--el-bg-color);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--el-fill-color-light) 82%, white), var(--el-bg-color));
   color: var(--el-text-color-primary);
-  font: inherit;
+  font-size: 14px;
+  line-height: 1.7;
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  letter-spacing: 0.01em;
+  font-variant-ligatures: none;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 60%);
 }
 
 .batch-textarea:focus {
   border-color: var(--el-color-primary);
+  box-shadow:
+    0 0 0 4px color-mix(in srgb, var(--el-color-primary) 10%, transparent),
+    inset 0 1px 0 rgb(255 255 255 / 60%);
 }
 
 .actions {
   flex-wrap: wrap;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.input-panel .actions {
+  padding-top: 4px;
+}
+
+.actions :deep(.el-button) {
+  border-radius: 999px;
+  padding-inline: 16px;
+  box-shadow: none;
+}
+
+.actions :deep(.el-button--primary) {
+  background: linear-gradient(135deg, var(--el-color-primary), color-mix(in srgb, var(--el-color-primary) 78%, var(--el-color-success)));
+  border-color: transparent;
+}
+
+.actions :deep(.el-button--primary:hover),
+.actions :deep(.el-button--primary:focus-visible) {
+  background: linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 88%, white), color-mix(in srgb, var(--el-color-primary) 70%, var(--el-color-success)));
+  border-color: transparent;
+}
+
+.actions :deep(.el-button--default),
+.actions :deep(.el-button--info),
+.actions :deep(.el-button--success),
+.actions :deep(.el-button--warning),
+.actions :deep(.el-button--danger) {
+  min-height: 34px;
+  font-weight: 600;
 }
 
 .risk-alert {
-  margin: 14px 0 10px;
+  margin: 18px 0 12px;
 }
 
 .submit-state {
   gap: 10px;
-  margin-top: 12px;
-  padding: 10px 12px;
+  margin-top: 16px;
+  padding: 12px 14px;
   border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--el-fill-color-blank);
+  font-size: 12px;
 }
 
-.invalid-summary {
-  margin-top: 14px;
-  padding: 14px 18px;
+.submit-state :deep(.el-tag),
+.drawer-title-tags :deep(.el-tag),
+.batch-summary-tags :deep(.el-tag),
+.invalid-panel :deep(.el-tag) {
+  border-radius: 999px;
+  border-color: color-mix(in srgb, currentColor 14%, var(--el-border-color-light));
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  box-shadow: none;
+}
+
+.drawer-title-tags :deep(.el-tag),
+.batch-summary-tags :deep(.el-tag) {
+  min-height: 26px;
+  padding-inline: 10px;
+}
+
+.submit-state :deep(.el-tag) {
+  min-height: 24px;
+  padding-inline: 10px;
+}
+
+.invalid-panel {
+  padding: 18px 18px 16px;
+  border-radius: 14px;
   border: 1px solid var(--el-color-danger-light-5);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--el-color-danger) 8%, var(--el-bg-color));
+  background: var(--el-bg-color);
+  box-shadow: 0 12px 32px rgb(15 23 42 / 6%);
+  max-height: 420px;
+  overflow-y: auto;
+  position: relative;
 }
 
-.invalid-summary-head {
+.invalid-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--el-color-danger), color-mix(in srgb, var(--el-color-danger) 30%, var(--el-color-warning)));
+  opacity: 0.55;
+}
+
+.invalid-panel-head {
   display: flex;
   align-items: center;
   gap: 8px;
+  margin-bottom: 16px;
   color: var(--el-color-danger);
-  font-size: 15px;
+  font-size: 13px;
 }
 
-.invalid-summary-head strong {
+.invalid-panel-head strong {
   font-weight: 600;
 }
 
 .invalid-group {
-  margin-top: 10px;
-  padding-left: 24px;
+  margin-top: 16px;
 }
 
-.invalid-group-reason {
-  color: var(--el-color-danger);
-  font-size: 13px;
-  font-weight: 600;
+.invalid-group :deep(.el-tag) {
+  min-height: 24px;
+  padding-inline: 10px;
 }
 
-.invalid-group-links {
-  margin: 4px 0 0 16px;
-  padding: 0;
-  color: var(--el-text-color-primary);
-  font-size: 12px;
-  line-height: 1.8;
-  word-break: break-all;
-}
-
-.invalid-summary-tip {
-  display: block;
-  margin-top: 4px;
-  padding-left: 24px;
+.invalid-group-count {
+  margin-left: 8px;
   color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 
+.invalid-group-links {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.invalid-link-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.invalid-link-no {
+  flex-shrink: 0;
+  width: 20px;
+  color: var(--el-text-color-placeholder);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.invalid-link-url {
+  color: var(--el-text-color-regular);
+  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  word-break: break-all;
+}
+
+.invalid-panel-tip {
+  margin-top: 16px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--el-color-warning) 10%, transparent);
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.reveal-hidden {
+  opacity: 0;
+  transform: translateY(24px);
+}
+
+.reveal-visible {
+  animation: reveal-in 0.6s ease-out forwards;
+}
+
+@keyframes reveal-in {
+  from {
+    opacity: 0;
+    transform: translateY(24px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 .result-list {
   display: grid;
-  gap: 8px;
-  margin-top: 14px;
+  gap: 12px;
+  margin-top: 16px;
+  max-height: 520px;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .result-row {
-  grid-template-columns: 48px 42px minmax(0, 1fr) 90px 180px;
+  grid-template-columns: 50px 44px minmax(0, 1fr) 88px 176px;
   display: grid;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 12px;
+  padding: 13px 14px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--el-fill-color-light);
 }
 
@@ -1446,14 +1728,14 @@ onMounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 36px;
-  height: 36px;
+  width: 40px;
+  height: 40px;
   border-radius: 50%;
   overflow: hidden;
   background: var(--el-fill-color);
   color: var(--el-text-color-secondary);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 10px;
+  font-weight: 700;
 }
 
 .note-avatar img {
@@ -1510,8 +1792,8 @@ onMounted(() => {
 }
 
 .drawer-actions {
-  margin-bottom: 14px;
-  padding-bottom: 14px;
+  margin-bottom: 18px;
+  padding-bottom: 18px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 
@@ -1522,13 +1804,13 @@ onMounted(() => {
 
 .order-record-drawer-list {
   display: grid;
-  gap: 12px;
+  gap: 16px;
 }
 
 .order-record-drawer-row {
-  padding: 12px;
+  padding: 16px;
   border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--el-bg-color);
 }
 
@@ -1565,15 +1847,16 @@ onMounted(() => {
 
 .order-record-drawer-meta {
   flex-wrap: wrap;
-  margin-top: 8px;
+  margin-top: 12px;
   color: var(--el-text-color-secondary);
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.6;
 }
 
 .order-record-drawer-items {
   display: grid;
-  gap: 8px;
-  margin-top: 12px;
+  gap: 12px;
+  margin-top: 16px;
 }
 
 .order-record-drawer-item {
@@ -1582,9 +1865,9 @@ onMounted(() => {
   align-items: center;
   width: 100%;
   box-sizing: border-box;
-  padding: 10px;
+  padding: 12px 12px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--el-fill-color-light);
 }
 
@@ -1658,9 +1941,9 @@ onMounted(() => {
   flex-direction: column;
   align-items: stretch;
   gap: 10px;
-  margin-bottom: 12px;
-  padding: 10px 12px;
-  border-radius: 8px;
+  margin-bottom: 16px;
+  padding: 13px 14px;
+  border-radius: 12px;
   background: var(--el-fill-color-light);
 }
 
@@ -1748,7 +2031,7 @@ onMounted(() => {
 }
 
 .empty-records {
-  padding: 32px 12px;
+  padding: 40px 12px;
   color: var(--el-text-color-secondary);
   text-align: center;
 }
@@ -1757,36 +2040,75 @@ onMounted(() => {
   padding: 16px 12px;
 }
 
+.right-panels {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  align-self: start;
+  position: sticky;
+  top: 80px;
+}
+
 .settlement-panel {
   align-self: start;
+  width: 100%;
+  min-width: 0;
   padding: 0;
   overflow: hidden;
   box-shadow: 0 10px 28px rgb(15 23 42 / 6%);
+  border: 1px solid transparent;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--el-bg-color) 94%, var(--el-color-success)), var(--el-bg-color) 36%) padding-box,
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--el-color-primary) 72%, white),
+      color-mix(in srgb, var(--el-color-success) 68%, white),
+      color-mix(in srgb, var(--el-color-primary) 72%, white)
+    ) border-box;
+  background-repeat: no-repeat;
+  background-size: auto, 240% 100%;
+  background-position: 0 0, 0% 50%;
+  animation: settlement-border-flow 7s linear infinite;
 }
 
 .settlement-panel h2 {
-  padding: 22px 26px 18px;
+  padding: 22px 24px 18px;
   border-bottom: 1px solid var(--el-border-color-lighter);
 }
 
+.settlement-panel h2::before {
+  display: none;
+}
+
 .settlement-body {
-  padding: 24px 26px 26px;
+  padding: 24px 24px 26px;
 }
 
 .amount-main {
   position: relative;
-  padding: 18px 18px 16px;
-  border: 1px solid color-mix(in srgb, var(--el-color-primary) 14%, var(--el-border-color-light));
-  border-radius: 10px;
+  padding: 22px 20px 18px;
+  border: 1px solid color-mix(in srgb, var(--el-color-primary) 10%, var(--el-border-color-light));
+  border-radius: 14px;
   background:
-    linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 8%, transparent), transparent 58%),
+    linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 5%, transparent), transparent 58%),
     var(--el-fill-color-blank);
+}
+
+.amount-main::after {
+  content: '';
+  position: absolute;
+  inset: auto 20px 15px 20px;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--el-color-primary) 25%, transparent), transparent);
+  opacity: 0.6;
 }
 
 .amount-main span {
   color: var(--el-text-color-secondary);
-  font-size: 13px;
-  font-weight: 600;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .amount-main strong {
@@ -1795,43 +2117,63 @@ onMounted(() => {
   gap: 8px;
   margin-top: 10px;
   color: var(--el-text-color-primary);
-  font-size: 34px;
+  font-size: 33px;
   line-height: 1;
   letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
 }
 
 .amount-main strong span {
   color: inherit;
-  font-size: 26px;
-  font-weight: 800;
+  font-size: 25px;
+  font-weight: 900;
 }
 
 .amount-main small {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  margin-top: 12px;
+  margin-top: 14px;
   padding: 4px 9px;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--el-color-primary) 10%, var(--el-fill-color-light));
+  background: color-mix(in srgb, var(--el-color-primary) 8%, var(--el-fill-color-light));
   color: var(--el-color-primary);
-  font-size: 12px;
-  font-weight: 650;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 .settlement-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
+  gap: 12px;
   margin-top: 18px;
 }
 
 .settlement-grid > div {
   min-width: 0;
-  padding: 12px;
+  min-height: 70px;
+  padding: 13px 14px 12px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
-  background: var(--el-fill-color-lighter);
+  border-radius: 14px;
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--el-fill-color-lighter) 90%, white), var(--el-fill-color-lighter));
+}
+
+.settlement-grid > div:first-child {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-success) 6%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
+}
+
+.settlement-grid > div:nth-child(2) {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-danger) 6%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
+}
+
+.settlement-grid > div:nth-child(3) {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-primary) 5%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
+}
+
+.settlement-grid > div:nth-child(4) {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-warning) 5%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
 }
 
 .settlement-grid strong,
@@ -1841,15 +2183,19 @@ onMounted(() => {
 
 .settlement-grid span {
   color: var(--el-text-color-secondary);
-  font-size: 12px;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
 
 .settlement-grid strong {
   overflow-wrap: anywhere;
   margin-top: 5px;
   color: var(--el-text-color-primary);
-  font-size: 15px;
+  font-size: 14px;
   line-height: 1.25;
+  font-variant-numeric: tabular-nums;
 }
 
 .settlement-grid strong.red {
@@ -1857,20 +2203,35 @@ onMounted(() => {
 }
 
 .warning-box {
-  gap: 8px;
-  margin-top: 18px;
-  padding: 12px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--el-color-warning) 14%, var(--el-bg-color));
+  gap: 6px;
+  margin-top: 14px;
+  padding: 9px 11px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--el-color-warning) 7%, var(--el-bg-color));
   color: var(--el-color-warning);
+  border: 1px solid color-mix(in srgb, var(--el-color-warning) 14%, var(--el-border-color-lighter));
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .connection-summary {
-  gap: 8px;
-  margin: 0 26px 24px;
-  padding: 10px 12px;
-  border-radius: 8px;
-  background: var(--el-fill-color-light);
+  gap: 6px;
+  margin: 0 24px 24px;
+  padding: 9px 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--el-bg-color) 96%, currentColor);
+  border: 1px solid color-mix(in srgb, currentColor 12%, var(--el-border-color-lighter));
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 60%);
+}
+
+.connection-summary svg {
+  color: currentColor;
+}
+
+.connection-summary span {
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
 }
 
 .connection-summary.danger {
@@ -1881,10 +2242,28 @@ onMounted(() => {
   color: var(--el-color-success);
 }
 
+@keyframes settlement-border-flow {
+  0% {
+    background-position: 0 0, 0% 50%;
+  }
+
+  50% {
+    background-position: 0 0, 100% 50%;
+  }
+
+  100% {
+    background-position: 0 0, 0% 50%;
+  }
+}
+
 @media (max-width: 1180px) {
   .order-layout {
     grid-template-columns: 1fr;
     gap: 16px;
+  }
+
+  .right-panels {
+    position: static;
   }
 }
 
@@ -1894,7 +2273,7 @@ onMounted(() => {
   }
 
   .panel {
-    padding: 18px;
+    padding: 18px 16px;
   }
 
   .connection-card,

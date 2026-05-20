@@ -980,6 +980,9 @@ onUnmounted(() => {
               <small v-if="order.order_status === 'failed' && order.reason_message">
                 失败原因：{{ order.reason_message }}
               </small>
+              <small v-if="order.stop_response_message" class="stop-reason">
+                停止原因：{{ order.stop_response_message }}
+              </small>
             </div>
             <span>{{ refundLabel(order) }}</span>
             <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
@@ -1062,6 +1065,9 @@ onUnmounted(() => {
               </div>
               <div v-if="order.reason_message" class="expand-item expand-full">
                 <span>备注/原因</span><strong>{{ order.reason_message }}</strong>
+              </div>
+              <div v-if="order.stop_response_message" class="expand-item expand-full">
+                <span>停止原因</span><strong>{{ order.stop_response_message }}</strong>
               </div>
               <div class="expand-item">
                 <span>创建时间</span><strong>{{ formatDateTime(order.created_at) }}</strong>
@@ -1609,6 +1615,10 @@ onUnmounted(() => {
   font-size: 12px;
   line-height: 1.4;
   text-overflow: ellipsis;
+}
+
+.order-status-cell small.stop-reason {
+  color: var(--el-color-warning);
 }
 
 .quantity-cell {

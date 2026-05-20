@@ -89,6 +89,8 @@ const assertAdmin = async (db, userId) => {
   return actor;
 };
 
+const ROLE_LABELS = { super: '超级管理员', admin: '管理员', user: '普通用户' };
+
 const listRoles = async (actorUserId) => {
   const db = getPool();
   const actor = await assertAdmin(db, actorUserId);
@@ -101,7 +103,7 @@ const listRoles = async (actorUserId) => {
     `,
   );
 
-  return rows;
+  return rows.map((r) => ({ ...r, name: ROLE_LABELS[r.code] || r.name }));
 };
 
 const listUsers = async (actorUserId, query = {}) => {
@@ -199,7 +201,9 @@ const listUsers = async (actorUserId, query = {}) => {
       row.quantity_price_amount === null ? null : Number(row.quantity_price_amount),
     quantity_price_base: row.quantity_price_base === null ? null : Number(row.quantity_price_base),
     real_name: row.real_name || '',
-    role_names: row.role_names ? row.role_names.split(',') : [],
+    role_names: row.role_codes
+      ? row.role_codes.split(',').map((c) => ROLE_LABELS[c] || c)
+      : [],
     roles: row.role_codes ? row.role_codes.split(',') : [],
     status: row.status || 'active',
     user_no: row.user_no || '',

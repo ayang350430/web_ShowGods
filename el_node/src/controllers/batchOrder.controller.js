@@ -31,6 +31,32 @@ const previewBatchOrderSilent = async (req, res, next) => {
   }
 };
 
+const previewBatchOrderStream = async (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+
+  const write = (payload) => {
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  try {
+    const data = await batchOrderService.buildPreview(getCurrentUserId(req), req.body, {
+      onStart: (info) => write({ type: 'start', data: info }),
+      onItem: (item) => write({ type: 'item', data: item }),
+    });
+
+    write({ type: 'done', data });
+  } catch (error) {
+    write({ type: 'error', message: error.message || 'Preview failed' });
+  }
+
+  res.end();
+};
+
 const getBatchOrders = async (req, res, next) => {
   try {
     const data = await batchOrderService.getBatchOrders(getCurrentUserId(req), req.params.batchId);
@@ -311,8 +337,26 @@ const batchApproveRefunds = async (req, res, next) => {
   }
 };
 
+const batchRejectRefunds = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.batchRejectRefunds(
+      getCurrentUserId(req),
+      req.body,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   batchApproveRefunds,
+  batchRejectRefunds,
   getBatchOrders,
   listBatchOrderRecords,
   listCheckRecords,
@@ -323,6 +367,7 @@ module.exports = {
   approveReplenishmentRequest,
   previewBatchOrder,
   previewBatchOrderSilent,
+  previewBatchOrderStream,
   replenishBatchOrder,
   requestBatchRefund,
   requestReplenishBatchOrder,

@@ -21,6 +21,7 @@ import {
 
 import {
   batchApproveRefundsApi,
+  batchRejectRefundsApi,
   getRefundRecordsApi,
   reviewOrderRefundApi,
 } from '#/api';
@@ -29,6 +30,7 @@ const loading = ref(false);
 const records = ref<OrderApi.RefundRecord[]>([]);
 const reviewingOrderId = ref<number>();
 const batchApprovingNo = ref<string>();
+const batchRejectingNo = ref<string>();
 const userStore = useUserStore();
 
 const filters = reactive({
@@ -184,6 +186,21 @@ async function batchApproveByBatchNo(batchNo: string) {
   }
 }
 
+async function batchRejectByBatchNo(batchNo: string) {
+  batchRejectingNo.value = batchNo;
+  try {
+    const result = await batchRejectRefundsApi({ batch_no: batchNo });
+    ElMessage.success(
+      `批量拒绝完成：共 ${result.total} 条，成功 ${result.succeeded} 条${result.failed > 0 ? `，失败 ${result.failed} 条` : ''}`,
+    );
+    await loadRecords();
+  } catch {
+    ElMessage.error('批量拒绝失败');
+  } finally {
+    batchRejectingNo.value = undefined;
+  }
+}
+
 async function reviewRefund(record: OrderApi.RefundRecord, approved: boolean) {
   reviewingOrderId.value = record.order_id;
   try {
@@ -326,23 +343,42 @@ onMounted(loadRecords);
             <span class="batch-no batch-no-link" @click="viewBatchDetail(batch.batch_no)">{{ batch.batch_no }}</span>
             <span class="batch-meta">{{ batch.user }} / {{ batch.count }} 条待审核</span>
           </div>
-          <ElPopconfirm
-            :title="`确认通过批次 ${batch.batch_no} 的全部 ${batch.count} 条退款申请？`"
-            confirm-button-text="全部通过"
-            cancel-button-text="取消"
-            width="360"
-            @confirm="batchApproveByBatchNo(batch.batch_no)"
-          >
-            <template #reference>
-              <ElButton
-                :loading="batchApprovingNo === batch.batch_no"
-                size="small"
-                type="primary"
-              >
-                一键通过 ({{ batch.count }})
-              </ElButton>
-            </template>
-          </ElPopconfirm>
+          <div class="batch-approve-actions">
+            <ElPopconfirm
+              :title="`确认通过批次 ${batch.batch_no} 的全部 ${batch.count} 条退款申请？`"
+              confirm-button-text="全部通过"
+              cancel-button-text="取消"
+              width="360"
+              @confirm="batchApproveByBatchNo(batch.batch_no)"
+            >
+              <template #reference>
+                <ElButton
+                  :loading="batchApprovingNo === batch.batch_no"
+                  size="small"
+                  type="primary"
+                >
+                  一键通过 ({{ batch.count }})
+                </ElButton>
+              </template>
+            </ElPopconfirm>
+            <ElPopconfirm
+              :title="`确认拒绝批次 ${batch.batch_no} 的全部 ${batch.count} 条退款申请？`"
+              confirm-button-text="全部拒绝"
+              cancel-button-text="取消"
+              width="360"
+              @confirm="batchRejectByBatchNo(batch.batch_no)"
+            >
+              <template #reference>
+                <ElButton
+                  :loading="batchRejectingNo === batch.batch_no"
+                  size="small"
+                  type="danger"
+                >
+                  一键拒绝 ({{ batch.count }})
+                </ElButton>
+              </template>
+            </ElPopconfirm>
+          </div>
         </div>
       </div>
     </section>
@@ -659,6 +695,11 @@ onMounted(loadRecords);
   border: 1px solid hsl(var(--border));
   border-radius: 6px;
   background: hsl(var(--accent) / 0.35);
+}
+
+.batch-approve-actions {
+  display: flex;
+  gap: 8px;
 }
 
 .batch-approve-info {

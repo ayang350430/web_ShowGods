@@ -12,7 +12,6 @@ const ACTIVE_NOTE_ORDER_STATUSES = [
   'refund_requested',
   'refund_calculating',
   'stopping',
-  'refund_rejected',
 ];
 const TARGET_TYPE_LABELS = {
   impression: '曝光',
@@ -1128,6 +1127,7 @@ const serializeBatchOrderItem = (row) => ({
   repair_count: Number(row.repair_count) || 0,
   record_status: row.record_status || '',
   source_note_url: row.source_note_url || row.note_url || '',
+  stop_response_message: row.stop_response_message || '',
   snapshot_current_read_count:
     row.snapshot_current_read_count === null || row.snapshot_current_read_count === undefined
       ? null
@@ -2880,6 +2880,111 @@ const batchApproveRefunds = async (actorUserId, { batch_no, order_ids } = {}) =>
   }
 };
 
+const batchRejectRefunds = async (actorUserId, { batch_no, order_ids, reason = '' } = {}) => {
+  const db = getPool();
+  const isAdmin = await canViewAllAccountRecords(db, actorUserId);
+  if (!isAdmin) {
+    const error = new Error('无权操作');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const conditions = [
+    "o.order_status IN ('refund_requested', 'refund_calculating', 'stopping')",
+  ];
+  const params = [];
+  let needJoin = false;
+
+  if (batch_no) {
+    needJoin = true;
+    conditions.push('ob.batch_no = ?');
+    params.push(batch_no);
+  } else if (Array.isArray(order_ids) && order_ids.length > 0) {
+    const ids = order_ids.map(Number).filter(Boolean);
+    if (ids.length === 0) {
+      const error = new Error('无有效的订单ID');
+      error.statusCode = 400;
+      throw error;
+    }
+    conditions.push(`o.id IN (${ids.map(() => '?').join(',')})`);
+    params.push(...ids);
+  } else {
+    const error = new Error('请提供 batch_no 或 order_ids');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const joinSql = needJoin ? 'INNER JOIN order_batches ob ON ob.id = o.batch_id' : '';
+  const connection = await db.getConnection();
+  const now = new Date();
+  const rejectReason = reason || '批量退款拒绝';
+
+  try {
+    await connection.beginTransaction();
+
+    const [orders] = await connection.execute(
+      `SELECT o.id, o.order_no, o.external_task_id, o.target_type, o.user_id
+       FROM orders o ${joinSql} WHERE ${conditions.join(' AND ')} ORDER BY o.id ASC FOR UPDATE`,
+      params,
+    );
+
+    if (orders.length === 0) {
+      await connection.commit();
+      return { total: 0, succeeded: 0, failed: 0, results: [] };
+    }
+
+    for (const order of orders) {
+      await connection.execute(
+        `UPDATE orders SET order_status = 'refund_rejected', reason_message = ?, updated_at = ? WHERE id = ?`,
+        [rejectReason, now, order.id],
+      );
+    }
+
+    await connection.commit();
+
+    const ordersToStop = orders.filter((o) => normalizeXhsTaskId(o.external_task_id));
+    if (ordersToStop.length > 0) {
+      const firstResults = await Promise.allSettled(
+        ordersToStop.map((o) =>
+          stopXhsTask({
+            reason: '批量退款拒绝',
+            taskId: o.external_task_id,
+            targetType: o.target_type,
+            userId: o.user_id,
+          }),
+        ),
+      );
+      const retryOrders = ordersToStop.filter((_, i) => firstResults[i].status === 'rejected');
+      if (retryOrders.length > 0) {
+        await Promise.allSettled(
+          retryOrders.map((o) =>
+            stopXhsTask({
+              reason: '批量退款拒绝(重试)',
+              taskId: o.external_task_id,
+              targetType: o.target_type,
+              userId: o.user_id,
+            }),
+          ),
+        );
+      }
+    }
+
+    const results = orders.map((o) => ({
+      order_id: o.id,
+      order_no: o.order_no,
+      success: true,
+      order_status: 'refund_rejected',
+    }));
+
+    return { total: orders.length, succeeded: orders.length, failed: 0, results };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
 // 序列化退款记录
 const serializeRefundRecord = (row) => ({
   actual_paid_amount: round4(row.actual_paid_amount),
@@ -4193,15 +4298,38 @@ const findActiveNoteOrderConflicts = async (db, targetType, noteIds) => {
 const buildPreview = async (
   userId,
   { content, target_type: targetTypeValue },
-  { persistCheckRecords = true } = {},
+  { onItem, onStart, persistCheckRecords = true } = {},
 ) => {
   const db = getPool();
   const targetType = normalizeTargetType(targetTypeValue);
   const context = await getUserOrderContext(db, userId, targetType);
   const minOrderQuantity = await getNumericConfig(db, 'order', 'min_order_quantity', 10);
   const previewItems = await resolvePreviewLocally(content);
+  if (onStart) onStart({ total_count: previewItems.length });
   const seenResolvedNoteIds = new Set();
   const runExternalCheck = createAsyncLimiter(getBatchCheckConcurrency());
+
+  // 批量预取：一次性调用 Tinydata 解析所有链接，避免逐条调用
+  const batchPrefetchMap = new Map();
+  {
+    const validUrls = previewItems.filter((i) => i.valid && i.note_url).map((i) => i.note_url);
+    if (validUrls.length > 0) {
+      try {
+        const batchContent = validUrls.map((url) => `${url} 1`).join('\n');
+        const batchPayload = await requestTinydataPreview({ content: batchContent, targetType });
+        const batchItems = normalizeTinydataPreviewItems(batchPayload);
+        for (const bi of batchItems) {
+          const rawUrl = bi.raw ? String(bi.raw).split(/\s+/)[0] : '';
+          if (rawUrl && bi.note_id) {
+            batchPrefetchMap.set(rawUrl, bi);
+          }
+        }
+      } catch {
+        // 批量预取失败，回退到逐条解析
+      }
+    }
+  }
+
   const items = await Promise.all(previewItems.map(async (item) => {
     const errors = [...item.errors];
     let noteId = item.note_id;
@@ -4213,7 +4341,16 @@ const buildPreview = async (
     }
 
     if (item.valid) {
-      if (isShortNoteLink(item.note_url)) {
+      // 优先使用批量预取结果
+      const prefetched = batchPrefetchMap.get(item.note_url);
+      if (prefetched?.note_id) {
+        noteId = prefetched.note_id;
+        resolvedNoteUrl = prefetched.note_url || item.note_url;
+        noteBasic = createPreviewNoteBasic(prefetched, item.note_url);
+        if (noteBasic) {
+          await saveCachedNoteBasic(db, item.note_url, noteBasic, null).catch(() => {});
+        }
+      } else if (isShortNoteLink(item.note_url)) {
         noteBasic = await getCachedNoteBasic(db, item.note_url);
         if (noteBasic) {
           noteId = noteBasic.note_id;
@@ -4223,7 +4360,6 @@ const buildPreview = async (
           noteId = resolved?.note_id || '';
           resolvedNoteUrl = resolved?.note_url || item.note_url;
         }
-        // Tinydata 无法解析时，本地通过 HTTP 重定向解析短链接
         if (!noteId) {
           const localResolved = await runExternalCheck(() => resolveShortLinkLocally(item.note_url));
           if (localResolved?.note_id) {
@@ -4257,7 +4393,6 @@ const buildPreview = async (
       }
     }
 
-    // Tinydata 未解析出笔记ID时，本地尝试解析（普通链接 + 短链接）
     if (!noteId) {
       const extracted = isShortNoteLink(item.note_url) ? '' : extractNoteId(item.note_url);
       if (extracted) {
@@ -4309,7 +4444,7 @@ const buildPreview = async (
       likeCount = likeCountResult.like_count;
     }
 
-    return {
+    const resolved = {
       ...item,
       author_id: noteBasic?.author_id || item.author_id || '',
       author_name: noteBasic?.author_name || item.author_name || '',
@@ -4326,6 +4461,8 @@ const buildPreview = async (
       original_amount: valid ? round4(originalAmount) : 0,
       payable_amount: valid ? round4(payableAmount) : 0,
     };
+    if (onItem) onItem(resolved);
+    return resolved;
   }));
 
   const activeConflicts = await findActiveNoteOrderConflicts(
@@ -4636,21 +4773,27 @@ const collectSubmitSnapshots = async (targetType, items) => {
     return new Map();
   }
 
-  const snapshotEntries = await Promise.all(
-    items.map(async (item) => {
-      const result = targetType === 'like'
-        ? await requestNoteLikeCount({ note_id: item.note_id })
-        : await requestNoteRealtimeViewCount({ note_id: item.note_id });
-      return [
-        item.line_no,
-        {
-          payload: result.payload ? JSON.stringify(result.payload).slice(0, 8000) : null,
-          like_count: result.like_count,
-          view_count: result.view_count,
-        },
-      ];
-    }),
-  );
+  const CONCURRENCY = 100;
+  const snapshotEntries = [];
+  for (let i = 0; i < items.length; i += CONCURRENCY) {
+    const batch = items.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(
+      batch.map(async (item) => {
+        const result = targetType === 'like'
+          ? await requestNoteLikeCount({ note_id: item.note_id })
+          : await requestNoteRealtimeViewCount({ note_id: item.note_id });
+        return [
+          item.line_no,
+          {
+            payload: result.payload ? JSON.stringify(result.payload).slice(0, 8000) : null,
+            like_count: result.like_count,
+            view_count: result.view_count,
+          },
+        ];
+      }),
+    );
+    snapshotEntries.push(...batchResults);
+  }
   return new Map(snapshotEntries);
 };
 
@@ -6056,6 +6199,7 @@ module.exports = {
   approveReplenishmentBatch,
   approveReplenishmentRequest,
   batchApproveRefunds,
+  batchRejectRefunds,
   buildPreview,
   getBatchOrders,
   listBatchOrderRecords,
