@@ -17,14 +17,17 @@ import {
 } from 'element-plus';
 
 import {
+  getAdminOrderSwitchesApi,
   getAdminPermissionRolesApi,
   getAdminPermissionUsersApi,
+  updateAdminOrderSwitchesApi,
   updateAdminUserBalanceApi,
   updateAdminUserDiscountsApi,
   updateAdminUserOrderTypesApi,
   updateAdminUserRolesApi,
   updateAdminUserStatusApi,
 } from '#/api';
+import type { OrderSwitches } from '#/api/core/user';
 
 interface EditableDiscounts {
   discount_rate: number;
@@ -88,6 +91,42 @@ const batchDiscounts = reactive<EditableDiscounts>({
   quantity_price_amount: 30,
   quantity_price_base: 1000,
 });
+
+// ─── 全局下单开关 ───
+const orderSwitches = reactive<OrderSwitches>({
+  impression_submit_enabled: true,
+  like_submit_enabled: true,
+  view_submit_enabled: true,
+});
+const switchLoading = reactive<Record<string, boolean>>({});
+
+async function loadOrderSwitches() {
+  try {
+    const data = await getAdminOrderSwitchesApi();
+    orderSwitches.view_submit_enabled = data.view_submit_enabled;
+    orderSwitches.like_submit_enabled = data.like_submit_enabled;
+    orderSwitches.impression_submit_enabled = data.impression_submit_enabled;
+  } catch {
+    // ignore
+  }
+}
+
+async function toggleGlobalSwitch(key: keyof OrderSwitches) {
+  const next = !orderSwitches[key];
+  const label = key === 'view_submit_enabled' ? '阅读' : key === 'like_submit_enabled' ? '点赞' : '曝光';
+  switchLoading[key] = true;
+  try {
+    const data = await updateAdminOrderSwitchesApi({ [key]: next });
+    orderSwitches.view_submit_enabled = data.view_submit_enabled;
+    orderSwitches.like_submit_enabled = data.like_submit_enabled;
+    orderSwitches.impression_submit_enabled = data.impression_submit_enabled;
+    ElMessage.success(`已${next ? '开启' : '关闭'}全局${label}下单`);
+  } catch {
+    ElMessage.error('更新失败');
+  } finally {
+    switchLoading[key] = false;
+  }
+}
 
 const filteredUsers = users;
 
@@ -442,13 +481,17 @@ async function toggleUserStatus(user: UserApi.AdminUserPermission) {
   }
 }
 
-onMounted(loadData);
+onMounted(() => {
+  loadData();
+  loadOrderSwitches();
+});
 </script>
 
 <template>
   <div class="permission-page">
     <section class="permission-head">
-      <div>
+      <div class="head-text">
+        <span class="eyebrow">Permission</span>
         <h1>权限管理</h1>
         <p>管理员可调整用户角色、账号状态，以及阅读和曝光业务折扣。</p>
       </div>
@@ -459,20 +502,78 @@ onMounted(loadData);
           placeholder="搜索用户名、昵称、编号"
           @keyup.enter="searchUsers"
         />
-        <ElButton :loading="loading" type="primary" @click="searchUsers">
-          搜索
-        </ElButton>
+        <button class="head-btn" :disabled="loading" @click="searchUsers">
+          {{ loading ? '搜索中…' : '搜索' }}
+        </button>
+      </div>
+    </section>
+
+    <section class="global-switch-panel">
+      <div class="gs-head">
+        <div class="gs-desc">
+          <strong>全局下单开关</strong>
+          <span>关闭后，所有用户将无法提交对应类型的订单。</span>
+        </div>
+      </div>
+      <div class="gs-switches">
+        <div class="gs-item">
+          <div class="gs-label">
+            <span class="gs-tag gs-tag--view">阅读</span>
+            <span class="gs-status" :class="{ 'gs-status--off': !orderSwitches.view_submit_enabled }">
+              {{ orderSwitches.view_submit_enabled ? '已开启' : '已关闭' }}
+            </span>
+          </div>
+          <ElSwitch
+            :model-value="orderSwitches.view_submit_enabled"
+            :loading="!!switchLoading['view_submit_enabled']"
+            @change="toggleGlobalSwitch('view_submit_enabled')"
+          />
+        </div>
+        <div class="gs-item">
+          <div class="gs-label">
+            <span class="gs-tag gs-tag--like">点赞</span>
+            <span class="gs-status" :class="{ 'gs-status--off': !orderSwitches.like_submit_enabled }">
+              {{ orderSwitches.like_submit_enabled ? '已开启' : '已关闭' }}
+            </span>
+          </div>
+          <ElSwitch
+            :model-value="orderSwitches.like_submit_enabled"
+            :loading="!!switchLoading['like_submit_enabled']"
+            @change="toggleGlobalSwitch('like_submit_enabled')"
+          />
+        </div>
+        <div class="gs-item">
+          <div class="gs-label">
+            <span class="gs-tag gs-tag--impression">曝光</span>
+            <span class="gs-status" :class="{ 'gs-status--off': !orderSwitches.impression_submit_enabled }">
+              {{ orderSwitches.impression_submit_enabled ? '已开启' : '已关闭' }}
+            </span>
+          </div>
+          <ElSwitch
+            :model-value="orderSwitches.impression_submit_enabled"
+            :loading="!!switchLoading['impression_submit_enabled']"
+            @change="toggleGlobalSwitch('impression_submit_enabled')"
+          />
+        </div>
       </div>
     </section>
 
     <section class="batch-discount-panel">
-      <div>
-        <strong>批量填入折扣设置</strong>
-        <span>选择模式和数值后，一键填入当前列表所有用户。</span>
+      <div class="batch-top">
+        <div class="batch-desc">
+          <strong>批量填入折扣设置</strong>
+          <span>选择模式和数值后，一键填入当前列表所有用户。</span>
+        </div>
+        <div class="batch-btns">
+          <button class="bd-btn bd-btn--primary" @click="applyBatchDiscounts">一键填入</button>
+          <button class="bd-btn bd-btn--warning" :disabled="batchDiscountSaving" @click="saveAllDiscounts">
+            {{ batchDiscountSaving ? '保存中…' : '一键保存' }}
+          </button>
+        </div>
       </div>
-      <div class="discount-editor batch-discount-editor">
-        <label>
-          <span>阅读</span>
+      <div class="batch-cards">
+        <div class="batch-card">
+          <div class="bc-head"><span class="bc-tag">阅读</span><em>{{ viewPriceLabel(batchDiscounts) }}</em></div>
           <ElSelect v-model="batchDiscounts.price_mode" class="price-mode-select">
             <ElOption label="默认价格" value="default" />
             <ElOption label="折扣价格" value="discount" />
@@ -482,48 +583,25 @@ onMounted(loadData);
           <ElInputNumber
             v-if="batchDiscounts.price_mode === 'default'"
             v-model="batchDiscounts.fixed_unit_price"
-            :min="0.0001"
-            :precision="4"
-            :step="0.01"
-            controls-position="right"
+            :min="0.0001" :precision="4" :step="0.01" controls-position="right"
           />
           <ElInputNumber
             v-else-if="batchDiscounts.price_mode === 'discount'"
             v-model="batchDiscounts.discount_rate"
-            :max="1"
-            :min="0.0001"
-            :precision="4"
-            :step="0.1"
-            controls-position="right"
+            :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
           />
           <ElInputNumber
             v-else-if="batchDiscounts.price_mode === 'fixed'"
             v-model="batchDiscounts.fixed_unit_price"
-            :min="0.0001"
-            :precision="4"
-            :step="0.001"
-            controls-position="right"
+            :min="0.0001" :precision="4" :step="0.001" controls-position="right"
           />
           <div v-else-if="batchDiscounts.price_mode === 'quantity'" class="quantity-mini-inputs">
-            <ElInputNumber
-              v-model="batchDiscounts.quantity_price_base"
-              :min="1"
-              :precision="0"
-              :step="100"
-              controls-position="right"
-            />
-            <ElInputNumber
-              v-model="batchDiscounts.quantity_price_amount"
-              :min="0.0001"
-              :precision="4"
-              :step="1"
-              controls-position="right"
-            />
+            <ElInputNumber v-model="batchDiscounts.quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
+            <ElInputNumber v-model="batchDiscounts.quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
           </div>
-          <em>{{ viewPriceLabel(batchDiscounts) }}</em>
-        </label>
-        <label>
-          <span>点赞</span>
+        </div>
+        <div class="batch-card">
+          <div class="bc-head"><span class="bc-tag">点赞</span><em>{{ likePriceLabel(batchDiscounts) }}</em></div>
           <ElSelect v-model="batchDiscounts.like_price_mode" class="price-mode-select">
             <ElOption label="默认价格" value="default" />
             <ElOption label="折扣价格" value="discount" />
@@ -533,52 +611,26 @@ onMounted(loadData);
           <ElInputNumber
             v-if="batchDiscounts.like_price_mode === 'default'"
             v-model="batchDiscounts.like_fixed_unit_price"
-            :min="0.0001"
-            :precision="4"
-            :step="0.01"
-            controls-position="right"
+            :min="0.0001" :precision="4" :step="0.01" controls-position="right"
           />
           <ElInputNumber
             v-else-if="batchDiscounts.like_price_mode === 'discount'"
             v-model="batchDiscounts.like_discount_rate"
-            :max="1"
-            :min="0.0001"
-            :precision="4"
-            :step="0.1"
-            controls-position="right"
+            :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
           />
           <ElInputNumber
             v-else-if="batchDiscounts.like_price_mode === 'fixed'"
             v-model="batchDiscounts.like_fixed_unit_price"
-            :min="0.0001"
-            :precision="4"
-            :step="0.001"
-            controls-position="right"
+            :min="0.0001" :precision="4" :step="0.001" controls-position="right"
           />
           <div v-else-if="batchDiscounts.like_price_mode === 'quantity'" class="quantity-mini-inputs">
-            <ElInputNumber
-              v-model="batchDiscounts.like_quantity_price_base"
-              :min="1"
-              :precision="0"
-              :step="100"
-              controls-position="right"
-            />
-            <ElInputNumber
-              v-model="batchDiscounts.like_quantity_price_amount"
-              :min="0.0001"
-              :precision="4"
-              :step="1"
-              controls-position="right"
-            />
+            <ElInputNumber v-model="batchDiscounts.like_quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
+            <ElInputNumber v-model="batchDiscounts.like_quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
           </div>
-          <em>{{ likePriceLabel(batchDiscounts) }}</em>
-        </label>
-        <label>
-          <span>曝光</span>
-          <ElSelect
-            v-model="batchDiscounts.impression_price_mode"
-            class="price-mode-select"
-          >
+        </div>
+        <div class="batch-card">
+          <div class="bc-head"><span class="bc-tag">曝光</span><em>{{ impressionPriceLabel(batchDiscounts) }}</em></div>
+          <ElSelect v-model="batchDiscounts.impression_price_mode" class="price-mode-select">
             <ElOption label="默认价格" value="default" />
             <ElOption label="折扣价格" value="discount" />
             <ElOption label="固定金额" value="fixed" />
@@ -587,60 +639,24 @@ onMounted(loadData);
           <ElInputNumber
             v-if="batchDiscounts.impression_price_mode === 'default'"
             v-model="batchDiscounts.impression_fixed_unit_price"
-            :min="0.0001"
-            :precision="4"
-            :step="0.01"
-            controls-position="right"
+            :min="0.0001" :precision="4" :step="0.01" controls-position="right"
           />
           <ElInputNumber
             v-else-if="batchDiscounts.impression_price_mode === 'discount'"
             v-model="batchDiscounts.impression_discount_rate"
-            :max="1"
-            :min="0.0001"
-            :precision="4"
-            :step="0.1"
-            controls-position="right"
+            :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
           />
           <ElInputNumber
             v-else-if="batchDiscounts.impression_price_mode === 'fixed'"
             v-model="batchDiscounts.impression_fixed_unit_price"
-            :min="0.0001"
-            :precision="4"
-            :step="0.001"
-            controls-position="right"
+            :min="0.0001" :precision="4" :step="0.001" controls-position="right"
           />
-          <div
-            v-else-if="batchDiscounts.impression_price_mode === 'quantity'"
-            class="quantity-mini-inputs"
-          >
-            <ElInputNumber
-              v-model="batchDiscounts.impression_quantity_price_base"
-              :min="1"
-              :precision="0"
-              :step="100"
-              controls-position="right"
-            />
-            <ElInputNumber
-              v-model="batchDiscounts.impression_quantity_price_amount"
-              :min="0.0001"
-              :precision="4"
-              :step="1"
-              controls-position="right"
-            />
+          <div v-else-if="batchDiscounts.impression_price_mode === 'quantity'" class="quantity-mini-inputs">
+            <ElInputNumber v-model="batchDiscounts.impression_quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
+            <ElInputNumber v-model="batchDiscounts.impression_quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
           </div>
-          <em>{{ impressionPriceLabel(batchDiscounts) }}</em>
-        </label>
+        </div>
       </div>
-      <ElButton type="primary" @click="applyBatchDiscounts">
-        一键填入
-      </ElButton>
-      <ElButton
-        :loading="batchDiscountSaving"
-        type="warning"
-        @click="saveAllDiscounts"
-      >
-        一键保存
-      </ElButton>
     </section>
 
     <section class="permission-table" v-loading="loading">
@@ -1040,80 +1056,306 @@ onMounted(loadData);
 
 <style scoped>
 .permission-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
   min-height: 100%;
-  padding: 16px;
-  background: var(--el-fill-color-lighter);
+  padding: 20px;
   color: var(--el-text-color-primary);
 }
 
-.permission-head,
-.batch-discount-panel,
-.permission-table {
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
-  background: var(--el-bg-color);
-}
-
+/* ---- header ---- */
 .permission-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 16px;
-  padding: 18px 20px;
+  padding: 20px 24px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+}
+
+.eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--el-color-primary);
 }
 
 .permission-head h1 {
-  margin: 0 0 6px;
+  margin: 2px 0 0;
   font-size: 22px;
+  font-weight: 700;
 }
 
 .permission-head p {
-  margin: 0;
+  margin: 4px 0 0;
+  font-size: 13px;
   color: var(--el-text-color-secondary);
 }
 
 .head-actions {
-  display: grid;
-  grid-template-columns: minmax(220px, 320px) auto;
+  display: flex;
   gap: 10px;
+  flex-shrink: 0;
 }
 
-.batch-discount-panel {
-  display: grid;
-  grid-template-columns: minmax(180px, 0.8fr) minmax(360px, 1.5fr) auto auto;
-  gap: 12px;
+.head-actions :deep(.el-input) {
+  width: 260px;
+}
+
+.head-btn {
+  padding: 8px 20px;
+  border: 1px solid var(--el-color-primary-light-5);
+  border-radius: 8px;
+  background: var(--el-color-primary);
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.head-btn:hover:not(:disabled) {
+  background: var(--el-color-primary-light-3);
+  box-shadow: 0 4px 12px rgba(64, 158, 255, 0.35);
+}
+
+.head-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ---- global switch ---- */
+.global-switch-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+}
+
+.gs-head {
+  display: flex;
   align-items: center;
-  margin-bottom: 16px;
-  padding: 14px 16px;
+  justify-content: space-between;
+  gap: 16px;
 }
 
-.batch-discount-panel strong,
-.batch-discount-panel span {
+.gs-desc strong {
+  font-size: 15px;
+}
+
+.gs-desc span {
   display: block;
-}
-
-.batch-discount-panel span {
-  margin-top: 4px;
+  margin-top: 3px;
   color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 
-.batch-discount-editor {
+.gs-switches {
+  display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
+.gs-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+  transition: border-color 0.2s;
+}
+
+.gs-item:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+
+.gs-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.gs-tag {
+  padding: 3px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.gs-tag--view {
+  background: var(--el-color-primary-light-8);
+  color: var(--el-color-primary);
+}
+
+.gs-tag--like {
+  background: var(--el-color-danger-light-8);
+  color: var(--el-color-danger);
+}
+
+.gs-tag--impression {
+  background: var(--el-color-warning-light-8);
+  color: var(--el-color-warning);
+}
+
+.gs-status {
+  font-size: 12px;
+  color: var(--el-color-success);
+  font-weight: 500;
+}
+
+.gs-status--off {
+  color: var(--el-color-danger);
+}
+
+/* ---- batch discount ---- */
+.batch-discount-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+}
+
+.batch-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.batch-desc strong {
+  font-size: 15px;
+}
+
+.batch-desc span {
+  display: block;
+  margin-top: 3px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.batch-btns {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.bd-btn {
+  padding: 8px 20px;
+  border: none;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+
+.bd-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.bd-btn--primary {
+  background: var(--el-color-primary);
+  color: #fff;
+}
+
+.bd-btn--primary:hover:not(:disabled) {
+  background: var(--el-color-primary-light-3);
+  box-shadow: 0 3px 10px rgba(64, 158, 255, 0.35);
+}
+
+.bd-btn--warning {
+  background: var(--el-color-warning);
+  color: #fff;
+}
+
+.bd-btn--warning:hover:not(:disabled) {
+  background: var(--el-color-warning-light-3);
+  box-shadow: 0 3px 10px rgba(230, 162, 60, 0.35);
+}
+
+.batch-cards {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.batch-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-fill-color-lighter);
+}
+
+.bc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.bc-tag {
+  padding: 2px 10px;
+  border-radius: 6px;
+  background: var(--el-color-primary-light-8);
+  color: var(--el-color-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.bc-head em {
+  font-style: normal;
+  font-size: 12px;
+  font-family: Consolas, monospace;
+  color: var(--el-color-primary);
+}
+
+.batch-card :deep(.el-select),
+.batch-card :deep(.el-input-number) {
+  width: 100%;
+}
+
+.batch-card :deep(.el-input-number .el-input__inner) {
+  text-align: center;
+}
+
+/* ---- user table ---- */
 .permission-table {
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
   overflow: hidden;
 }
 
 .table-row {
   display: grid;
-  grid-template-columns: minmax(104px, 0.7fr) 96px 72px 100px minmax(220px, 1.05fr) minmax(180px, 0.8fr) 160px 184px;
+  grid-template-columns: minmax(110px, 0.7fr) 96px 72px 100px minmax(220px, 1.05fr) minmax(180px, 0.8fr) 160px 184px;
   gap: 10px;
   align-items: center;
-  padding: 12px 16px;
+  padding: 14px 18px;
   border-bottom: 1px solid var(--el-border-color-lighter);
+  transition: background 0.15s;
+}
+
+.table-row:not(.table-header):hover {
+  background: var(--el-fill-color-lighter);
 }
 
 .table-row > * {
@@ -1123,51 +1365,59 @@ onMounted(loadData);
 .table-header {
   background: var(--el-fill-color-light);
   color: var(--el-text-color-secondary);
-  font-size: 13px;
-  font-weight: 650;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
 
-.user-cell strong,
-.user-cell span {
-  display: block;
+.user-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.user-cell strong {
+  font-size: 14px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .user-cell span {
-  margin-top: 2px;
   color: var(--el-text-color-secondary);
   font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .balance-text {
+  font-family: Consolas, monospace;
+  font-size: 14px;
   color: var(--el-color-primary);
   white-space: nowrap;
 }
 
-.row-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
+/* ---- row actions ---- */
 .row-actions {
   display: grid;
-  grid-template-columns: repeat(2, 54px);
-  gap: 8px;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
   justify-content: start;
 }
 
 .row-actions :deep(.el-button) {
   margin-left: 0;
-  width: 54px;
+  width: 100%;
   padding-inline: 0;
+  font-size: 12px;
 }
 
+/* ---- switches ---- */
 .order-type-switches {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .order-type-switches label {
@@ -1175,38 +1425,40 @@ onMounted(loadData);
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 4px 8px;
+  padding: 3px 8px;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 6px;
-  background: var(--el-fill-color-blank);
   font-size: 12px;
   color: var(--el-text-color-secondary);
 }
 
+/* ---- discount summary ---- */
 .discount-summary {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .discount-summary span {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  padding: 6px 8px;
-  border: 1px solid var(--el-border-color-lighter);
+  padding: 4px 8px;
   border-radius: 6px;
-  background: var(--el-fill-color-blank);
+  background: var(--el-fill-color-light);
   color: var(--el-color-primary);
   font-size: 12px;
+  font-family: Consolas, monospace;
 }
 
 .discount-summary b {
   color: var(--el-text-color-secondary);
   font-weight: 500;
+  font-family: inherit;
 }
 
+/* ---- batch discount editor ---- */
 .discount-editor {
   display: grid;
   grid-template-columns: 1fr;
@@ -1223,7 +1475,6 @@ onMounted(loadData);
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
   padding: 7px 8px;
-  background: var(--el-fill-color-blank);
 }
 
 .discount-editor span {
@@ -1258,18 +1509,7 @@ onMounted(loadData);
   min-width: 0;
 }
 
-.labeled-input {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-
-  small {
-    font-size: 11px;
-    color: #909399;
-    line-height: 1;
-  }
-}
-
+/* ---- dialogs ---- */
 .discount-dialog-body {
   display: grid;
   gap: 14px;
@@ -1282,8 +1522,8 @@ onMounted(loadData);
 }
 
 .discount-user {
-  padding: 10px 12px;
-  border-radius: 8px;
+  padding: 12px 14px;
+  border-radius: 10px;
   background: var(--el-fill-color-light);
 }
 
@@ -1293,9 +1533,9 @@ onMounted(loadData);
 }
 
 .price-form-section {
-  padding: 12px;
+  padding: 14px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 8px;
+  border-radius: 10px;
 }
 
 .section-title {
@@ -1303,11 +1543,19 @@ onMounted(loadData);
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.section-title strong {
+  padding-left: 8px;
+  border-left: 3px solid var(--el-color-primary);
 }
 
 .section-title span {
   color: var(--el-color-primary);
   font-size: 13px;
+  font-family: Consolas, monospace;
 }
 
 .price-form-section label,
@@ -1336,16 +1584,16 @@ onMounted(loadData);
 }
 
 .empty-state {
-  padding: 48px 16px;
+  padding: 60px 16px;
   color: var(--el-text-color-secondary);
   text-align: center;
+  font-size: 14px;
 }
 
 .pagination-bar {
   display: flex;
   justify-content: flex-end;
-  padding: 14px 16px;
-  border-top: 1px solid var(--el-border-color-lighter);
+  padding: 14px 18px;
 }
 
 .balance-dialog-body {
@@ -1369,22 +1617,37 @@ onMounted(loadData);
   width: 100%;
 }
 
+/* ---- responsive ---- */
 @media (max-width: 1280px) {
   .permission-head {
     align-items: stretch;
     flex-direction: column;
   }
 
-  .batch-discount-panel {
+  .head-actions {
+    flex-direction: column;
+  }
+
+  .head-actions :deep(.el-input) {
+    width: 100%;
+  }
+
+  .gs-switches {
     grid-template-columns: 1fr;
   }
 
-  .batch-discount-editor {
+  .batch-cards {
     grid-template-columns: 1fr;
+  }
+
+  .batch-top {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .table-row {
     grid-template-columns: 1fr;
+    gap: 8px;
   }
 
   .table-header {

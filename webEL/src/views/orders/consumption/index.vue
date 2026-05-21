@@ -58,28 +58,6 @@ function applyRouteKeyword() {
   }
 }
 
-const stats = computed(() => [
-  {
-    label: '支出金额',
-    value: formatMoney(summary.value.expense_amount),
-    tone: 'danger',
-  },
-  {
-    label: '退款金额',
-    value: formatMoney(summary.value.refund_amount),
-    tone: 'success',
-  },
-  {
-    label: '净消费',
-    value: formatMoney(Math.abs(summary.value.net_amount)),
-    tone: 'primary',
-  },
-  {
-    label: '记录数',
-    value: pagination.total.toLocaleString('zh-CN'),
-    tone: 'normal',
-  },
-]);
 
 const canManageRefund = computed(() =>
   (userStore.userInfo?.roles ?? []).some((role) => ['admin', 'super', 'user'].includes(role)),
@@ -184,6 +162,15 @@ function statusTagType(status: string) {
   return 'warning';
 }
 
+function targetTypeLabel(type: string) {
+  const map: Record<string, string> = {
+    exposure: '曝光',
+    like: '点赞',
+    read: '阅读',
+  };
+  return map[type] || type || '-';
+}
+
 function orderStatusLabel(status: string) {
   const map: Record<string, string> = {
     completed: '订单完成',
@@ -282,7 +269,7 @@ async function handleBatchRefund(row: OrderApi.ConsumptionRecord) {
   try {
     await ElMessageBox.confirm(
       `该批次共 ${row.order_items.length} 条订单，其中 ${eligible.length} 条可退款。确定全部申请退款吗？`,
-      '批次全额退款',
+      '批次全部退款',
       { confirmButtonText: '确定退款', cancelButtonText: '取消', type: 'warning' },
     );
   } catch {
@@ -366,24 +353,44 @@ watch(
 <template>
   <div class="consumption-page">
     <section class="page-head">
-      <div>
+      <div class="head-text">
+        <span class="eyebrow">Consumption</span>
         <h1>消费记录</h1>
         <p>展示真实账户流水，包含下单扣费、退款、余额变化和关联订单。</p>
       </div>
-      <ElButton :loading="loading" type="primary" @click="loadRecords">
-        刷新
-      </ElButton>
+      <button class="head-btn" :disabled="loading" @click="loadRecords">
+        {{ loading ? '刷新中…' : '刷新' }}
+      </button>
     </section>
 
     <section class="summary-grid">
-      <div
-        v-for="item in stats"
-        :key="item.label"
-        class="summary-card"
-        :class="`is-${item.tone}`"
-      >
-        <span>{{ item.label }}</span>
-        <strong>{{ item.value }}</strong>
+      <div class="stat-card stat-card--danger">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M5.05 3.636a1 1 0 010 1.414 7 7 0 000 9.9 1 1 0 11-1.414 1.414 9 9 0 010-12.728 1 1 0 011.414 0zm9.9 0a1 1 0 011.414 0 9 9 0 010 12.728 1 1 0 11-1.414-1.414 7 7 0 000-9.9 1 1 0 010-1.414zM7.879 6.464a1 1 0 010 1.414 3 3 0 000 4.243 1 1 0 11-1.415 1.414 5 5 0 010-7.07 1 1 0 011.415 0zm4.242 0a1 1 0 011.415 0 5 5 0 010 7.072 1 1 0 01-1.415-1.415 3 3 0 000-4.242 1 1 0 010-1.415zM10 9a1 1 0 100 2 1 1 0 000-2z" clip-rule="evenodd" /></svg></div>
+        <div class="stat-body">
+          <span>支出金额</span>
+          <strong>{{ formatMoney(summary.expense_amount) }}</strong>
+        </div>
+      </div>
+      <div class="stat-card stat-card--success">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M4 4a2 2 0 00-2 2v4a2 2 0 002 2V6h10a2 2 0 00-2-2H4zm2 6a2 2 0 012-2h8a2 2 0 012 2v4a2 2 0 01-2 2H8a2 2 0 01-2-2v-4zm6 4a2 2 0 100-4 2 2 0 000 4z" clip-rule="evenodd" /></svg></div>
+        <div class="stat-body">
+          <span>退款金额</span>
+          <strong>{{ formatMoney(summary.refund_amount) }}</strong>
+        </div>
+      </div>
+      <div class="stat-card stat-card--primary">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M11 17a1 1 0 001.447.894l4-2A1 1 0 0017 15V9.236a1 1 0 00-1.447-.894l-4 2a1 1 0 00-.553.894V17zM15.211 6.276a1 1 0 000-1.788l-4.764-2.382a1 1 0 00-.894 0L4.789 4.488a1 1 0 000 1.788l4.764 2.382a1 1 0 00.894 0l4.764-2.382zM4.447 8.342A1 1 0 003 9.236V15a1 1 0 00.553.894l4 2A1 1 0 009 17v-5.764a1 1 0 00-.553-.894l-4-2z" /></svg></div>
+        <div class="stat-body">
+          <span>净消费</span>
+          <strong>{{ formatMoney(Math.abs(summary.net_amount)) }}</strong>
+        </div>
+      </div>
+      <div class="stat-card stat-card--normal">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z" /><path fill-rule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd" /></svg></div>
+        <div class="stat-body">
+          <span>记录数</span>
+          <strong>{{ pagination.total.toLocaleString('zh-CN') }}</strong>
+        </div>
       </div>
     </section>
 
@@ -437,45 +444,58 @@ watch(
                   :loading="batchRefundLoading"
                   @click.stop="handleBatchRefund(row)"
                 >
-                  批次全额退款
+                  批次全部退款
                 </ElButton>
               </div>
               <div
                 v-for="item in row.order_items"
                 :key="item.order_id"
-                class="order-item-row"
+                class="order-item-card"
               >
-                <div class="order-item-main">
-                  <strong>{{ item.order_no }}</strong>
-                  <span>数量 {{ item.ordered_quantity.toLocaleString('zh-CN') }}</span>
+                <div class="oic-left">
+                  <div class="oic-no">{{ item.order_no }}</div>
+                  <div class="oic-meta">
+                    <span class="oic-chip">{{ item.ordered_quantity.toLocaleString('zh-CN') }} 个</span>
+                    <ElTag :type="orderStatusTagType(item.order_status)" effect="plain" size="small">
+                      {{ orderStatusLabel(item.order_status) }}
+                    </ElTag>
+                  </div>
+                  <div v-if="item.note_id || item.target_type" class="oic-note-row">
+                    <span v-if="item.note_id" class="oic-note">
+                      <span class="oic-note-label">笔记</span>
+                      <a
+                        v-if="item.note_url"
+                        :href="item.note_url"
+                        target="_blank"
+                        rel="noopener"
+                        class="oic-note-id"
+                      >{{ item.note_id }}</a>
+                      <span v-else class="oic-note-id">{{ item.note_id }}</span>
+                    </span>
+                    <span v-if="item.target_type" class="oic-target-tag">{{ targetTypeLabel(item.target_type) }}</span>
+                    <span class="oic-progress">完成 <strong>{{ item.completed_quantity ?? 0 }}</strong> / {{ item.ordered_quantity }}</span>
+                  </div>
                 </div>
-                <div class="order-item-amount">
-                  <strong>{{ formatMoney(item.actual_paid_amount) }}</strong>
-                  <span v-if="item.refund_amount">
-                    已退 {{ formatMoney(item.refund_amount) }}
-                  </span>
+                <div class="oic-right">
+                  <div class="oic-money">
+                    <strong>{{ formatMoney(item.actual_paid_amount) }}</strong>
+                    <span v-if="item.refund_amount" class="oic-refunded">已退 {{ formatMoney(item.refund_amount) }}</span>
+                  </div>
+                  <ElPopconfirm
+                    v-if="canManageRefund && canRequestRefund(item)"
+                    title="确认申请这条订单退款？申请后需要管理员审核。"
+                    confirm-button-text="申请退款"
+                    cancel-button-text="取消"
+                    @confirm="requestRefund(item.order_id)"
+                  >
+                    <template #reference>
+                      <button class="oic-btn oic-btn--refund" @click.stop>申请退款</button>
+                    </template>
+                  </ElPopconfirm>
+                  <button v-else-if="canManageRefund" class="oic-btn oic-btn--disabled" disabled>
+                    {{ disabledRefundLabel(item) }}
+                  </button>
                 </div>
-                <ElTag
-                  :type="orderStatusTagType(item.order_status)"
-                  effect="plain"
-                  size="small"
-                >
-                  {{ orderStatusLabel(item.order_status) }}
-                </ElTag>
-                <ElPopconfirm
-                  v-if="canManageRefund && canRequestRefund(item)"
-                  title="确认申请这条订单退款？申请后需要管理员审核。"
-                  confirm-button-text="申请退款"
-                  cancel-button-text="取消"
-                  @confirm="requestRefund(item.order_id)"
-                >
-                  <template #reference>
-                    <ElButton size="small" type="warning">申请退款</ElButton>
-                  </template>
-                </ElPopconfirm>
-                <ElButton v-else-if="canManageRefund" disabled size="small">
-                  {{ disabledRefundLabel(item) }}
-                </ElButton>
               </div>
             </div>
             <span v-else class="empty-detail">这条记录没有可申请退款的订单明细</span>
@@ -587,76 +607,96 @@ watch(
   gap: 16px;
   min-height: 100%;
   padding: 20px;
-  color: hsl(var(--foreground));
-  background: hsl(var(--background));
+  color: var(--el-text-color-primary);
 }
 
-.page-head,
-.record-panel {
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--card));
-}
-
+/* ---- header ---- */
 .page-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px;
+  padding: 20px 24px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
 }
 
-.page-head h1 {
-  margin: 0;
-  font-size: 22px;
+.eyebrow {
+  font-size: 11px;
   font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--el-color-primary);
 }
 
-.page-head p {
-  margin: 6px 0 0;
-  color: hsl(var(--muted-foreground));
-}
+.page-head h1 { margin: 2px 0 0; font-size: 22px; font-weight: 700; }
+.page-head p { margin: 4px 0 0; font-size: 13px; color: var(--el-text-color-secondary); }
 
+.head-btn {
+  padding: 8px 20px;
+  border: 1px solid var(--el-color-primary-light-5);
+  border-radius: 8px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.head-btn:hover:not(:disabled) { background: var(--el-color-primary); color: #fff; }
+.head-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ---- stat cards ---- */
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 14px;
 }
 
-.summary-card {
+.stat-card {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-height: 96px;
-  padding: 18px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--card));
+  align-items: center;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.stat-card:hover {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
 }
 
-.summary-card span {
-  color: hsl(var(--muted-foreground));
+.stat-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  flex-shrink: 0;
 }
 
-.summary-card strong {
-  font-size: 24px;
-  line-height: 1.2;
-}
+.stat-card--danger .stat-icon { background: var(--el-color-danger-light-8); color: var(--el-color-danger); }
+.stat-card--success .stat-icon { background: var(--el-color-success-light-8); color: var(--el-color-success); }
+.stat-card--primary .stat-icon { background: var(--el-color-primary-light-8); color: var(--el-color-primary); }
+.stat-card--normal .stat-icon { background: var(--el-fill-color); color: var(--el-text-color-secondary); }
 
-.summary-card.is-danger strong {
-  color: #f56c6c;
-}
+.stat-body { display: flex; flex-direction: column; gap: 4px; }
+.stat-body span { font-size: 12px; color: var(--el-text-color-secondary); }
+.stat-body strong { font-size: 22px; font-weight: 700; line-height: 1.1; }
 
-.summary-card.is-success strong {
-  color: #2fbf71;
-}
+.stat-card--danger .stat-body strong { color: var(--el-color-danger); }
+.stat-card--success .stat-body strong { color: var(--el-color-success); }
+.stat-card--primary .stat-body strong { color: var(--el-color-primary); }
 
-.summary-card.is-primary strong {
-  color: #2f80ed;
-}
-
+/* ---- record panel ---- */
 .record-panel {
-  padding: 16px;
+  padding: 18px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
 }
 
 .filter-bar {
@@ -666,13 +706,16 @@ watch(
   margin-bottom: 16px;
 }
 
-.record-table {
-  width: 100%;
-}
+/* ---- table ---- */
+.record-table { width: 100%; }
+.record-table :deep(.el-table__row) { cursor: pointer; }
 
-.record-table :deep(.el-table__row) {
-  cursor: pointer;
+:deep(.el-table) {
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: var(--el-fill-color-light);
 }
+:deep(.el-table th.el-table__cell) { background: var(--el-fill-color-light); }
 
 .main-cell,
 .muted-cell,
@@ -681,20 +724,20 @@ watch(
 .type-cell {
   display: flex;
   flex-direction: column;
-  gap: 5px;
-  line-height: 1.25;
+  gap: 4px;
+  line-height: 1.3;
 }
 
-.type-cell {
-  align-items: flex-start;
-}
+.type-cell { align-items: flex-start; }
 
+.main-cell strong { font-size: 13px; font-family: Consolas, monospace; }
 .main-cell span,
 .main-cell small,
 .muted-cell span,
 .amount-cell span,
 .number-cell span {
-  color: hsl(var(--muted-foreground));
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
 }
 
 .type-badge {
@@ -704,42 +747,42 @@ watch(
   min-width: 68px;
   height: 24px;
   padding: 0 10px;
-  border: 1px solid rgba(47, 128, 237, 0.28);
-  border-radius: 4px;
-  color: #2f80ed;
+  border: 1px solid var(--el-color-primary-light-5);
+  border-radius: 6px;
+  color: var(--el-color-primary);
   font-size: 12px;
   font-weight: 600;
   line-height: 1;
-  background: rgba(47, 128, 237, 0.12);
+  background: var(--el-color-primary-light-9);
 }
 
 .direction-text {
   padding-left: 2px;
-  color: hsl(var(--muted-foreground));
-  font-size: 13px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
 }
-
-.direction-text.is-debit {
-  color: #f56c6c;
-}
-
-.direction-text.is-credit {
-  color: #2fbf71;
-}
+.direction-text.is-debit { color: var(--el-color-danger); }
+.direction-text.is-credit { color: var(--el-color-success); }
 
 .amount-cell strong,
 .number-cell strong {
-  font-size: 16px;
+  font-size: 14px;
+  font-family: Consolas, monospace;
 }
 
-.amount-cell .text-success {
-  color: #2fbf71;
+.amount-cell .text-success { color: var(--el-color-success); }
+
+.muted-cell strong {
+  font-family: Consolas, monospace;
+  font-size: 13px;
 }
 
+/* ---- expand section ---- */
 .order-items {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
   padding: 10px 16px 12px 64px;
 }
 
@@ -750,91 +793,160 @@ watch(
   padding: 10px 14px;
   border: 1px dashed var(--el-color-danger-light-3);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--el-color-danger) 6%, transparent);
+  background: var(--el-color-danger-light-9);
 }
+.batch-refund-bar > span { color: var(--el-text-color-secondary); font-size: 13px; }
 
-.batch-refund-bar > span {
-  color: var(--el-text-color-secondary);
-  font-size: 13px;
-}
-
-.order-item-row {
-  display: grid;
-  grid-template-columns: minmax(220px, 1fr) 140px 120px 100px;
-  gap: 12px;
+.order-item-card {
+  display: flex;
   align-items: center;
-  padding: 12px;
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--muted) / 35%);
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 16px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.order-item-card:hover {
+  border-color: var(--el-color-primary-light-5);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.04);
 }
 
-.order-item-main,
-.order-item-amount {
+.oic-left {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 6px;
+  min-width: 0;
 }
-
-.order-item-main span,
-.order-item-amount span,
-.empty-detail {
-  color: hsl(var(--muted-foreground));
+.oic-no {
+  font-family: Consolas, monospace;
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-
-.empty-detail {
-  display: block;
-  padding: 12px 16px 12px 64px;
-}
-
-.pagination-bar {
+.oic-meta {
   display: flex;
-  justify-content: flex-end;
-  padding-top: 16px;
+  align-items: center;
+  gap: 8px;
+}
+.oic-chip {
+  padding: 1px 8px;
+  border-radius: 4px;
+  background: var(--el-fill-color-light);
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
 }
 
+.oic-note-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.oic-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.oic-note-label {
+  color: var(--el-text-color-secondary);
+}
+.oic-note-id {
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  color: var(--el-text-color-primary);
+}
+a.oic-note-id {
+  color: var(--el-color-primary);
+  text-decoration: none;
+}
+a.oic-note-id:hover {
+  text-decoration: underline;
+}
+.oic-target-tag {
+  padding: 1px 8px;
+  border-radius: 4px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-size: 11px;
+  font-weight: 600;
+}
+.oic-progress {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+.oic-progress strong {
+  font-family: Consolas, monospace;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.oic-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+.oic-money {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.oic-money strong {
+  font-family: Consolas, monospace;
+  font-size: 14px;
+  font-weight: 700;
+}
+.oic-refunded {
+  font-size: 11px;
+  color: var(--el-color-warning);
+}
+
+.oic-btn {
+  padding: 5px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.oic-btn--refund {
+  border-color: var(--el-color-warning-light-5);
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+.oic-btn--refund:hover { background: var(--el-color-warning); color: #fff; }
+.oic-btn--disabled {
+  border-color: var(--el-border-color-lighter);
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-disabled);
+  cursor: not-allowed;
+}
+
+.empty-detail { display: block; padding: 12px 16px 12px 64px; }
+
+.pagination-bar { display: flex; justify-content: flex-end; padding-top: 16px; }
+
+/* ---- responsive ---- */
 @media (max-width: 1100px) {
-  .summary-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .filter-bar {
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .order-item-row {
-    grid-template-columns: 1fr 120px;
-  }
+  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .filter-bar { grid-template-columns: 1fr 1fr; }
+  .order-item-card { flex-wrap: wrap; }
 }
 
 @media (max-width: 640px) {
-  .consumption-page {
-    padding: 12px;
-  }
-
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .summary-grid,
-  .filter-bar {
-    grid-template-columns: 1fr;
-  }
-
-  .pagination-bar {
-    justify-content: flex-start;
-    overflow-x: auto;
-  }
-
-  .order-items,
-  .empty-detail {
-    padding-left: 12px;
-  }
-
-  .order-item-row {
-    grid-template-columns: 1fr;
-  }
+  .consumption-page { padding: 12px; }
+  .page-head { align-items: flex-start; flex-direction: column; }
+  .summary-grid, .filter-bar { grid-template-columns: 1fr; }
+  .pagination-bar { justify-content: flex-start; overflow-x: auto; }
+  .order-items, .empty-detail { padding-left: 12px; }
+  .order-item-row { grid-template-columns: 1fr; }
 }
 </style>
 

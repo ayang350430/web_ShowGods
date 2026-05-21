@@ -32,6 +32,7 @@ export namespace DashboardApi {
     impression_discount_rate: number;
     impression_submit_enabled: boolean;
     impression_unit_price: number;
+    like_submit_enabled: boolean;
     view_discount_rate: number;
     view_submit_enabled: boolean;
     view_unit_price: number;
@@ -52,9 +53,21 @@ export namespace DashboardApi {
     username: string;
   }
 
+  export interface ApiCallStats {
+    preview_calls: number;
+    progress_calls: number;
+    stop_calls: number;
+    submit_calls: number;
+    today_calls: number;
+    total_calls: number;
+    week_calls: number;
+    yesterday_calls: number;
+  }
+
   export interface DashboardSummary {
     alert_orders: unknown[];
     all_users_overview: unknown[];
+    api_call_stats: ApiCallStats;
     is_admin: boolean;
     metrics: DashboardMetrics;
     pricing: DashboardPricing;

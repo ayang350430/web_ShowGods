@@ -1633,19 +1633,50 @@ const searchBatchOrdersByLinks = async (userId, params = {}) => {
 
   const viewAll = await canViewAllAccountRecords(db, userId);
   const urls = [...new Set(validLinks.map((item) => item.note_url).filter(Boolean))];
-  const linkWhere = [];
-  const filters = [];
-  const queryParams = [];
+  const urlSet = new Set(urls);
 
-  if (urls.length > 0) {
-    linkWhere.push(`o.note_url IN (${urls.map(() => '?').join(',')})`);
-    queryParams.push(...urls);
-    for (const url of urls) {
-      linkWhere.push('ob.raw_content LIKE ?');
-      queryParams.push(`%${url}%`);
+  // Step 1: find batches whose raw_content contains any search URL, resolve precise batch_item_ids
+  const batchLikeConditions = urls.map(() => 'raw_content LIKE ?');
+  const batchLikeParams = urls.map((u) => `%${u}%`);
+  const precisePairs = []; // [{ batch_id, batch_item_id, matched_url }]
+  if (batchLikeConditions.length > 0) {
+    const [batches] = await db.execute(
+      `SELECT id, raw_content FROM order_batches WHERE ${batchLikeConditions.join(' OR ')}`,
+      batchLikeParams,
+    );
+    for (const batch of batches) {
+      const lines = String(batch.raw_content || '').split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      lines.forEach((line, idx) => {
+        const lineUrl = line.split(/\s+/)[0] || '';
+        if (urlSet.has(lineUrl)) {
+          precisePairs.push({ batch_id: batch.id, batch_item_id: idx + 1, matched_url: lineUrl });
+        }
+      });
     }
   }
 
+  // Step 2: build WHERE clause — match by note_url OR by precise (batch_id, batch_item_id)
+  const linkWhere = [];
+  const queryParams = [];
+  if (urls.length > 0) {
+    linkWhere.push(`o.note_url IN (${urls.map(() => '?').join(',')})`);
+    queryParams.push(...urls);
+  }
+  for (const pair of precisePairs) {
+    linkWhere.push('(o.batch_id = ? AND o.batch_item_id = ?)');
+    queryParams.push(pair.batch_id, pair.batch_item_id);
+  }
+  if (linkWhere.length === 0) {
+    return {
+      invalid_count: parsedLinks.filter((item) => !item.valid).length,
+      items: [],
+      links: parsedLinks,
+      matched_count: 0,
+      total_count: parsedLinks.length,
+    };
+  }
+
+  const filters = [];
   const startDate = String(params.start_date || '').trim();
   const endDate = String(params.end_date || '').trim();
   if (startDate) {
@@ -1700,12 +1731,20 @@ const searchBatchOrdersByLinks = async (userId, params = {}) => {
     queryParams,
   );
 
+  // Build matched URL map from precisePairs for quick lookup
+  const pairMap = new Map();
+  for (const pair of precisePairs) {
+    pairMap.set(`${pair.batch_id}-${pair.batch_item_id}`, pair.matched_url);
+  }
+
   const resultRows = rows.flatMap((row) => {
-    const rawUrlMap = buildRawUrlMap(row.raw_content);
-    const sourceUrl = rawUrlMap.get(Number(row.batch_item_id)) || row.note_url;
+    const pairKey = `${row.batch_id}-${row.batch_item_id}`;
+    const sourceUrl = pairMap.get(pairKey) || row.note_url;
     const matchedLink =
-      validLinks.find((item) => item.note_url === row.note_url || item.note_url === sourceUrl) ||
-      null;
+      validLinks.find((item) =>
+        item.note_url === row.note_url ||
+        item.note_url === sourceUrl,
+      ) || null;
     if (!matchedLink) {
       return [];
     }
@@ -1854,6 +1893,10 @@ const listConsumptionRecords = async (userId, query = {}) => {
         o.refund_requested_at,
         o.refund_amount_total,
         o.refunded_quantity AS order_refunded_quantity,
+        o.note_url,
+        o.note_id,
+        o.target_type,
+        o.completed_quantity,
         u.username,
         COALESCE(NULLIF(u.real_name, ''), NULLIF(u.nickname, ''), u.username) AS display_name
       ${fromSql}
@@ -1930,6 +1973,9 @@ const listConsumptionRecords = async (userId, query = {}) => {
             if (!existing) {
               byOrder.set(oid, {
                 actual_paid_amount: Number(item.actual_paid_amount) || 0,
+                completed_quantity: Number(item.completed_quantity) || 0,
+                note_id: item.note_id || '',
+                note_url: item.note_url || '',
                 order_id: oid,
                 order_no: item.order_no,
                 order_status: item.order_status || 'running',
@@ -1939,6 +1985,7 @@ const listConsumptionRecords = async (userId, query = {}) => {
                 refund_amount: Number(item.refund_amount_total ?? item.refund_amount) || 0,
                 refund_requested_at: item.refund_requested_at || null,
                 refunded_quantity: Number(item.order_refunded_quantity ?? item.refunded_quantity) || 0,
+                target_type: item.target_type || '',
               });
             } else {
               existing.actual_paid_amount += Number(item.actual_paid_amount) || 0;
@@ -2230,102 +2277,46 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
     }
 
     if (!approved) {
-      let nextStatus = 'running';
-      let nextReason = reason || '退款审核拒绝，继续处理';
-      let completedQuantityAfterReject = null;
-      let replenishmentRequest = null;
+      const rejectReason = reason || '退款审核拒绝';
+      await connection.execute(
+        `
+          UPDATE orders
+          SET order_status = 'refund_rejected',
+              reason_message = ?,
+              updated_at = ?
+          WHERE id = ?
+        `,
+        [rejectReason, now, targetOrderId],
+      );
+      await connection.commit();
 
-      if (['like', 'view'].includes(normalizeTargetType(order.target_type))) {
+      // 拒绝后查询上游任务状态并刷新 external_status
+      const externalTaskId = normalizeXhsTaskId(order.external_task_id);
+      if (externalTaskId) {
         try {
-          const checkResult = await replenishOrderIfNeeded(connection, order.user_id, order, {
-            dispatch: false,
-            now,
-          });
-          if (checkResult?.needs_replenish) {
-            nextStatus = 'repair_review';
-            nextReason = `退款被拒绝后复查未完成，需补单 ${checkResult.replenish_quantity}`;
-            const [[checkedOrder]] = await connection.execute(
-              'SELECT * FROM orders WHERE id = ? LIMIT 1',
-              [targetOrderId],
-            );
-            replenishmentRequest = await createPendingReplenishmentForOrder(
-              connection,
-              {
-                ...order,
-                ...checkedOrder,
-                completed_quantity: checkResult.achieved_quantity,
-                external_completed_quantity: checkResult.achieved_quantity,
-                reason_message: nextReason,
-              },
-              nextReason,
-              now,
-            );
-          } else if (
-            checkResult?.checked &&
-            Number(checkResult.replenish_quantity) === 0 &&
-            Number.isFinite(Number(checkResult.achieved_quantity))
-          ) {
-            nextStatus = 'completed';
-            const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
-            completedQuantityAfterReject = Math.min(
-              Math.max(Number(checkResult.achieved_quantity) || 0, 0),
-              orderedQuantity,
+          const targetType = normalizeTargetType(order.target_type);
+          const statusResult = await getXhsTaskClient().getTaskStatus(
+            targetType,
+            externalTaskId,
+            { token: createCurrentUserToken(order.user_id) },
+          );
+          const taskStatus = getXhsTaskStatus(statusResult?.body);
+          const statusMap = { 1: 'processing', 2: 'completed', 3: 'stopped' };
+          const newExtStatus = statusMap[taskStatus] || order.external_status;
+          if (newExtStatus !== order.external_status) {
+            await db.execute(
+              'UPDATE orders SET external_status = ?, updated_at = ? WHERE id = ?',
+              [newExtStatus, new Date(), targetOrderId],
             );
           }
-        } catch (error) {
-          nextReason = `${nextReason}; 补单复查失败: ${normalizeXhsErrorMessage(error)}`;
-        }
+        } catch { /* 查询失败不影响拒绝结果 */ }
       }
 
-      if (nextStatus === 'completed') {
-        await connection.execute(
-          `
-            UPDATE orders
-            SET order_status = 'completed',
-                external_status = 'completed',
-                external_progress = 1,
-                external_completed_quantity = ?,
-                completed_quantity = ?,
-                reason_message = ?,
-                updated_at = ?
-            WHERE id = ?
-          `,
-          [
-            completedQuantityAfterReject,
-            completedQuantityAfterReject,
-            nextReason,
-            now,
-            targetOrderId,
-          ],
-        );
-      } else if (nextStatus === 'running') {
-        await connection.execute(
-          `
-            UPDATE orders
-            SET order_status = 'running',
-                reason_message = ?,
-                updated_at = ?
-            WHERE id = ?
-          `,
-          [nextReason, now, targetOrderId],
-        );
-      } else {
-        await connection.execute(
-          `
-            UPDATE orders
-            SET reason_message = ?,
-                updated_at = ?
-            WHERE id = ?
-          `,
-          [nextReason, now, targetOrderId],
-        );
-      }
-      await connection.commit();
       return {
         order_id: targetOrderId,
         order_no: order.order_no,
-        order_status: nextStatus,
-        replenishment_request_id: replenishmentRequest?.id || null,
+        order_status: 'refund_rejected',
+        replenishment_request_id: null,
         refunded_amount: 0,
       };
     }
@@ -2509,7 +2500,7 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
 
     await connection.commit();
 
-    // 退款通过后停止上游任务
+    // 退款通过后停止上游任务，然后查询确认
     if (normalizeXhsTaskId(order.external_task_id)) {
       try {
         await stopXhsTask({
@@ -2518,6 +2509,24 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
           targetType: order.target_type,
           userId: order.user_id,
         });
+        await db.execute(
+          "UPDATE orders SET external_status = 'stop_requested', updated_at = ? WHERE id = ?",
+          [new Date(), targetOrderId],
+        );
+        // 查询上游确认是否真的停止了
+        const statusResult = await getXhsTaskClient().getTaskStatus(
+          normalizeTargetType(order.target_type),
+          normalizeXhsTaskId(order.external_task_id),
+          { token: createCurrentUserToken(order.user_id) },
+        );
+        const taskStatus = getXhsTaskStatus(statusResult?.body);
+        // status 2 = completed, 3 = stopped
+        if (taskStatus === 2 || taskStatus === 3) {
+          await db.execute(
+            "UPDATE orders SET external_status = 'stopped', updated_at = ? WHERE id = ?",
+            [new Date(), targetOrderId],
+          );
+        }
       } catch {
         // 停止失败不影响退款结果
       }
@@ -2529,6 +2538,344 @@ const reviewOrderRefund = async (actorUserId, orderId, { approved, reason = '' }
       order_status: 'refund_approved',
       refunded_amount: refundAmount,
     };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+// ─── 售后全额退款 ────────────────────────────────────────────────
+// 不限订单当前状态，计算 actual_paid_amount – refund_amount_total 差额并退回用户
+const fullRefundOrder = async (actorUserId, orderId) => {
+  const db = getPool();
+  const isAdmin = await canViewAllAccountRecords(db, actorUserId);
+  if (!isAdmin) {
+    const error = new Error('Forbidden');
+    error.statusCode = 403;
+    throw error;
+  }
+
+  const targetOrderId = Number(orderId);
+  if (!targetOrderId) {
+    const error = new Error('Invalid order id');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const connection = await db.getConnection();
+  const now = new Date();
+  try {
+    await connection.beginTransaction();
+
+    const [[order]] = await connection.execute(
+      'SELECT * FROM orders WHERE id = ? LIMIT 1 FOR UPDATE',
+      [targetOrderId],
+    );
+    if (!order) {
+      const error = new Error('Order not found');
+      error.statusCode = 404;
+      throw error;
+    }
+
+    // 查找所有扣费记录，计算实际支付总额
+    const [chargeRecords] = await connection.execute(
+      `SELECT * FROM account_records
+       WHERE order_id = ? AND record_type = 'order_charge' AND status = 'success'
+       ORDER BY id ASC FOR UPDATE`,
+      [targetOrderId],
+    );
+    if (!chargeRecords.length) {
+      const error = new Error('未找到扣费记录，无法退款');
+      error.statusCode = 400;
+      throw error;
+    }
+
+    const chargeRecord = chargeRecords[0];
+    const totalPaid = chargeRecords.reduce(
+      (sum, cr) => sum + (Number(cr.actual_paid_amount) || 0), 0,
+    );
+    const alreadyRefunded = Number(order.refund_amount_total) || 0;
+    const refundAmount = round4(Math.max(totalPaid - alreadyRefunded, 0));
+
+    if (refundAmount <= 0) {
+      await connection.rollback();
+      return {
+        already_refunded: round4(alreadyRefunded),
+        order_id: targetOrderId,
+        order_no: order.order_no,
+        refund_amount: 0,
+        total_paid: round4(totalPaid),
+        message: '该订单已全额退款，无需再退',
+      };
+    }
+
+    // 获取当前余额
+    const [[balance]] = await connection.execute(
+      'SELECT available_amount FROM balance_accounts WHERE user_id = ? LIMIT 1 FOR UPDATE',
+      [order.user_id],
+    );
+    const beforeBalance = round4(balance?.available_amount);
+    const afterBalance = round4(beforeBalance + refundAmount);
+    const recordNo = `FULL-REFUND-${Date.now()}-${String(targetOrderId).padStart(3, '0')}`;
+
+    // 写退款账户记录
+    await connection.execute(
+      `INSERT INTO account_records
+        (record_no, user_id, record_type, direction, order_id, order_no,
+         related_record_id, status, ordered_quantity, completed_quantity, refunded_quantity,
+         original_unit_price, original_total_amount, discount_rate, discounted_unit_price,
+         discount_amount, payable_amount, actual_paid_amount, refund_amount, net_amount,
+         before_available_amount, after_available_amount, reason_message, remark,
+         created_at, updated_at)
+       VALUES (?, ?, 'refund', 'credit', ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        recordNo,
+        order.user_id,
+        order.id,
+        order.order_no,
+        chargeRecord.id,
+        order.ordered_quantity,
+        Number(order.completed_quantity) || 0,
+        Number(order.ordered_quantity) || 0,
+        chargeRecord.discounted_unit_price,
+        refundAmount,
+        chargeRecord.discount_rate,
+        chargeRecord.discounted_unit_price,
+        0,
+        refundAmount,
+        refundAmount,
+        refundAmount,
+        beforeBalance,
+        afterBalance,
+        '售后全额退款',
+        `已付 ${round4(totalPaid)}，已退 ${round4(alreadyRefunded)}，本次退 ${refundAmount}`,
+        now,
+        now,
+      ],
+    );
+
+    // 更新订单
+    await connection.execute(
+      `UPDATE orders
+       SET order_status = 'refund_approved',
+           refund_amount_total = ?,
+           refunded_quantity = ordered_quantity,
+           reason_message = ?,
+           updated_at = ?
+       WHERE id = ?`,
+      [round4(alreadyRefunded + refundAmount), '售后全额退款', now, targetOrderId],
+    );
+
+    // 更新余额
+    await connection.execute(
+      'UPDATE balance_accounts SET available_amount = ?, updated_at = ? WHERE user_id = ?',
+      [afterBalance, now, order.user_id],
+    );
+
+    await connection.commit();
+
+    // 尝试停止上游任务（不影响退款结果）
+    if (normalizeXhsTaskId(order.external_task_id)) {
+      try {
+        await stopXhsTask({
+          reason: '售后全额退款',
+          taskId: order.external_task_id,
+          targetType: order.target_type,
+          userId: order.user_id,
+        });
+        await db.execute(
+          "UPDATE orders SET external_status = 'stopped', updated_at = ? WHERE id = ?",
+          [new Date(), targetOrderId],
+        );
+      } catch {
+        // 停止失败不影响退款结果
+      }
+    }
+
+    return {
+      after_balance: afterBalance,
+      already_refunded: round4(alreadyRefunded),
+      order_id: targetOrderId,
+      order_no: order.order_no,
+      refund_amount: refundAmount,
+      total_paid: round4(totalPaid),
+    };
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+};
+
+// ─── 批次全额退款（单事务批量） ─────────────────────────────────────
+const fullRefundBatch = async (actorUserId, batchNo) => {
+  const db = getPool();
+  const isAdmin = await canViewAllAccountRecords(db, actorUserId);
+  if (!isAdmin) {
+    const error = new Error('Forbidden');
+    error.statusCode = 403;
+    throw error;
+  }
+  if (!batchNo) {
+    const error = new Error('缺少批次号');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const connection = await db.getConnection();
+  const now = new Date();
+  try {
+    await connection.beginTransaction();
+
+    // 1. 一次性查出该批次所有订单 + 锁定
+    const [orders] = await connection.execute(
+      `SELECT o.*
+       FROM orders o
+       INNER JOIN order_batches ob ON ob.id = o.batch_id
+       WHERE ob.batch_no = ?
+       ORDER BY o.id ASC
+       FOR UPDATE`,
+      [batchNo],
+    );
+    if (orders.length === 0) {
+      await connection.commit();
+      return { total: 0, succeeded: 0, failed: 0, total_refunded: 0, results: [] };
+    }
+
+    const orderIds = orders.map((o) => o.id);
+
+    // 2. 一次性查出所有扣费记录
+    const [allChargeRecords] = await connection.execute(
+      `SELECT * FROM account_records
+       WHERE order_id IN (${orderIds.map(() => '?').join(',')})
+         AND record_type = 'order_charge' AND status = 'success'
+       ORDER BY id ASC
+       FOR UPDATE`,
+      orderIds,
+    );
+    // 按 order_id 分组
+    const chargeMap = new Map();
+    for (const cr of allChargeRecords) {
+      const oid = Number(cr.order_id);
+      if (!chargeMap.has(oid)) chargeMap.set(oid, []);
+      chargeMap.get(oid).push(cr);
+    }
+
+    // 3. 查出涉及的用户余额并锁定
+    const userIds = [...new Set(orders.map((o) => Number(o.user_id)))];
+    const [balanceRows] = await connection.execute(
+      `SELECT user_id, available_amount FROM balance_accounts
+       WHERE user_id IN (${userIds.map(() => '?').join(',')})
+       FOR UPDATE`,
+      userIds,
+    );
+    const balanceMap = new Map();
+    for (const b of balanceRows) {
+      balanceMap.set(Number(b.user_id), Number(b.available_amount) || 0);
+    }
+
+    // 4. 逐订单计算并批量写入
+    let succeeded = 0;
+    let totalRefunded = 0;
+    const results = [];
+    const refundInserts = [];
+    const orderUpdates = [];
+
+    for (const order of orders) {
+      const charges = chargeMap.get(order.id) || [];
+      if (charges.length === 0) {
+        results.push({ order_id: order.id, success: true, refund_amount: 0 });
+        continue;
+      }
+      const totalPaid = charges.reduce((s, c) => s + (Number(c.actual_paid_amount) || 0), 0);
+      const alreadyRefunded = Number(order.refund_amount_total) || 0;
+      const refundAmount = round4(Math.max(totalPaid - alreadyRefunded, 0));
+
+      if (refundAmount <= 0) {
+        results.push({ order_id: order.id, success: true, refund_amount: 0 });
+        continue;
+      }
+
+      const userId = Number(order.user_id);
+      const beforeBalance = round4(balanceMap.get(userId) || 0);
+      const afterBalance = round4(beforeBalance + refundAmount);
+      balanceMap.set(userId, afterBalance);
+
+      const chargeRecord = charges[0];
+      const recordNo = `FULL-REFUND-${Date.now()}-${String(order.id).padStart(3, '0')}`;
+
+      refundInserts.push([
+        recordNo, userId, order.id, order.order_no, chargeRecord.id,
+        order.ordered_quantity, Number(order.completed_quantity) || 0, Number(order.ordered_quantity) || 0,
+        chargeRecord.discounted_unit_price, refundAmount, chargeRecord.discount_rate,
+        chargeRecord.discounted_unit_price, 0, refundAmount, refundAmount, refundAmount,
+        beforeBalance, afterBalance, '售后全额退款',
+        `已付 ${round4(totalPaid)}，已退 ${round4(alreadyRefunded)}，本次退 ${refundAmount}`,
+        now, now,
+      ]);
+
+      orderUpdates.push([round4(alreadyRefunded + refundAmount), now, order.id]);
+      succeeded++;
+      totalRefunded = round4(totalRefunded + refundAmount);
+      results.push({ order_id: order.id, success: true, refund_amount: refundAmount });
+    }
+
+    // 5. 批量写退款记录
+    for (const params of refundInserts) {
+      await connection.execute(
+        `INSERT INTO account_records
+          (record_no, user_id, record_type, direction, order_id, order_no,
+           related_record_id, status, ordered_quantity, completed_quantity, refunded_quantity,
+           original_unit_price, original_total_amount, discount_rate, discounted_unit_price,
+           discount_amount, payable_amount, actual_paid_amount, refund_amount, net_amount,
+           before_available_amount, after_available_amount, reason_message, remark,
+           created_at, updated_at)
+         VALUES (?, ?, 'refund', 'credit', ?, ?, ?, 'success', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        params,
+      );
+    }
+
+    // 6. 批量更新订单状态
+    for (const [refundTotal, updatedAt, orderId] of orderUpdates) {
+      await connection.execute(
+        `UPDATE orders
+         SET order_status = 'refund_approved',
+             refund_amount_total = ?,
+             refunded_quantity = ordered_quantity,
+             reason_message = '售后全额退款',
+             updated_at = ?
+         WHERE id = ?`,
+        [refundTotal, updatedAt, orderId],
+      );
+    }
+
+    // 7. 批量更新用户余额
+    for (const [userId, amount] of balanceMap) {
+      await connection.execute(
+        'UPDATE balance_accounts SET available_amount = ?, updated_at = ? WHERE user_id = ?',
+        [round4(amount), now, userId],
+      );
+    }
+
+    await connection.commit();
+
+    // 8. 事务外尝试停止上游任务（不阻塞）
+    const tasksToStop = orders.filter((o) => normalizeXhsTaskId(o.external_task_id));
+    if (tasksToStop.length > 0) {
+      Promise.allSettled(
+        tasksToStop.map(async (o) => {
+          try {
+            await stopXhsTask({ reason: '售后全额退款', taskId: o.external_task_id, targetType: o.target_type, userId: o.user_id });
+            await db.execute("UPDATE orders SET external_status = 'stopped', updated_at = ? WHERE id = ?", [new Date(), o.id]);
+          } catch { /* ignore */ }
+        }),
+      );
+    }
+
+    return { total: orders.length, succeeded, failed: orders.length - succeeded, total_refunded: round4(totalRefunded), results };
   } catch (error) {
     await connection.rollback();
     throw error;
@@ -2790,6 +3137,7 @@ const batchApproveRefunds = async (actorUserId, { batch_no, order_ids } = {}) =>
         }),
       ),
     );
+    const stoppedIds = ordersToStop.filter((_, i) => firstResults[i].status === 'fulfilled').map((o) => o.id);
     const retryOrders = ordersToStop.filter((_, i) => firstResults[i].status === 'rejected');
     let failedOrders = [];
     if (retryOrders.length > 0) {
@@ -2803,7 +3151,40 @@ const batchApproveRefunds = async (actorUserId, { batch_no, order_ids } = {}) =>
           }),
         ),
       );
+      retryOrders.forEach((o, i) => { if (retryResults[i].status === 'fulfilled') stoppedIds.push(o.id); });
       failedOrders = retryOrders.filter((_, i) => retryResults[i].status === 'rejected');
+    }
+    // 先标记为 stop_requested，再查询确认
+    if (stoppedIds.length > 0) {
+      const ph = stoppedIds.map(() => '?').join(',');
+      await db.execute(
+        `UPDATE orders SET external_status = 'stop_requested', updated_at = ? WHERE id IN (${ph})`,
+        [new Date(), ...stoppedIds],
+      );
+      // 并发查询上游确认停止状态
+      const stoppedOrders = orders.filter((o) => stoppedIds.includes(o.id));
+      const verifyResults = await Promise.allSettled(
+        stoppedOrders.map((o) =>
+          getXhsTaskClient().getTaskStatus(
+            normalizeTargetType(o.target_type),
+            normalizeXhsTaskId(o.external_task_id),
+            { token: createCurrentUserToken(o.user_id) },
+          ),
+        ),
+      );
+      const confirmedIds = stoppedOrders
+        .filter((_, i) => {
+          const s = getXhsTaskStatus(verifyResults[i]?.value?.body);
+          return s === 2 || s === 3;
+        })
+        .map((o) => o.id);
+      if (confirmedIds.length > 0) {
+        const ph2 = confirmedIds.map(() => '?').join(',');
+        await db.execute(
+          `UPDATE orders SET external_status = 'stopped', updated_at = ? WHERE id IN (${ph2})`,
+          [new Date(), ...confirmedIds],
+        );
+      }
     }
 
     // 10. 二次失败的撤回退款
@@ -2969,6 +3350,31 @@ const batchRejectRefunds = async (actorUserId, { batch_no, order_ids, reason = '
       }
     }
 
+    // 刷新上游任务状态
+    const taskOrders = orders.filter((o) => normalizeXhsTaskId(o.external_task_id));
+    if (taskOrders.length > 0) {
+      Promise.allSettled(
+        taskOrders.map(async (o) => {
+          try {
+            const tType = normalizeTargetType(o.target_type);
+            const statusResult = await getXhsTaskClient().getTaskStatus(
+              tType, normalizeXhsTaskId(o.external_task_id),
+              { token: createCurrentUserToken(o.user_id) },
+            );
+            const taskStatus = getXhsTaskStatus(statusResult?.body);
+            const statusMap = { 1: 'processing', 2: 'completed', 3: 'stopped' };
+            const newExtStatus = statusMap[taskStatus];
+            if (newExtStatus) {
+              await db.execute(
+                'UPDATE orders SET external_status = ?, updated_at = ? WHERE id = ?',
+                [newExtStatus, new Date(), o.id],
+              );
+            }
+          } catch { /* ignore */ }
+        }),
+      );
+    }
+
     const results = orders.map((o) => ({
       order_id: o.id,
       order_no: o.order_no,
@@ -3026,7 +3432,8 @@ const listRefundRecords = async (userId, query = {}) => {
   const keyword = String(query.keyword || '').trim();
   const status = String(query.status || '').trim();
   const viewAll = await canViewAllAccountRecords(db, userId);
-  const where = [
+
+  const orderWhere = [
     `(
       o.order_status IN ('refund_requested', 'refund_calculating', 'stopping', 'refund_approved', 'refund_rejected')
       OR o.refund_requested_at IS NOT NULL
@@ -3034,18 +3441,18 @@ const listRefundRecords = async (userId, query = {}) => {
       OR o.refund_amount_total > 0
     )`,
   ];
-  const params = [];
+  const orderParams = [];
 
   if (!viewAll) {
-    where.push('o.user_id = ?');
-    params.push(userId);
+    orderWhere.push('o.user_id = ?');
+    orderParams.push(userId);
   }
   if (status) {
-    where.push('o.order_status = ?');
-    params.push(status);
+    orderWhere.push('o.order_status = ?');
+    orderParams.push(status);
   }
   if (keyword) {
-    where.push(`
+    orderWhere.push(`
       (
         o.order_no LIKE ?
         OR ob.batch_no LIKE ?
@@ -3059,78 +3466,101 @@ const listRefundRecords = async (userId, query = {}) => {
       )
     `);
     const keywordLike = `%${keyword}%`;
-    params.push(
-      keywordLike,
-      keywordLike,
-      keywordLike,
-      keywordLike,
-      keywordLike,
-      keywordLike,
-      keywordLike,
-      keywordLike,
-      keywordLike,
+    orderParams.push(
+      keywordLike, keywordLike, keywordLike, keywordLike, keywordLike,
+      keywordLike, keywordLike, keywordLike, keywordLike,
     );
   }
 
-  const fromSql = `
+  const baseFromSql = `
     FROM orders o
     LEFT JOIN order_batches ob ON ob.id = o.batch_id
     LEFT JOIN users u ON u.id = o.user_id
     LEFT JOIN (
-      SELECT
-        note_id,
-        MAX(title) AS title,
-        MAX(author_name) AS author_name,
-        MAX(avatar_url) AS avatar_url
-      FROM note_basic_cache
-      GROUP BY note_id
+      SELECT note_id, MAX(title) AS title, MAX(author_name) AS author_name, MAX(avatar_url) AS avatar_url
+      FROM note_basic_cache GROUP BY note_id
     ) nbc ON nbc.note_id = o.note_id
-    LEFT JOIN (
-      SELECT
-        order_id,
-        SUM(actual_paid_amount) AS actual_paid_amount,
-        SUM(payable_amount) AS payable_amount,
-        SUM(refund_amount) AS refund_amount,
-        MAX(status) AS status
-      FROM account_records
-      WHERE record_type = 'order_charge'
-      GROUP BY order_id
-    ) ar ON ar.order_id = o.id
-    LEFT JOIN (
-      SELECT order_id, MAX(id) AS refund_record_id
-      FROM account_records
-      WHERE record_type = 'refund'
-      GROUP BY order_id
-    ) latest_refund ON latest_refund.order_id = o.id
-    LEFT JOIN account_records rr ON rr.id = latest_refund.refund_record_id
-    WHERE ${where.join(' AND ')}
+    WHERE ${orderWhere.join(' AND ')}
   `;
 
-  const [[countRow]] = await db.execute(`SELECT COUNT(DISTINCT o.id) AS total ${fromSql}`, params);
+  // ── 按批次分页：先统计不同批次数，再取当前页的批次号 ──
+  const [[batchCountRow]] = await db.execute(
+    `SELECT COUNT(DISTINCT COALESCE(ob.batch_no, CONCAT('_single_', o.id))) AS total ${baseFromSql}`,
+    orderParams,
+  );
+  const totalBatches = Number(batchCountRow.total) || 0;
+
+  // 取当前页的批次号列表（按最近退款时间排序）
+  const [batchRows] = await db.execute(
+    `SELECT
+       COALESCE(ob.batch_no, CONCAT('_single_', o.id)) AS batch_key,
+       MAX(COALESCE(o.refund_requested_at, o.updated_at, o.created_at)) AS latest_time
+     ${baseFromSql}
+     GROUP BY batch_key
+     ORDER BY latest_time DESC
+     LIMIT ${safeLimit} OFFSET ${offset}`,
+    orderParams,
+  );
+
+  if (batchRows.length === 0) {
+    return { items: [], page: safePage, page_size: safeLimit, total: totalBatches };
+  }
+
+  // ── 取这些批次下的所有订单（完整批次，不截断） ──
+  const batchKeys = batchRows.map((r) => r.batch_key);
+  const batchNos = batchKeys.filter((k) => !k.startsWith('_single_'));
+  const singleIds = batchKeys.filter((k) => k.startsWith('_single_')).map((k) => Number(k.replace('_single_', '')));
+
+  const detailWhere = [...orderWhere];
+  const detailParams = [...orderParams];
+  const orParts = [];
+  if (batchNos.length > 0) {
+    orParts.push(`ob.batch_no IN (${batchNos.map(() => '?').join(',')})`);
+    detailParams.push(...batchNos);
+  }
+  if (singleIds.length > 0) {
+    orParts.push(`(o.batch_id IS NULL AND o.id IN (${singleIds.map(() => '?').join(',')}))`);
+    detailParams.push(...singleIds);
+  }
+  if (orParts.length > 0) {
+    detailWhere.push(`(${orParts.join(' OR ')})`);
+  }
+
+  const detailFromSql = `
+    FROM orders o
+    LEFT JOIN order_batches ob ON ob.id = o.batch_id
+    LEFT JOIN users u ON u.id = o.user_id
+    LEFT JOIN (
+      SELECT note_id, MAX(title) AS title, MAX(author_name) AS author_name, MAX(avatar_url) AS avatar_url
+      FROM note_basic_cache GROUP BY note_id
+    ) nbc ON nbc.note_id = o.note_id
+    LEFT JOIN (
+      SELECT order_id, SUM(actual_paid_amount) AS actual_paid_amount, SUM(payable_amount) AS payable_amount,
+             SUM(refund_amount) AS refund_amount, MAX(status) AS status
+      FROM account_records WHERE record_type = 'order_charge' GROUP BY order_id
+    ) ar ON ar.order_id = o.id
+    LEFT JOIN (
+      SELECT order_id, MAX(id) AS refund_record_id FROM account_records WHERE record_type = 'refund' GROUP BY order_id
+    ) latest_refund ON latest_refund.order_id = o.id
+    LEFT JOIN account_records rr ON rr.id = latest_refund.refund_record_id
+    WHERE ${detailWhere.join(' AND ')}
+  `;
+
   const [rows] = await db.execute(
-    `
-      SELECT
-        o.*,
-        ob.batch_no,
-        u.username,
-        COALESCE(NULLIF(u.real_name, ''), NULLIF(u.nickname, ''), u.username) AS display_name,
-        nbc.title,
-        nbc.author_name,
-        nbc.avatar_url,
-        ar.actual_paid_amount,
-        rr.after_available_amount AS refund_after_available_amount
-      ${fromSql}
-      ORDER BY COALESCE(o.refund_requested_at, o.updated_at, o.created_at) DESC, o.id DESC
-      LIMIT ${safeLimit} OFFSET ${offset}
-    `,
-    params,
+    `SELECT o.*, ob.batch_no, u.username,
+       COALESCE(NULLIF(u.real_name, ''), NULLIF(u.nickname, ''), u.username) AS display_name,
+       nbc.title, nbc.author_name, nbc.avatar_url, ar.actual_paid_amount,
+       rr.after_available_amount AS refund_after_available_amount
+     ${detailFromSql}
+     ORDER BY ob.batch_no DESC, o.id DESC`,
+    detailParams,
   );
 
   return {
     items: rows.map(serializeRefundRecord),
     page: safePage,
     page_size: safeLimit,
-    total: Number(countRow.total) || 0,
+    total: totalBatches,
   };
 };
 
@@ -4134,8 +4564,36 @@ const getNumericConfig = async (db, group, key, defaultValue) => {
   }
 };
 
+const getBoolConfig = async (db, group, key, defaultValue) => {
+  const [[row]] = await db.execute(
+    `SELECT config_value FROM system_configs
+     WHERE config_group = ? AND config_key = ? AND status = 'active' LIMIT 1`,
+    [group, key],
+  );
+  if (!row) return defaultValue;
+  try {
+    const value = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value;
+    if (typeof value?.enabled === 'boolean') return value.enabled;
+    if (typeof value === 'boolean') return value;
+    return defaultValue;
+  } catch { return defaultValue; }
+};
+
 // 获取用户订单上下文（余额、折扣率、单价等定价信息）
 const getUserOrderContext = async (db, userId, targetType) => {
+  // 先检查全局下单开关
+  const systemSwitchKey = targetType === 'impression'
+    ? 'impression_submit_enabled'
+    : targetType === 'like'
+      ? 'like_submit_enabled'
+      : 'view_submit_enabled';
+  const systemEnabled = await getBoolConfig(db, 'system', systemSwitchKey, true);
+  if (!systemEnabled) {
+    const error = new Error(`${getTargetTypeLabel(targetType)}下单功能已被系统全局禁用`);
+    error.statusCode = 403;
+    throw error;
+  }
+
   const [[user]] = await db.execute(
     `
       SELECT id, discount_rate, impression_discount_rate, price_mode, impression_price_mode,
@@ -4220,17 +4678,19 @@ const getUserOrderContext = async (db, userId, targetType) => {
     ? userUnitPrice
     : packageAmount;
   const discountRate = mode === 'default' ? 1 : normalizeDiscountRate(rawDiscountRate);
-  const discountedUnitPrice =
+  const discountedUnitPriceRaw =
     mode === 'fixed'
       ? userUnitPrice
       : mode === 'quantity'
         ? packageAmount
-      : round4(unitPrice * discountRate);
+      : unitPrice * discountRate;
+  const discountedUnitPrice = round4(discountedUnitPriceRaw);
 
   return {
     availableBalance: round4(balance?.available_amount),
-    discountRate: unitPrice > 0 ? round4(discountedUnitPrice / unitPrice) : discountRate,
+    discountRate: unitPrice > 0 ? round4(discountedUnitPriceRaw / unitPrice) : discountRate,
     discountedUnitPrice,
+    discountedUnitPriceRaw,
     priceBaseQuantity: mode === 'quantity' ? packageBaseQuantity : 1,
     priceMode: mode,
     unitPrice: round4(unitPrice),
@@ -4238,12 +4698,14 @@ const getUserOrderContext = async (db, userId, targetType) => {
 };
 
 // 计算订单的原价、折扣金额和应付金额
+// 使用全精度单价（discountedUnitPriceRaw）计算总额，避免先 round 单价再乘数量导致误差
 const calculateOrderAmounts = (context, orderedQuantity) => {
   const quantity = Number(orderedQuantity) || 0;
+  const rawPrice = context.discountedUnitPriceRaw ?? context.discountedUnitPrice;
   if (context.priceMode === 'quantity') {
     const baseQuantity = Math.max(Number(context.priceBaseQuantity) || 1, 1);
     const originalAmount = round4((quantity / baseQuantity) * context.unitPrice);
-    const payableAmount = round4((quantity / baseQuantity) * context.discountedUnitPrice);
+    const payableAmount = round4((quantity / baseQuantity) * rawPrice);
     return {
       discountAmount: round4(Math.max(originalAmount - payableAmount, 0)),
       originalAmount,
@@ -4252,7 +4714,7 @@ const calculateOrderAmounts = (context, orderedQuantity) => {
   }
 
   const originalAmount = round4(context.unitPrice * quantity);
-  const payableAmount = round4(context.discountedUnitPrice * quantity);
+  const payableAmount = round4(rawPrice * quantity);
   return {
     discountAmount: round4(Math.max(originalAmount - payableAmount, 0)),
     originalAmount,
@@ -5396,8 +5858,9 @@ const listReplenishmentRequests = async (actorUserId, query = {}) => {
   const offset = (safePage - 1) * safePageSize;
   const conditions = [];
   const params = [];
+  conditions.push(`rr.status != 'cancelled'`);
   conditions.push(`(rr.status != 'pending' OR NOT EXISTS (SELECT 1 FROM orders o WHERE o.id = rr.order_id AND o.order_status IN ('refund_requested','refund_calculating','refund_approved','refunded','stopping')))`);
-  if (status && status !== 'all') {
+  if (status && status !== 'all' && status !== 'cancelled') {
     conditions.push('rr.status = ?');
     params.push(status);
   }
@@ -6195,13 +6658,39 @@ const retryBatch = async (userId, batchId) => {
   }
 };
 
+// 获取下单类型开关状态（全局 + 用户级别）
+const getOrderTypeStatus = async (userId) => {
+  const db = getPool();
+  const [viewEnabled, likeEnabled, impressionEnabled] = await Promise.all([
+    getBoolConfig(db, 'system', 'view_submit_enabled', true),
+    getBoolConfig(db, 'system', 'like_submit_enabled', true),
+    getBoolConfig(db, 'system', 'impression_submit_enabled', true),
+  ]);
+  const [[user]] = await db.execute(
+    `SELECT order_view_enabled, order_like_enabled, order_impression_enabled
+     FROM users WHERE id = ? LIMIT 1`,
+    [userId],
+  );
+  const userView = user ? user.order_view_enabled !== 0 : true;
+  const userLike = user ? user.order_like_enabled !== 0 : true;
+  const userImpression = user ? user.order_impression_enabled !== 0 : true;
+  return {
+    view: { global_enabled: viewEnabled, user_enabled: userView },
+    like: { global_enabled: likeEnabled, user_enabled: userLike },
+    impression: { global_enabled: impressionEnabled, user_enabled: userImpression },
+  };
+};
+
 module.exports = {
   approveReplenishmentBatch,
   approveReplenishmentRequest,
   batchApproveRefunds,
   batchRejectRefunds,
   buildPreview,
+  fullRefundBatch,
+  fullRefundOrder,
   getBatchOrders,
+  getOrderTypeStatus,
   listBatchOrderRecords,
   listBatchLinkCheckRecords,
   listConsumptionRecords,

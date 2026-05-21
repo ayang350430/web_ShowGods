@@ -320,6 +320,40 @@ const reviewOrderRefund = async (req, res, next) => {
   }
 };
 
+const fullRefundOrder = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.fullRefundOrder(
+      getCurrentUserId(req),
+      req.params.orderId,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const fullRefundBatch = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.fullRefundBatch(
+      getCurrentUserId(req),
+      req.body?.batch_no,
+    );
+
+    return res.json({
+      code: 0,
+      data,
+      message: 'ok',
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 const batchApproveRefunds = async (req, res, next) => {
   try {
     const data = await batchOrderService.batchApproveRefunds(
@@ -354,10 +388,22 @@ const batchRejectRefunds = async (req, res, next) => {
   }
 };
 
+const getOrderTypeStatus = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.getOrderTypeStatus(getCurrentUserId(req));
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   batchApproveRefunds,
   batchRejectRefunds,
+  fullRefundBatch,
+  fullRefundOrder,
   getBatchOrders,
+  getOrderTypeStatus,
   listBatchOrderRecords,
   listCheckRecords,
   listConsumptionRecords,

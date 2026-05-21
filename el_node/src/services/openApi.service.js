@@ -4,6 +4,7 @@ const { getPool } = require('../config/database');
 const batchOrderService = require('./batchOrder.service');
 
 let openApiKeyTableReady;
+let openApiLogTableReady;
 const progressRateLimitMap = new Map();
 const PROGRESS_RATE_LIMIT_MS = 10_000;
 
@@ -30,6 +31,82 @@ const ensureOpenApiKeyTable = async (db = getPool()) => {
     `);
   }
   await openApiKeyTableReady;
+};
+
+const ensureOpenApiLogTable = async (db = getPool()) => {
+  if (!openApiLogTableReady) {
+    openApiLogTableReady = db.execute(`
+      CREATE TABLE IF NOT EXISTS open_api_logs (
+        id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+        key_id BIGINT UNSIGNED NOT NULL,
+        user_id INT UNSIGNED NOT NULL,
+        endpoint VARCHAR(100) NOT NULL,
+        status_code SMALLINT UNSIGNED NOT NULL DEFAULT 200,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (id),
+        KEY idx_open_api_logs_created (created_at),
+        KEY idx_open_api_logs_user (user_id, created_at),
+        KEY idx_open_api_logs_endpoint (endpoint, created_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+  }
+  await openApiLogTableReady;
+};
+
+const logApiCall = async (keyId, userId, endpoint, statusCode = 200) => {
+  try {
+    const db = getPool();
+    await ensureOpenApiLogTable(db);
+    await db.execute(
+      'INSERT INTO open_api_logs (key_id, user_id, endpoint, status_code) VALUES (?, ?, ?, ?)',
+      [keyId, userId, endpoint, statusCode],
+    );
+  } catch {
+    // fire-and-forget
+  }
+};
+
+const getApiCallStats = async (userId) => {
+  const db = getPool();
+  await ensureOpenApiLogTable(db);
+
+  const now = new Date();
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const yesterdayStart = new Date(todayStart);
+  yesterdayStart.setDate(yesterdayStart.getDate() - 1);
+  const weekStart = new Date(todayStart);
+  weekStart.setDate(weekStart.getDate() - 7);
+
+  const userFilter = userId ? 'AND user_id = ?' : '';
+  const userParams = userId ? [userId] : [];
+
+  const [[stats]] = await db.execute(
+    `
+      SELECT
+        COUNT(1) AS total_calls,
+        COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS today_calls,
+        COALESCE(SUM(CASE WHEN created_at >= ? AND created_at < ? THEN 1 ELSE 0 END), 0) AS yesterday_calls,
+        COALESCE(SUM(CASE WHEN created_at >= ? THEN 1 ELSE 0 END), 0) AS week_calls,
+        COALESCE(SUM(CASE WHEN endpoint = 'preview' THEN 1 ELSE 0 END), 0) AS preview_calls,
+        COALESCE(SUM(CASE WHEN endpoint = 'submit' THEN 1 ELSE 0 END), 0) AS submit_calls,
+        COALESCE(SUM(CASE WHEN endpoint = 'progress' THEN 1 ELSE 0 END), 0) AS progress_calls,
+        COALESCE(SUM(CASE WHEN endpoint = 'stop' THEN 1 ELSE 0 END), 0) AS stop_calls
+      FROM open_api_logs
+      WHERE 1=1 ${userFilter}
+    `,
+    [todayStart, yesterdayStart, todayStart, weekStart, ...userParams],
+  );
+
+  return {
+    preview_calls: Number(stats?.preview_calls) || 0,
+    progress_calls: Number(stats?.progress_calls) || 0,
+    stop_calls: Number(stats?.stop_calls) || 0,
+    submit_calls: Number(stats?.submit_calls) || 0,
+    today_calls: Number(stats?.today_calls) || 0,
+    total_calls: Number(stats?.total_calls) || 0,
+    week_calls: Number(stats?.week_calls) || 0,
+    yesterday_calls: Number(stats?.yesterday_calls) || 0,
+  };
 };
 
 const hashKey = (apiKey) => crypto.createHash('sha256').update(String(apiKey)).digest('hex');
@@ -247,6 +324,7 @@ const assertProgressRateLimit = (keyId) => {
 
 const previewOpenBatch = async (req) => {
   const auth = await authenticateOpenApiKey(req);
+  void logApiCall(auth.key_id, auth.user_id, 'preview');
   const data = await batchOrderService.buildPreview(auth.user_id, req.body, {
     persistCheckRecords: false,
   });
@@ -258,6 +336,7 @@ const previewOpenBatch = async (req) => {
 
 const submitOpenBatch = async (req) => {
   const auth = await authenticateOpenApiKey(req);
+  void logApiCall(auth.key_id, auth.user_id, 'submit');
   const remark = String(req.body?.remark || req.body?.source || '').trim();
   if (!remark) {
     const error = new Error('remark（备注）为必填项');
@@ -306,6 +385,7 @@ const submitOpenBatch = async (req) => {
 
 const getOpenOrderProgress = async (req) => {
   const auth = await authenticateOpenApiKey(req);
+  void logApiCall(auth.key_id, auth.user_id, 'progress');
   assertProgressRateLimit(auth.key_id);
   const { batch_id: batchUuid, batch_no: batchNo, order_id: orderId, order_no: orderNo } = req.query || {};
   if (!batchUuid && !batchNo && !orderId && !orderNo) {
@@ -459,6 +539,7 @@ const getOpenOrderProgress = async (req) => {
 
 const stopOpenOrderTasks = async (req) => {
   const auth = await authenticateOpenApiKey(req);
+  void logApiCall(auth.key_id, auth.user_id, 'stop');
   const {
     batch_id: batchUuid,
     batch_no: batchNo,
@@ -652,6 +733,7 @@ module.exports = {
   authenticateOpenApiKey,
   createApiKey,
   ensureOpenApiKeyTable,
+  getApiCallStats,
   getOpenOrderProgress,
   listApiKeys,
   previewOpenBatch,

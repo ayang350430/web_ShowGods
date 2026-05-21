@@ -11,6 +11,7 @@ router.post('/batch/preview-stream', batchOrderController.previewBatchOrderStrea
 router.post('/batch/search', batchOrderController.searchBatchOrders);
 router.get('/batch/check-records', batchOrderController.listCheckRecords);
 router.get('/batch/records', batchOrderController.listBatchOrderRecords);
+router.get('/batch/type-status', batchOrderController.getOrderTypeStatus);
 router.get('/batch/:batchId/orders', batchOrderController.getBatchOrders);
 router.get('/batch/problem-links', batchOrderController.listProblemLinks);
 router.get('/consumption-records', batchOrderController.listConsumptionRecords);
@@ -27,5 +28,7 @@ router.post('/:orderId/refund-request', batchOrderController.requestOrderRefund)
 router.post('/refund-batch-approve', batchOrderController.batchApproveRefunds);
 router.post('/refund-batch-reject', batchOrderController.batchRejectRefunds);
 router.post('/:orderId/refund-review', batchOrderController.reviewOrderRefund);
+router.post('/:orderId/full-refund', batchOrderController.fullRefundOrder);
+router.post('/full-refund-batch', batchOrderController.fullRefundBatch);
 
 module.exports = router;

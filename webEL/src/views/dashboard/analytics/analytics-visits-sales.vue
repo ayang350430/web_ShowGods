@@ -16,10 +16,10 @@ interface Props {
 
 const props = withDefaults(defineProps<Props>(), {
   data: () => [
-    { name: '可用', value: 0 },
-    { name: '冷却中', value: 0 },
-    { name: '失效', value: 0 },
-    { name: '已禁用', value: 0 },
+    { name: '预览', value: 0 },
+    { name: '提交', value: 0 },
+    { name: '进度查询', value: 0 },
+    { name: '停止', value: 0 },
   ],
 });
 
@@ -42,15 +42,18 @@ function renderChart() {
         animationEasing: 'exponentialInOut',
         animationType: 'scale',
         center: ['50%', '50%'],
-        color: ['#019680', '#e6a23c', '#f56c6c', '#909399'],
+        color: ['#409eff', '#67c23a', '#e6a23c', '#f56c6c'],
         data: normalizeData(props.data),
-        name: '账号池',
-        radius: '80%',
-        roseType: 'radius',
+        label: {
+          formatter: '{b}: {c}',
+        },
+        name: 'API 调用',
+        radius: ['40%', '70%'],
         type: 'pie',
       },
     ],
     tooltip: {
+      formatter: '{b}: {c} 次 ({d}%)',
       trigger: 'item',
     },
   });

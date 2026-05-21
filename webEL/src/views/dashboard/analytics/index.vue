@@ -190,12 +190,16 @@ const orderStatusData = computed<ChartDatum[]>(() => [
   { name: '退款中', value: metrics.value.refunding_total },
 ]);
 
-const xhsAccountData = computed<ChartDatum[]>(() => [
-  { name: '可用', value: metrics.value.xhs_active_total },
-  { name: '冷却中', value: metrics.value.xhs_cooling_total },
-  { name: '失效', value: metrics.value.xhs_invalid_total },
-  { name: '已禁用', value: metrics.value.xhs_disabled_total },
-]);
+const apiCallData = computed<ChartDatum[]>(() => {
+  const stats = summary.value?.api_call_stats;
+  if (!stats) return [];
+  return [
+    { name: '预览', value: stats.preview_calls },
+    { name: '提交', value: stats.submit_calls },
+    { name: '进度查询', value: stats.progress_calls },
+    { name: '停止', value: stats.stop_calls },
+  ];
+});
 
 const amountBreakdownData = computed<ChartDatum[]>(() => {
   const historicalAmount = Math.max(
@@ -331,8 +335,8 @@ onMounted(() => {
       <AnalysisChartCard class="mt-5 md:mt-0 md:mr-4 md:w-1/3" title="订单状态">
         <AnalyticsVisitsSource :data="orderStatusData" />
       </AnalysisChartCard>
-      <AnalysisChartCard class="mt-5 md:mt-0 md:mr-4 md:w-1/3" title="小红书账号池">
-        <AnalyticsVisitsSales :data="xhsAccountData" />
+      <AnalysisChartCard class="mt-5 md:mt-0 md:mr-4 md:w-1/3" title="API 调用分布">
+        <AnalyticsVisitsSales :data="apiCallData" />
       </AnalysisChartCard>
       <AnalysisChartCard class="mt-5 md:mt-0 md:w-1/3" title="金额分布">
         <AnalyticsVisitsData :data="amountBreakdownData" />

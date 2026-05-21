@@ -440,12 +440,17 @@ function orderStatusLabel(status: string) {
   return statusMap[status] || status || '-';
 }
 
-function externalStatusLabel(status: string) {
+function externalStatusLabel(status: string, orderStatus?: string) {
+  // 退款已通过的订单，兜底显示已停止（正常情况后端已更新为 stopped）
+  if (orderStatus === 'refund_approved' && !['stopped', 'completed', 'failed'].includes(status)) return '已停止';
   const map: Record<string, string> = {
+    accepted: '已接单',
     completed: '已完成',
     failed: '失败',
     pending: '等待中',
+    processing: '处理中',
     running: '进行中',
+    stop_requested: '停止请求中',
     stopped: '已停止',
     stopping: '停止中',
   };
@@ -990,101 +995,178 @@ onUnmounted(() => {
           </article>
           <Transition @enter="expandEnter" @after-enter="expandAfterEnter" @leave="expandLeave" @after-leave="expandAfterLeave">
           <div v-if="expandedOrderIds.has(order.id)" class="expand-panel">
-            <div class="expand-grid">
-              <div class="expand-item">
-                <span>订单编号</span><strong>{{ order.order_no }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>订单ID</span><strong>{{ order.id }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>笔记ID</span><strong>{{ order.note_id || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>博主ID</span><strong>{{ order.author_id || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>博主昵称</span><strong>{{ order.author_name || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>笔记标题</span><strong>{{ order.title || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>服务类型</span><strong>{{ targetTypeLabel(order.target_type) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>订单状态</span><strong>{{ orderDisplayStatusLabel(order) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>原始链接</span><strong>{{ order.source_note_url || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>解析链接</span><strong>{{ order.note_url || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>下单数量</span><strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>完成数量</span><strong>{{ (order.completed_quantity || 0).toLocaleString('zh-CN') }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>应付金额</span><strong>{{ formatMoney(order.payable_amount) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>实付金额</span><strong>{{ formatMoney(order.actual_paid_amount) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>退款金额</span><strong>{{ formatMoney(order.refund_amount) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>售后退款</span><strong>{{ refundLabel(order) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>外部任务ID</span><strong>{{ order.external_task_id || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>外部状态</span><strong>{{ externalStatusLabel(order.external_status) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>外部进度</span><strong>{{ order.external_progress ? `${(order.external_progress * 100).toFixed(1)}%` : '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>补单次数</span><strong>{{ order.repair_count || 0 }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>阅读数快照</span><strong>{{ order.snapshot_current_read_count ?? '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>验收阅读数</span><strong>{{ order.snapshot_verified_read_count ?? '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>验收点赞数</span><strong>{{ order.snapshot_verified_like_count ?? '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>点赞数</span><strong>{{ order.like_count ?? '-' }}</strong>
-              </div>
-              <div v-if="order.reason_message" class="expand-item expand-full">
-                <span>备注/原因</span><strong>{{ order.reason_message }}</strong>
-              </div>
-              <div v-if="order.stop_response_message" class="expand-item expand-full">
-                <span>停止原因</span><strong>{{ order.stop_response_message }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>创建时间</span><strong>{{ formatDateTime(order.created_at) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>更新时间</span><strong>{{ formatDateTime(order.updated_at) }}</strong>
+            <!-- 基本信息 -->
+            <div class="exp-section">
+              <div class="exp-section-title">基本信息</div>
+              <div class="exp-grid">
+                <div class="exp-cell">
+                  <span class="exp-label">订单编号</span>
+                  <span class="exp-value mono">{{ order.order_no }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">订单ID</span>
+                  <span class="exp-value mono">{{ order.id }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">服务类型</span>
+                  <span class="exp-value">
+                    <ElTag size="small" :type="order.target_type === 'view' ? 'primary' : order.target_type === 'like' ? 'danger' : 'warning'" disable-transitions>
+                      {{ targetTypeLabel(order.target_type) }}
+                    </ElTag>
+                  </span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">订单状态</span>
+                  <span class="exp-value">
+                    <ElTag size="small" :type="order.order_status === 'completed' ? 'success' : order.order_status === 'failed' ? 'danger' : 'info'" disable-transitions>
+                      {{ orderDisplayStatusLabel(order) }}
+                    </ElTag>
+                  </span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">创建时间</span>
+                  <span class="exp-value">{{ formatDateTime(order.created_at) }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">更新时间</span>
+                  <span class="exp-value">{{ formatDateTime(order.updated_at) }}</span>
+                </div>
               </div>
             </div>
-            <div v-if="canRequestRefund(order)" class="expand-actions">
-              <ElButton
-                type="danger"
-                :loading="refundLoadingId === order.id"
-                @click.stop="handleRequestRefund(order)"
-              >
-                申请退款
-              </ElButton>
+
+            <!-- 笔记信息 -->
+            <div class="exp-section">
+              <div class="exp-section-title">笔记信息</div>
+              <div class="exp-grid">
+                <div class="exp-cell">
+                  <span class="exp-label">笔记标题</span>
+                  <span class="exp-value">{{ order.title || '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">博主昵称</span>
+                  <span class="exp-value">{{ order.author_name || '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">笔记ID</span>
+                  <span class="exp-value mono">{{ order.note_id || '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">博主ID</span>
+                  <span class="exp-value mono">{{ order.author_id || '-' }}</span>
+                </div>
+                <div class="exp-cell exp-wide">
+                  <span class="exp-label">原始链接</span>
+                  <a v-if="order.source_note_url" class="exp-link" :href="order.source_note_url" target="_blank" @click.stop>{{ order.source_note_url }}</a>
+                  <span v-else class="exp-value">-</span>
+                </div>
+                <div class="exp-cell exp-wide">
+                  <span class="exp-label">解析链接</span>
+                  <a v-if="order.note_url" class="exp-link" :href="order.note_url" target="_blank" @click.stop>{{ order.note_url }}</a>
+                  <span v-else class="exp-value">-</span>
+                </div>
+              </div>
             </div>
+
+            <!-- 数量与金额 -->
+            <div class="exp-section">
+              <div class="exp-section-title">数量与金额</div>
+              <div class="exp-stats">
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">下单数量</span>
+                  <span class="exp-stat-num">{{ order.ordered_quantity.toLocaleString('zh-CN') }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">完成数量</span>
+                  <span class="exp-stat-num" :class="{ 'text-success': (order.completed_quantity || 0) >= order.ordered_quantity }">{{ (order.completed_quantity || 0).toLocaleString('zh-CN') }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">应付金额</span>
+                  <span class="exp-stat-num">{{ formatMoney(order.payable_amount) }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">实付金额</span>
+                  <span class="exp-stat-num text-primary">{{ formatMoney(order.actual_paid_amount) }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">退款金额</span>
+                  <span class="exp-stat-num" :class="{ 'text-warning': Number(order.refund_amount) > 0 }">{{ formatMoney(order.refund_amount) }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">售后退款</span>
+                  <span class="exp-stat-num">{{ refundLabel(order) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 外部任务 -->
+            <div class="exp-section">
+              <div class="exp-section-title">外部任务</div>
+              <div class="exp-grid">
+                <div class="exp-cell">
+                  <span class="exp-label">外部任务ID</span>
+                  <span class="exp-value mono">{{ order.external_task_id || '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">外部状态</span>
+                  <span class="exp-value">{{ externalStatusLabel(order.external_status, order.order_status) }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">外部进度</span>
+                  <span class="exp-value">
+                    <template v-if="order.external_progress">
+                      <span class="exp-progress-bar">
+                        <span class="exp-progress-fill" :style="{ width: `${(order.external_progress * 100).toFixed(1)}%` }"></span>
+                        <span class="exp-progress-text">{{ (order.external_progress * 100).toFixed(1) }}%</span>
+                      </span>
+                    </template>
+                    <template v-else>-</template>
+                  </span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">补单次数</span>
+                  <span class="exp-value">{{ order.repair_count || 0 }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 数据快照 -->
+            <div class="exp-section">
+              <div class="exp-section-title">数据快照</div>
+              <div class="exp-grid">
+                <div class="exp-cell">
+                  <span class="exp-label">阅读数快照</span>
+                  <span class="exp-value">{{ order.snapshot_current_read_count ?? '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">验收阅读数</span>
+                  <span class="exp-value">{{ order.snapshot_verified_read_count ?? '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">验收点赞数</span>
+                  <span class="exp-value">{{ order.snapshot_verified_like_count ?? '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">点赞数</span>
+                  <span class="exp-value">{{ order.like_count ?? '-' }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 备注信息 -->
+            <div v-if="order.reason_message || order.stop_response_message" class="exp-section">
+              <div class="exp-section-title">备注信息</div>
+              <div class="exp-notes">
+                <div v-if="order.reason_message" class="exp-note-item">
+                  <span class="exp-label">备注/原因</span>
+                  <span class="exp-value">{{ order.reason_message }}</span>
+                </div>
+                <div v-if="order.stop_response_message" class="exp-note-item">
+                  <span class="exp-label">停止原因</span>
+                  <span class="exp-value">{{ order.stop_response_message }}</span>
+                </div>
+              </div>
+            </div>
+
           </div>
           </Transition>
         </div>
@@ -1136,54 +1218,101 @@ onUnmounted(() => {
           </article>
           <Transition @enter="expandEnter" @after-enter="expandAfterEnter" @leave="expandLeave" @after-leave="expandAfterLeave">
           <div v-if="expandedProblemIds.has(record.id)" class="expand-panel">
-            <div class="expand-grid">
-              <div class="expand-item">
-                <span>记录ID</span><strong>{{ record.id }}</strong>
+            <div class="exp-section">
+              <div class="exp-section-title">基本信息</div>
+              <div class="exp-grid">
+                <div class="exp-cell">
+                  <span class="exp-label">记录ID</span>
+                  <span class="exp-value mono">{{ record.id }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">行号</span>
+                  <span class="exp-value">#{{ record.line_no }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">检测类型</span>
+                  <span class="exp-value">
+                    <ElTag size="small" :type="record.target_type === 'view' ? 'primary' : record.target_type === 'like' ? 'danger' : 'warning'" disable-transitions>
+                      {{ targetTypeLabel(record.target_type) }}
+                    </ElTag>
+                  </span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">处理状态</span>
+                  <span class="exp-value">
+                    <ElTag size="small" :type="record.valid ? 'success' : 'danger'" disable-transitions>
+                      {{ record.valid ? '成功' : '放弃' }}
+                    </ElTag>
+                  </span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">检测批次</span>
+                  <span class="exp-value mono">{{ record.check_batch_no }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">检测时间</span>
+                  <span class="exp-value">{{ formatDateTime(record.created_at) }}</span>
+                </div>
               </div>
-              <div class="expand-item">
-                <span>行号</span><strong>#{{ record.line_no }}</strong>
+            </div>
+
+            <div class="exp-section">
+              <div class="exp-section-title">笔记信息</div>
+              <div class="exp-grid">
+                <div class="exp-cell">
+                  <span class="exp-label">笔记标题</span>
+                  <span class="exp-value">{{ record.title || '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">博主昵称</span>
+                  <span class="exp-value">{{ record.author_name || '-' }}</span>
+                </div>
+                <div class="exp-cell">
+                  <span class="exp-label">笔记ID</span>
+                  <span class="exp-value mono">{{ record.note_id || '-' }}</span>
+                </div>
+                <div class="exp-cell exp-wide">
+                  <span class="exp-label">原始输入</span>
+                  <span class="exp-value mono">{{ record.raw }}</span>
+                </div>
+                <div class="exp-cell exp-wide">
+                  <span class="exp-label">原始链接</span>
+                  <a v-if="record.note_url" class="exp-link" :href="record.note_url" target="_blank" @click.stop>{{ record.note_url }}</a>
+                  <span v-else class="exp-value">-</span>
+                </div>
+                <div class="exp-cell exp-wide">
+                  <span class="exp-label">解析链接</span>
+                  <a v-if="record.resolved_note_url" class="exp-link" :href="record.resolved_note_url" target="_blank" @click.stop>{{ record.resolved_note_url }}</a>
+                  <span v-else class="exp-value">-</span>
+                </div>
               </div>
-              <div class="expand-item">
-                <span>笔记ID</span><strong>{{ record.note_id || '-' }}</strong>
+            </div>
+
+            <div class="exp-section">
+              <div class="exp-section-title">数量与金额</div>
+              <div class="exp-stats">
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">下单数量</span>
+                  <span class="exp-stat-num">{{ record.ordered_quantity.toLocaleString('zh-CN') }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">预估单价</span>
+                  <span class="exp-stat-num">{{ formatMoney(record.payable_amount / Math.max(record.ordered_quantity, 1)) }}</span>
+                </div>
+                <div class="exp-stat-card">
+                  <span class="exp-stat-label">预估金额</span>
+                  <span class="exp-stat-num">{{ formatMoney(record.payable_amount) }}</span>
+                </div>
               </div>
-              <div class="expand-item">
-                <span>博主昵称</span><strong>{{ record.author_name || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>笔记标题</span><strong>{{ record.title || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>检测类型</span><strong>{{ targetTypeLabel(record.target_type) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>原始输入</span><strong>{{ record.raw }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>原始链接</span><strong>{{ record.note_url || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>解析链接</span><strong>{{ record.resolved_note_url || '-' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>下单数量</span><strong>{{ record.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>预估单价</span><strong>{{ formatMoney(record.payable_amount / Math.max(record.ordered_quantity, 1)) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>预估金额</span><strong>{{ formatMoney(record.payable_amount) }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>处理状态</span><strong>{{ record.valid ? '成功' : '放弃' }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>检测批次</span><strong>{{ record.check_batch_no }}</strong>
-              </div>
-              <div v-if="record.errors.length" class="expand-item expand-full">
-                <span>放弃原因</span><strong>{{ record.errors.join('、') }}</strong>
-              </div>
-              <div class="expand-item">
-                <span>检测时间</span><strong>{{ formatDateTime(record.created_at) }}</strong>
+            </div>
+
+            <div v-if="record.errors.length" class="exp-section">
+              <div class="exp-section-title">放弃原因</div>
+              <div class="exp-notes">
+                <div class="exp-note-item">
+                  <span class="exp-label">原因</span>
+                  <span class="exp-value">{{ record.errors.join('、') }}</span>
+                </div>
               </div>
             </div>
           </div>
@@ -1682,7 +1811,7 @@ onUnmounted(() => {
 }
 
 .expand-panel {
-  padding: 16px 20px;
+  padding: 0 20px 16px;
   border: 1px solid var(--el-border-color-light);
   border-top: none;
   border-radius: 0 0 8px 8px;
@@ -1691,40 +1820,170 @@ onUnmounted(() => {
   margin-bottom: 4px;
 }
 
-.expand-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
-  gap: 12px 24px;
+.exp-section {
+  padding-top: 16px;
 }
 
-.expand-item {
+.exp-section + .exp-section {
+  border-top: 1px dashed var(--el-border-color-lighter);
+  margin-top: 14px;
+}
+
+.exp-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+  margin-bottom: 10px;
+  padding-left: 8px;
+  border-left: 3px solid var(--el-color-primary);
+  line-height: 1;
+}
+
+.exp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 10px 20px;
+}
+
+.exp-cell {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   min-width: 0;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
 }
 
-.expand-item > span {
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-}
-
-.expand-item > strong {
-  font-size: 14px;
-  font-weight: 500;
-  word-break: break-all;
-}
-
-.expand-full {
+.exp-wide {
   grid-column: 1 / -1;
+}
+
+.exp-label {
+  color: var(--el-text-color-secondary);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.exp-value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--el-text-color-primary);
+  word-break: break-all;
+  line-height: 1.4;
+}
+
+.exp-value.mono {
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 12px;
+  letter-spacing: -0.2px;
+}
+
+.exp-link {
+  font-size: 12px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  color: var(--el-color-primary);
+  word-break: break-all;
+  line-height: 1.4;
+  text-decoration: none;
+}
+
+.exp-link:hover {
+  text-decoration: underline;
+}
+
+.exp-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 10px;
+}
+
+.exp-stat-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 8px;
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
+}
+
+.exp-stat-label {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.exp-stat-num {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+.exp-stat-num.text-primary {
+  color: var(--el-color-primary);
+}
+
+.exp-stat-num.text-success {
+  color: var(--el-color-success);
+}
+
+.exp-stat-num.text-warning {
+  color: var(--el-color-warning);
+}
+
+.exp-notes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.exp-note-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
+}
+
+.exp-progress-bar {
+  display: inline-flex;
+  align-items: center;
+  position: relative;
+  width: 140px;
+  height: 16px;
+  background: var(--el-border-color-lighter);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.exp-progress-fill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  height: 100%;
+  background: var(--el-color-primary);
+  border-radius: 8px;
+  transition: width 0.3s;
+}
+
+.exp-progress-text {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  text-align: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 0 2px rgba(0, 0, 0, 0.3);
 }
 
 .expand-actions {
   display: flex;
   justify-content: flex-end;
-  padding-top: 12px;
-  border-top: 1px solid var(--el-border-color-lighter);
-  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+  margin-top: 14px;
 }
 
 .empty-state {

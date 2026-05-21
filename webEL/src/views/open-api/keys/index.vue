@@ -64,12 +64,22 @@ const apiDocs = [
   // 多条示例：
   // “content”: “http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000\\nhttp://xhslink.com/o/ghi789 500”
 }`,
+    curlExample: `curl -X POST "http://你的域名/api/open/orders/preview" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer <你的API Key>" \\
+  -d '{
+    "target_type": "view",
+    "content": "http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000"
+  }'`,
+    responseFields: [
+      { name: 'data.total_count', type: 'number', desc: '提交的总链接数' },
+      { name: 'data.valid_count', type: 'number', desc: '校验通过、可以下单的链接数' },
+      { name: 'data.invalid_count', type: 'number', desc: '校验失败的链接数' },
+      { name: 'data.total_amount', type: 'number', desc: '预估总费用（元），不会实际扣款' },
+    ],
     responseExample: `{
-  // 0 表示成功，非 0 表示失败
   "code": 0,
-  // 本次接口处理结果说明
   "message": "ok",
-  // 预校验结果，不会创建订单，也不会扣余额
   "data": {
     "total_count": 1,
     "valid_count": 1,
@@ -130,6 +140,22 @@ const apiDocs = [
   // 多条示例：
   // “content”: “http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000\\nhttp://xhslink.com/o/ghi789 500”
 }`,
+    curlExample: `curl -X POST "http://你的域名/api/open/orders/submit" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer <你的API Key>" \\
+  -d '{
+    "target_type": "view",
+    "agree_policy": true,
+    "remark": "merchant_order=MO202605180001",
+    "content": "http://xhslink.com/o/abc123 1000\\nhttp://xhslink.com/o/def456 2000"
+  }'`,
+    responseFields: [
+      { name: 'data.batch_id', type: 'string', desc: '批次 ID（UUID），后续查询进度、停止任务时传此值' },
+      { name: 'data.batch_no', type: 'string', desc: '批次编号，页面可见的编号' },
+      { name: 'data.submitted_count', type: 'number', desc: '成功提交的订单数' },
+      { name: 'data.failed_count', type: 'number', desc: '提交失败的订单数' },
+      { name: 'data.total_amount', type: 'number', desc: '本次下单实际扣款总金额（元）' },
+    ],
     responseExample: `{
   "code": 0,
   "message": "ok",
@@ -183,6 +209,22 @@ const apiDocs = [
       },
     ],
     path: '/api/open/orders/progress',
+    curlExample: `curl "http://你的域名/api/open/orders/progress?batch_id=62db9f35-1228-4fe9-962b-57568c5bb690" \\
+  -H "Authorization: Bearer <你的API Key>"`,
+    responseFields: [
+      { name: 'data.count', type: 'number', desc: '匹配到的批次数量' },
+      { name: 'data.batches[].batch_id', type: 'string', desc: '批次 ID' },
+      { name: 'data.batches[].batch_no', type: 'string', desc: '批次编号' },
+      { name: 'data.batches[].status', type: 'string', desc: '批次状态：processing / completed / stopped' },
+      { name: 'data.batches[].progress.completed_quantity', type: 'number', desc: '已完成数量' },
+      { name: 'data.batches[].progress.total_quantity', type: 'number', desc: '目标总数量' },
+      { name: 'data.batches[].progress.percent', type: 'number', desc: '完成百分比（0-100）' },
+      { name: 'data.batches[].orders[].order_id', type: 'number', desc: '订单自增 ID' },
+      { name: 'data.batches[].orders[].order_no', type: 'string', desc: '订单编号' },
+      { name: 'data.batches[].orders[].order_status', type: 'string', desc: '订单状态：pending / running / completed / stopped' },
+      { name: 'data.batches[].orders[].progress', type: 'number', desc: '订单已完成数量' },
+      { name: 'data.batches[].orders[].progress_percent', type: 'number', desc: '订单完成百分比（0-100）' },
+    ],
     requestExample: `GET /api/open/orders/progress?batch_id=62db9f35-1228-4fe9-962b-57568c5bb690`,
     responseExample: `{
   "code": 0,
@@ -267,6 +309,25 @@ const apiDocs = [
   // 选填：停止原因，会写入订单记录和上游状态变更原因
   "reason": "merchant cancel requested"
 }`,
+    curlExample: `curl -X POST "http://你的域名/api/open/orders/stop" \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer <你的API Key>" \\
+  -d '{
+    "batch_id": "62db9f35-1228-4fe9-962b-57568c5bb690",
+    "reason": "merchant cancel requested"
+  }'`,
+    responseFields: [
+      { name: 'data.total_count', type: 'number', desc: '匹配到的订单总数' },
+      { name: 'data.stopped_count', type: 'number', desc: '成功停止的订单数' },
+      { name: 'data.skipped_count', type: 'number', desc: '跳过的订单数（已完成或已停止）' },
+      { name: 'data.failed_count', type: 'number', desc: '停止失败的订单数' },
+      { name: 'data.orders[].batch_id', type: 'string', desc: '批次 ID' },
+      { name: 'data.orders[].batch_no', type: 'string', desc: '批次编号' },
+      { name: 'data.orders[].order_id', type: 'number', desc: '订单自增 ID' },
+      { name: 'data.orders[].order_no', type: 'string', desc: '订单编号' },
+      { name: 'data.orders[].order_status', type: 'string', desc: '停止后的订单状态' },
+      { name: 'data.orders[].stop_status', type: 'string', desc: '停止结果：success / skipped / failed' },
+    ],
     responseExample: `{
   "code": 0,
   "message": "ok",
@@ -411,6 +472,15 @@ function highlightCode(value: string) {
     .replace(/(:\s*)(true|false|null)\b/g, '$1<span class="code-literal">$2</span>');
 }
 
+function highlightCurl(value: string) {
+  return escapeHtml(value)
+    .replace(/^(curl)\b/gm, '<span class="curl-cmd">$1</span>')
+    .replace(/(-[XHGI]|--\w[\w-]*)\b/g, '<span class="curl-flag">$1</span>')
+    .replace(/(&quot;[^&]*?&quot;)/g, '<span class="curl-string">$1</span>')
+    .replace(/(&#39;[\s\S]*?&#39;)/g, '<span class="curl-body">$1</span>')
+    .replace(/(\\)$/gm, '<span class="curl-escape">$1</span>');
+}
+
 onMounted(loadKeys);
 </script>
 
@@ -529,6 +599,16 @@ onMounted(loadKeys);
           <el-table-column label="说明" prop="desc" min-width="260" />
         </el-table>
 
+        <div v-if="doc.curlExample" class="curl-section">
+          <div class="code-panel">
+            <div class="code-title">
+              <span>调用示例 (cURL)</span>
+              <button type="button" @click="copyText(doc.curlExample)">复制</button>
+            </div>
+            <pre class="curl-pre"><code v-html="highlightCurl(doc.curlExample)"></code></pre>
+          </div>
+        </div>
+
         <div class="code-grid">
           <div class="code-panel">
             <div class="code-title">
@@ -544,6 +624,26 @@ onMounted(loadKeys);
             </div>
             <pre><code v-html="highlightCode(doc.responseExample)"></code></pre>
           </div>
+        </div>
+
+        <div v-if="doc.responseFields && doc.responseFields.length > 0" class="response-fields-section">
+          <h4>响应字段说明</h4>
+          <table class="resp-table">
+            <thead>
+              <tr>
+                <th style="width: 280px;">字段</th>
+                <th style="width: 130px;">类型</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="field in doc.responseFields" :key="field.name">
+                <td><code>{{ field.name }}</code></td>
+                <td><span class="type-tag">{{ field.type }}</span></td>
+                <td>{{ field.desc }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </article>
     </section>
@@ -707,7 +807,7 @@ onMounted(loadKeys);
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 8px;
   padding: 14px;
-  background: var(--el-fill-color-extra-light);
+  background: var(--el-fill-color-light);
 }
 
 .new-key-box {
@@ -793,6 +893,7 @@ onMounted(loadKeys);
   background: var(--el-fill-color-light);
   padding: 8px 10px;
   font-family: Consolas, monospace;
+  color: var(--el-text-color-primary);
 }
 
 .doc-panel {
@@ -824,17 +925,35 @@ onMounted(loadKeys);
 }
 
 .method-post {
-  background: #fff2e8;
-  color: #d46b08;
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
 }
 
 .method-get {
-  background: #e6f7ff;
-  color: #0958d9;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
 }
 
 .param-table {
   margin-top: 12px;
+}
+
+.api-card-head code {
+  border-radius: 4px;
+  background: var(--el-fill-color-light);
+  padding: 3px 8px;
+  color: var(--el-text-color-primary);
+  font-family: Consolas, monospace;
+}
+
+:deep(.el-table) {
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: var(--el-fill-color-light);
+}
+
+:deep(.el-table th.el-table__cell) {
+  background: var(--el-fill-color-light);
 }
 
 .code-grid {
@@ -889,6 +1008,91 @@ pre {
 
 :deep(.code-literal) {
   color: #c084fc;
+}
+
+.response-fields-section {
+  margin-top: 14px;
+}
+
+.response-fields-section h4 {
+  margin: 0 0 10px;
+  padding-left: 8px;
+  border-left: 3px solid var(--el-color-primary);
+  color: var(--el-text-color-primary);
+  font-size: 14px;
+}
+
+.resp-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.resp-table th,
+.resp-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border: 1px solid var(--el-border-color-lighter);
+  color: var(--el-text-color-primary);
+}
+
+.resp-table thead th {
+  background: var(--el-fill-color-light);
+  color: var(--el-text-color-regular);
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.resp-table tbody tr:hover {
+  background: var(--el-fill-color-lighter);
+}
+
+.resp-table code {
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--el-fill-color);
+  color: var(--el-color-primary);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}
+
+.type-tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+}
+
+.curl-section {
+  margin-top: 14px;
+}
+
+.curl-pre {
+  min-height: auto !important;
+}
+
+:deep(.curl-cmd) {
+  color: #34d399;
+  font-weight: 700;
+}
+
+:deep(.curl-flag) {
+  color: #93c5fd;
+}
+
+:deep(.curl-string) {
+  color: #fbbf24;
+}
+
+:deep(.curl-body) {
+  color: #a5b4fc;
+}
+
+:deep(.curl-escape) {
+  color: #6b7280;
 }
 
 @media (max-width: 1100px) {

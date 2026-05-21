@@ -611,6 +611,7 @@ const seedGoodsConfigs = async (db) => {
     ['pricing', 'impression_unit_price', JSON.stringify({ value: 0.01 }), 'Impression unit price'],
     ['order', 'min_order_quantity', JSON.stringify({ value: 10 }), '单条最低下单量'],
     ['system', 'view_submit_enabled', JSON.stringify({ enabled: true }), 'Enable view orders'],
+    ['system', 'like_submit_enabled', JSON.stringify({ enabled: true }), 'Enable like orders'],
     [
       'system',
       'impression_submit_enabled',

@@ -119,9 +119,29 @@ const updateUserOrderTypes = async (req, res, next) => {
   }
 };
 
+const getOrderSwitches = async (req, res, next) => {
+  try {
+    const data = await adminPermissionService.getOrderSwitches(getCurrentUserId(req));
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const updateOrderSwitches = async (req, res, next) => {
+  try {
+    const data = await adminPermissionService.updateOrderSwitches(getCurrentUserId(req), req.body);
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
+  getOrderSwitches,
   listRoles,
   listUsers,
+  updateOrderSwitches,
   updateUserBalance,
   updateUserDiscounts,
   updateUserOrderTypes,

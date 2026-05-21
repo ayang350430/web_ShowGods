@@ -4,6 +4,8 @@ const adminPermissionController = require('../controllers/adminPermission.contro
 
 const router = express.Router();
 
+router.get('/order-switches', adminPermissionController.getOrderSwitches);
+router.put('/order-switches', adminPermissionController.updateOrderSwitches);
 router.get('/roles', adminPermissionController.listRoles);
 router.get('/users', adminPermissionController.listUsers);
 router.put('/users/:userId/balance', adminPermissionController.updateUserBalance);

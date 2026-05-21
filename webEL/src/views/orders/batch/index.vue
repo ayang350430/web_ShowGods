@@ -12,6 +12,7 @@ import {
   ElDrawer,
   ElInput,
   ElMessage,
+  ElMessageBox,
   ElOption,
   ElRadioButton,
   ElRadioGroup,
@@ -27,6 +28,7 @@ import {
   getProblemLinkRecordsApi,
   previewBatchOrderSilentApi,
   previewBatchOrderStreamApi,
+  getOrderTypeStatusApi,
   saveProblemLinkRecordsApi,
   submitBatchOrderApi,
 } from '#/api';
@@ -79,6 +81,7 @@ const selectedCheckBatchNo = ref('');
 const latestPreviewBatchNo = ref('');
 const submitting = ref(false);
 const targetType = ref<'impression' | 'like' | 'view'>('view');
+const typeStatus = ref<OrderApi.OrderTypeStatus>();
 const settlementLabels = {
   totalQuantity: '\u603b\u6570',
 };
@@ -103,11 +106,28 @@ const formatErrorCount = computed(() => {
   return errors;
 });
 
+const typeDisabledMessage = computed(() => {
+  if (!typeStatus.value) return '';
+  const current = typeStatus.value[targetType.value];
+  if (!current) return '';
+  const label = { impression: '曝光', like: '点赞', view: '阅读' }[targetType.value];
+  if (!current.global_enabled) return `${label}下单功能已被系统全局关闭，所有用户均无法提交${label}订单`;
+  if (!current.user_enabled) return `${label}下单功能已被管理员对当前账号禁用`;
+  return '';
+});
+
+function isTypeDisabled(type: 'impression' | 'like' | 'view') {
+  if (!typeStatus.value) return false;
+  const s = typeStatus.value[type];
+  return !s.global_enabled || !s.user_enabled;
+}
+
 const canSubmit = computed(
   () =>
     Boolean(preview.value?.can_submit) &&
     agreePolicy.value &&
-    connectionOk.value === true,
+    connectionOk.value === true &&
+    !typeDisabledMessage.value,
 );
 
 const invalidItemsSummary = computed(() => {
@@ -606,6 +626,55 @@ async function copySelectedProblemBatchLinks() {
   }
 }
 
+async function copyAllProblemLinks() {
+  const allInvalid = removedProblemLinks.value.filter((r) => !r.valid);
+  if (allInvalid.length === 0) {
+    ElMessage.warning('暂无问题链接可复制');
+    return;
+  }
+  const unique = [...new Set(allInvalid.map((r) => r.raw))];
+  const copyText = unique.join('\n');
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(copyText);
+    } else if (!copyTextWithFallback(copyText)) {
+      throw new Error('Clipboard fallback failed');
+    }
+    ElMessage.success(`已复制 ${unique.length} 条问题链接`);
+  } catch {
+    if (copyTextWithFallback(copyText)) {
+      ElMessage.success(`已复制 ${unique.length} 条问题链接`);
+      return;
+    }
+    ElMessage.error('复制失败，浏览器未授权剪贴板');
+  }
+}
+
+async function copyInvalidPreviewLinks() {
+  const items = preview.value?.items ?? [];
+  const invalidItems = items.filter((item) => !item.valid);
+  if (invalidItems.length === 0) {
+    ElMessage.warning('暂无问题链接可复制');
+    return;
+  }
+  const links = [...new Set(invalidItems.map((item) => item.raw || item.note_url || item.note_id || '').filter(Boolean))];
+  const copyText = links.join('\n');
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(copyText);
+    } else if (!copyTextWithFallback(copyText)) {
+      throw new Error('Clipboard fallback failed');
+    }
+    ElMessage.success(`已复制 ${links.length} 条问题链接`);
+  } catch {
+    if (copyTextWithFallback(copyText)) {
+      ElMessage.success(`已复制 ${links.length} 条问题链接`);
+      return;
+    }
+    ElMessage.error('复制失败，浏览器未授权剪贴板');
+  }
+}
+
 async function loadOrderRecords(
   preferredBatchNo = '',
   options: { silent?: boolean; skipStatusSync?: boolean } = {},
@@ -774,6 +843,12 @@ async function checkConnection(showSuccess = false) {
 }
 
 async function validateContent() {
+  // 先刷新类型开关状态
+  await loadTypeStatus();
+  if (typeDisabledMessage.value) {
+    ElMessage.error(typeDisabledMessage.value);
+    return;
+  }
   const batchContent = getCurrentBatchContent();
   previewing.value = true;
   streamTotal.value = 0;
@@ -815,9 +890,9 @@ async function validateContent() {
       return;
     }
     ElMessage.success('预校验通过');
-  } catch (error) {
+  } catch (error: any) {
     console.error('[Batch Preview] error', error);
-    throw error;
+    ElMessage.error(error?.message || '预校验失败');
   } finally {
     previewing.value = false;
     streamTotal.value = 0;
@@ -826,12 +901,38 @@ async function validateContent() {
 }
 
 async function submitOrder() {
+  await loadTypeStatus();
+  if (typeDisabledMessage.value) {
+    ElMessage.error(typeDisabledMessage.value);
+    return;
+  }
   if (connectionOk.value !== true) {
     await checkConnection();
   }
   if (connectionOk.value !== true) {
     return;
   }
+
+  const typeLabel = { impression: '曝光', like: '点赞', view: '阅读' }[targetType.value] || '';
+  const confirmText = `确认下单${typeLabel}`;
+  let userInput: { value: string } | undefined;
+  try {
+    userInput = await ElMessageBox.prompt(
+      `即将提交 ${preview.value?.valid_count || 0} 条${typeLabel}订单，总计 ${(preview.value?.total_count || 0).toLocaleString('zh-CN')} 个，预计费用 ￥${(preview.value?.total_amount || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}。\n\n请输入「${confirmText}」以确认：`,
+      '二次确认',
+      {
+        confirmButtonText: '确认提交',
+        cancelButtonText: '取消',
+        inputPattern: new RegExp(`^${confirmText}$`),
+        inputErrorMessage: `请输入「${confirmText}」`,
+        inputPlaceholder: confirmText,
+        type: 'warning',
+      },
+    );
+  } catch {
+    return;
+  }
+  if (userInput?.value !== confirmText) return;
 
   submitting.value = true;
   try {
@@ -881,8 +982,17 @@ watch(currentInputKey, (key) => {
   }
 });
 
+async function loadTypeStatus() {
+  try {
+    typeStatus.value = await getOrderTypeStatusApi();
+  } catch {
+    // ignore
+  }
+}
+
 onMounted(() => {
   checkConnection();
+  loadTypeStatus();
   loadOrderRecords();
   loadProblemLinkRecords();
 });
@@ -915,11 +1025,20 @@ onMounted(() => {
             <p>格式：链接 + 数量，支持空格或 Tab 分隔。</p>
           </div>
           <ElRadioGroup v-model="targetType" size="small" @change="validateContent">
-            <ElRadioButton label="view">阅读</ElRadioButton>
-            <ElRadioButton label="like">点赞</ElRadioButton>
-            <ElRadioButton label="impression">曝光</ElRadioButton>
+            <ElRadioButton label="view">阅读<span v-if="isTypeDisabled('view')" class="type-off-dot" title="已关闭">●</span></ElRadioButton>
+            <ElRadioButton label="like">点赞<span v-if="isTypeDisabled('like')" class="type-off-dot" title="已关闭">●</span></ElRadioButton>
+            <ElRadioButton label="impression">曝光<span v-if="isTypeDisabled('impression')" class="type-off-dot" title="已关闭">●</span></ElRadioButton>
           </ElRadioGroup>
         </div>
+
+        <ElAlert
+          v-if="typeDisabledMessage"
+          :title="typeDisabledMessage"
+          type="error"
+          show-icon
+          :closable="false"
+          class="type-disabled-alert"
+        />
 
         <label class="field-label">
           批量内容（{{ { view: '阅读', like: '点赞', impression: '曝光' }[targetType] }}）
@@ -1068,6 +1187,13 @@ onMounted(() => {
         <div class="invalid-panel-head">
           <component :is="AlertIcon" />
           <strong>{{ invalidItemsSummary.count }} 条校验失败</strong>
+          <ElButton
+            size="small"
+            type="warning"
+            @click="copyInvalidPreviewLinks"
+          >
+            一键复制
+          </ElButton>
         </div>
         <div v-for="(group, idx) in invalidItemsSummary.groups" :key="idx" class="invalid-group">
           <ElTag size="small" type="danger" effect="dark">
@@ -1114,6 +1240,14 @@ onMounted(() => {
               :value="record.key"
             />
           </ElSelect>
+          <ElButton
+            v-if="removedProblemLinks.filter((r) => !r.valid).length > 0"
+            size="small"
+            type="warning"
+            @click="copyAllProblemLinks"
+          >
+            一键复制所有问题链接
+          </ElButton>
         </div>
         <article
           v-if="selectedOrderBatch"
@@ -1435,6 +1569,17 @@ onMounted(() => {
   margin-bottom: 14px;
   padding-bottom: 14px;
   border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.type-disabled-alert {
+  margin-bottom: 14px;
+}
+
+.type-off-dot {
+  margin-left: 3px;
+  color: var(--el-color-danger);
+  font-size: 8px;
+  vertical-align: super;
 }
 
 .panel h2 {

@@ -163,7 +163,10 @@ export namespace OrderApi {
     order_id: number;
     order_items: Array<{
       actual_paid_amount: number;
+      completed_quantity: number;
       external_status: string;
+      note_id: string;
+      note_url: string;
       order_id: number;
       order_no: string;
       order_status: string;
@@ -172,6 +175,7 @@ export namespace OrderApi {
       refund_amount: number;
       refund_requested_at: null | string;
       refunded_quantity: number;
+      target_type: string;
     }>;
     order_no: string;
     order_status: string;
@@ -295,6 +299,17 @@ export namespace OrderApi {
     saved_count: number;
   }
 
+  export interface OrderTypeStatusItem {
+    global_enabled: boolean;
+    user_enabled: boolean;
+  }
+
+  export interface OrderTypeStatus {
+    impression: OrderTypeStatusItem;
+    like: OrderTypeStatusItem;
+    view: OrderTypeStatusItem;
+  }
+
   export interface HealthResult {
     status: string;
     timestamp: string;
@@ -362,7 +377,12 @@ export async function previewBatchOrderStreamApi(
   });
 
   if (!response.ok || !response.body) {
-    throw new Error(`Preview stream failed: ${response.status}`);
+    let errorMessage = `预校验请求失败 (${response.status})`;
+    try {
+      const errorBody = await response.json();
+      if (errorBody?.message) errorMessage = errorBody.message;
+    } catch {}
+    throw new Error(errorMessage);
   }
 
   const reader = response.body.getReader();
@@ -558,6 +578,33 @@ export async function reviewOrderRefundApi(
   }>(`/v1/orders/${orderId}/refund-review`, data);
 }
 
+export async function fullRefundOrderApi(orderId: number) {
+  return requestClient.post<{
+    after_balance: number;
+    already_refunded: number;
+    message?: string;
+    order_id: number;
+    order_no: string;
+    refund_amount: number;
+    total_paid: number;
+  }>(`/v1/orders/${orderId}/full-refund`);
+}
+
+export async function fullRefundBatchApi(batchNo: string) {
+  return requestClient.post<{
+    failed: number;
+    results: Array<{
+      error?: string;
+      order_id: number;
+      refund_amount?: number;
+      success: boolean;
+    }>;
+    succeeded: number;
+    total: number;
+    total_refunded: number;
+  }>('/v1/orders/full-refund-batch', { batch_no: batchNo });
+}
+
 export async function batchApproveRefundsApi(data: {
   batch_no?: string;
   order_ids?: number[];
@@ -631,5 +678,11 @@ export async function createOpenApiKeyApi(data: { name?: string }) {
 export async function deleteOpenApiKeyApi(keyId: number) {
   return requestClient.delete<{ id: number; status: string }>(
     `/v1/open-api/keys/${keyId}`,
+  );
+}
+
+export async function getOrderTypeStatusApi() {
+  return requestClient.get<OrderApi.OrderTypeStatus>(
+    '/v1/orders/batch/type-status',
   );
 }

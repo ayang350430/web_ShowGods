@@ -196,6 +196,20 @@ export async function updateAdminUserOrderTypesApi(
   }>(`/v1/admin/permissions/users/${userId}/order-types`, data);
 }
 
+export interface OrderSwitches {
+  impression_submit_enabled: boolean;
+  like_submit_enabled: boolean;
+  view_submit_enabled: boolean;
+}
+
+export async function getAdminOrderSwitchesApi() {
+  return requestClient.get<OrderSwitches>('/v1/admin/permissions/order-switches');
+}
+
+export async function updateAdminOrderSwitchesApi(data: Partial<OrderSwitches>) {
+  return requestClient.put<OrderSwitches>('/v1/admin/permissions/order-switches', data);
+}
+
 export async function updateAdminUserDiscountsApi(
   userId: number,
   data: {

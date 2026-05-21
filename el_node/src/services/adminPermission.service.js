@@ -658,9 +658,67 @@ const updateUserOrderTypes = async (actorUserId, targetUserId, { order_view_enab
   };
 };
 
+// ─── 全局下单开关 ───────────────────────────────────────
+const getBoolConfig = async (db, group, key, defaultValue) => {
+  const [[row]] = await db.execute(
+    `SELECT config_value FROM system_configs
+     WHERE config_group = ? AND config_key = ? AND status = 'active' LIMIT 1`,
+    [group, key],
+  );
+  if (!row) return defaultValue;
+  try {
+    const value = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value;
+    if (typeof value?.enabled === 'boolean') return value.enabled;
+    if (typeof value === 'boolean') return value;
+    return defaultValue;
+  } catch { return defaultValue; }
+};
+
+const getOrderSwitches = async (actorUserId) => {
+  const db = getPool();
+  await assertAdmin(db, actorUserId);
+
+  const [viewEnabled, likeEnabled, impressionEnabled] = await Promise.all([
+    getBoolConfig(db, 'system', 'view_submit_enabled', true),
+    getBoolConfig(db, 'system', 'like_submit_enabled', true),
+    getBoolConfig(db, 'system', 'impression_submit_enabled', true),
+  ]);
+
+  return {
+    impression_submit_enabled: impressionEnabled,
+    like_submit_enabled: likeEnabled,
+    view_submit_enabled: viewEnabled,
+  };
+};
+
+const updateOrderSwitches = async (actorUserId, data) => {
+  const db = getPool();
+  await assertAdmin(db, actorUserId);
+
+  const keys = [
+    ['view_submit_enabled', data.view_submit_enabled],
+    ['like_submit_enabled', data.like_submit_enabled],
+    ['impression_submit_enabled', data.impression_submit_enabled],
+  ];
+
+  for (const [key, enabled] of keys) {
+    if (typeof enabled !== 'boolean') continue;
+    await db.execute(
+      `INSERT INTO system_configs (config_group, config_key, config_value, status, description, version)
+       VALUES ('system', ?, ?, 'active', ?, 1)
+       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), version = version + 1`,
+      [key, JSON.stringify({ enabled }), `Global switch: ${key}`],
+    );
+  }
+
+  return getOrderSwitches(actorUserId);
+};
+
 module.exports = {
+  getOrderSwitches,
   listRoles,
   listUsers,
+  updateOrderSwitches,
   updateUserBalance,
   updateUserDiscounts,
   updateUserOrderTypes,

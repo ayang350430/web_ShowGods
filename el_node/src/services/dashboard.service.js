@@ -1,4 +1,5 @@
 const { getPool } = require('../config/database');
+const openApiService = require('./openApi.service');
 
 const ORDER_STATUS = {
   completed: 'completed',
@@ -590,9 +591,20 @@ const getDashboardSummary = async (userId, rankingPeriod = 'all') => {
     [userId],
   );
 
+  let apiCallStats = {
+    preview_calls: 0, progress_calls: 0, stop_calls: 0, submit_calls: 0,
+    today_calls: 0, total_calls: 0, week_calls: 0, yesterday_calls: 0,
+  };
+  try {
+    apiCallStats = await openApiService.getApiCallStats(isAdmin ? null : userId);
+  } catch {
+    // table may not exist yet
+  }
+
   const viewUnitPrice = await getNumericConfig(db, 'pricing', 'view_unit_price', 0.01);
   const impressionUnitPrice = await getNumericConfig(db, 'pricing', 'impression_unit_price', 0.01);
   const viewSubmitEnabled = await getBoolConfig(db, 'system', 'view_submit_enabled', true);
+  const likeSubmitEnabled = await getBoolConfig(db, 'system', 'like_submit_enabled', true);
   const impressionSubmitEnabled = await getBoolConfig(db, 'system', 'impression_submit_enabled', true);
   const viewDiscountRate = normalizeDiscountRate(currentUser.discount_rate);
   const impressionDiscountRate = normalizeDiscountRate(currentUser.impression_discount_rate);
@@ -600,6 +612,7 @@ const getDashboardSummary = async (userId, rankingPeriod = 'all') => {
   return {
     alert_orders: serializeOrderRows(alertOrders, alertBatchMap),
     all_users_overview: [],
+    api_call_stats: apiCallStats,
     is_admin: isAdmin,
     metrics: {
       available_balance: round4(availableBalance),
@@ -635,6 +648,7 @@ const getDashboardSummary = async (userId, rankingPeriod = 'all') => {
       impression_discount_rate: impressionDiscountRate,
       impression_submit_enabled: impressionSubmitEnabled,
       impression_unit_price: impressionUnitPrice,
+      like_submit_enabled: likeSubmitEnabled,
       view_discount_rate: viewDiscountRate,
       view_submit_enabled: viewSubmitEnabled,
       view_unit_price: viewUnitPrice,
