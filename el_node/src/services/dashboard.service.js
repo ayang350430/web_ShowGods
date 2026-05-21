@@ -475,7 +475,9 @@ const getDashboardSummary = async (userId, rankingPeriod = 'all') => {
     scopeParams,
   );
   const recentNetAmount = round4(
-    recentRecordRows.reduce((total, row) => total + (Number(row.net_amount) || 0), 0),
+    recentRecordRows
+      .filter((row) => row.record_type === 'order_charge' || row.record_type === 'refund')
+      .reduce((total, row) => total + (Number(row.net_amount) || 0), 0),
   );
 
   const now = new Date();

@@ -1871,10 +1871,9 @@ const listConsumptionRecords = async (userId, query = {}) => {
   const [[summaryRow]] = await db.execute(
     `
       SELECT
-        COALESCE(SUM(CASE WHEN ar.direction = 'debit' THEN ar.actual_paid_amount ELSE 0 END), 0) AS expense_amount,
-        COALESCE(SUM(CASE WHEN ar.direction = 'credit' THEN ar.actual_paid_amount ELSE 0 END), 0) AS income_amount,
-        COALESCE(SUM(ar.refund_amount), 0) AS refund_amount,
-        COALESCE(SUM(ar.net_amount), 0) AS net_amount
+        COALESCE(SUM(CASE WHEN ar.record_type = 'order_charge' THEN ar.actual_paid_amount ELSE 0 END), 0) AS expense_amount,
+        COALESCE(SUM(CASE WHEN ar.record_type = 'refund' THEN ar.refund_amount ELSE 0 END), 0) AS refund_amount,
+        COALESCE(SUM(CASE WHEN ar.record_type IN ('order_charge', 'refund') THEN ar.net_amount ELSE 0 END), 0) AS net_amount
       ${fromSql}
     `,
     params,

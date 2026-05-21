@@ -95,14 +95,12 @@ const overviewCards = computed(() => [
 ]);
 
 const walletItems = computed(() => {
-  const expenseTotal = recentRecords.value.reduce(
-    (sum, record) => sum + Math.abs(record.net_amount || 0),
-    0,
-  );
-  const refundTotal = recentRecords.value.reduce(
-    (sum, record) => sum + Math.abs(record.refund_amount || 0),
-    0,
-  );
+  const expenseTotal = recentRecords.value
+    .filter((r) => r.record_type === 'order_charge')
+    .reduce((sum, record) => sum + Math.abs(record.net_amount || 0), 0);
+  const refundTotal = recentRecords.value
+    .filter((r) => r.record_type === 'refund')
+    .reduce((sum, record) => sum + Math.abs(record.refund_amount || 0), 0);
 
   return [
     { label: '可用余额', value: formatMoney(balance.value) },
