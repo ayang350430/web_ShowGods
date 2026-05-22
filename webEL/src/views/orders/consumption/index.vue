@@ -8,6 +8,7 @@ import { useUserStore } from '@vben/stores';
 
 import {
   ElButton,
+  ElDatePicker,
   ElInput,
   ElMessage,
   ElMessageBox,
@@ -39,6 +40,7 @@ const summary = ref<OrderApi.ConsumptionRecordSummary>({
 });
 
 const filters = reactive({
+  dateRange: null as [string, string] | null,
   direction: '',
   keyword: '',
   record_type: '',
@@ -295,6 +297,8 @@ async function loadRecords() {
   loading.value = true;
   try {
     const result = await getConsumptionRecordsApi({
+      date_from: filters.dateRange?.[0] || undefined,
+      date_to: filters.dateRange?.[1] || undefined,
       direction: filters.direction || undefined,
       keyword: filters.keyword.trim() || undefined,
       page: pagination.page,
@@ -316,6 +320,7 @@ function searchRecords() {
 }
 
 function resetFilters() {
+  filters.dateRange = null;
   filters.direction = '';
   filters.keyword = '';
   filters.record_type = '';
@@ -420,6 +425,16 @@ watch(
           <ElOption label="待处理" value="pending" />
           <ElOption label="失败" value="failed" />
         </ElSelect>
+        <ElDatePicker
+          v-model="filters.dateRange"
+          type="daterange"
+          range-separator="至"
+          start-placeholder="开始日期"
+          end-placeholder="结束日期"
+          value-format="YYYY-MM-DD"
+          style="width: 260px"
+          clearable
+        />
         <ElButton type="primary" @click="searchRecords">查询</ElButton>
         <ElButton @click="resetFilters">重置</ElButton>
       </div>
@@ -700,10 +715,21 @@ watch(
 }
 
 .filter-bar {
-  display: grid;
-  grid-template-columns: minmax(240px, 1fr) 150px 130px 130px auto auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 10px;
   margin-bottom: 16px;
+}
+
+.filter-bar > .el-input {
+  width: 260px;
+  flex-shrink: 0;
+}
+
+.filter-bar > .el-select {
+  width: 130px;
+  flex-shrink: 0;
 }
 
 /* ---- table ---- */

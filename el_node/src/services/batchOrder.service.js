@@ -1464,6 +1464,25 @@ const listBatchOrderRecords = async (userId, query = {}) => {
     `,
     userParams,
   );
+  // 全局汇总：所有批次的订单总数、进行中数量、实际付款总额
+  const orderUserFilter = viewAll ? '' : 'WHERE o.user_id = ?';
+  const [[globalSummary]] = await db.execute(
+    `
+      SELECT
+        COUNT(*) AS total_orders,
+        COALESCE(SUM(CASE WHEN o.order_status IN ('running', 'stopping', 'refund_requested', 'refund_calculating', 'manual_review', 'repair_review') THEN 1 ELSE 0 END), 0) AS processing_orders,
+        COALESCE(SUM(ar.actual_paid_amount), 0) AS total_actual_paid
+      FROM orders o
+      LEFT JOIN (
+        SELECT order_id, SUM(actual_paid_amount) AS actual_paid_amount
+        FROM account_records
+        WHERE record_type = 'order_charge'
+        GROUP BY order_id
+      ) ar ON ar.order_id = o.id
+      ${orderUserFilter}
+    `,
+    viewAll ? [] : [userId],
+  );
   let [batches] = await db.execute(
     `
       SELECT *
@@ -1521,7 +1540,7 @@ const listBatchOrderRecords = async (userId, query = {}) => {
     userParams,
   );
 
-  // 查询每个批次的订单状态汇总，用于前端显示批次状态标签
+  // 查询每个批次的订单状态汇总 + 实际付款金额 + target_type
   const batchIdPlaceholders = batchIds.map(() => '?').join(',');
   const [orderStatusRows] = await db.execute(
     `SELECT batch_id, order_status, COUNT(1) AS cnt
@@ -1536,10 +1555,33 @@ const listBatchOrderRecords = async (userId, query = {}) => {
     batchOrderStatusMap[row.batch_id][row.order_status] = Number(row.cnt) || 0;
   }
 
-  const items = batches.map((batch) => ({
-    ...serializeBatchOrderRecord(batch, []),
-    order_status_summary: batchOrderStatusMap[batch.id] || {},
-  }));
+  const [batchSummaryRows] = await db.execute(
+    `SELECT o.batch_id,
+            COALESCE(SUM(ar.actual_paid_amount), 0) AS total_actual_paid,
+            MAX(o.target_type) AS target_type
+     FROM orders o
+     LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
+     WHERE o.batch_id IN (${batchIdPlaceholders})
+     GROUP BY o.batch_id`,
+    batchIds,
+  );
+  const batchSummaryMap = {};
+  for (const row of batchSummaryRows) {
+    batchSummaryMap[row.batch_id] = {
+      target_type: row.target_type || '',
+      total_actual_paid: round4(row.total_actual_paid),
+    };
+  }
+
+  const items = batches.map((batch) => {
+    const summary = batchSummaryMap[batch.id] || {};
+    return {
+      ...serializeBatchOrderRecord(batch, []),
+      order_status_summary: batchOrderStatusMap[batch.id] || {},
+      target_type: summary.target_type || '',
+      total_actual_paid: summary.total_actual_paid || 0,
+    };
+  });
 
   if (!paginationRequested) {
     return items;
@@ -1549,6 +1591,11 @@ const listBatchOrderRecords = async (userId, query = {}) => {
     items,
     page: safePage,
     page_size: safeLimit,
+    summary: {
+      processing_orders: Number(globalSummary.processing_orders) || 0,
+      total_actual_paid: round4(globalSummary.total_actual_paid),
+      total_orders: Number(globalSummary.total_orders) || 0,
+    },
     total: Number(countRow.total) || 0,
   };
 };
@@ -1737,7 +1784,13 @@ const searchBatchOrdersByLinks = async (userId, params = {}) => {
     pairMap.set(`${pair.batch_id}-${pair.batch_item_id}`, pair.matched_url);
   }
 
+  // 按 order id 去重（防止 JOIN 或 OR 条件产生重复行）
+  const seenOrderIds = new Set();
   const resultRows = rows.flatMap((row) => {
+    if (seenOrderIds.has(row.id)) {
+      return [];
+    }
+    seenOrderIds.add(row.id);
     const pairKey = `${row.batch_id}-${row.batch_item_id}`;
     const sourceUrl = pairMap.get(pairKey) || row.note_url;
     const matchedLink =
@@ -1813,6 +1866,8 @@ const listConsumptionRecords = async (userId, query = {}) => {
   const recordType = String(query.record_type || '').trim();
   const direction = String(query.direction || '').trim();
   const status = String(query.status || '').trim();
+  const dateFrom = String(query.date_from || '').trim();
+  const dateTo = String(query.date_to || '').trim();
   const viewAll = await canViewAllAccountRecords(db, userId);
 
   const where = [];
@@ -1832,6 +1887,18 @@ const listConsumptionRecords = async (userId, query = {}) => {
   if (status) {
     where.push('ar.status = ?');
     params.push(status);
+  }
+  if (dateFrom) {
+    where.push('ar.created_at >= ?');
+    params.push(dateFrom);
+  }
+  if (dateTo) {
+    where.push('ar.created_at < ?');
+    // dateTo 是日期字符串（如 2026-05-22），加一天变成次日零点
+    const endDate = new Date(dateTo);
+    endDate.setDate(endDate.getDate() + 1);
+    const endStr = `${endDate.getFullYear()}-${String(endDate.getMonth() + 1).padStart(2, '0')}-${String(endDate.getDate()).padStart(2, '0')}`;
+    params.push(endStr);
   }
   if (keyword) {
     where.push(`
@@ -6073,8 +6140,23 @@ const submitBatch = async (userId, params) => {
       });
     }
 
-    const taskResults = await Promise.all(
-      orderRows.map(async (order) => {
+    // 并发控制 + 自动重试：避免同时发送过多请求导致上游限流
+    const SUBMIT_CONCURRENCY = 5;
+    const MAX_RETRIES = 2;
+    const RETRY_BASE_DELAY_MS = 2000;
+    const submitLimiter = createAsyncLimiter(SUBMIT_CONCURRENCY);
+
+    const isRetryableError = (error) => {
+      const msg = String(error?.message || error?.cause?.message || '').toLowerCase();
+      return msg.includes('繁忙') || msg.includes('busy')
+        || msg.includes('etimedout') || msg.includes('econnreset')
+        || msg.includes('rate') || msg.includes('too many');
+    };
+
+    const createTaskWithRetry = async (order) => {
+      let lastError;
+      let retried = 0;
+      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
         try {
           const xhsResult = await getXhsTaskClient().createTask(
             preview.target_type,
@@ -6091,17 +6173,30 @@ const submitBatch = async (userId, params) => {
           if (!externalTaskId) {
             throw new Error('XHS API response missing task id (numeric)');
           }
-          return {
-            externalTaskId,
-            orderId: order.id,
-          };
+          return { externalTaskId, orderId: order.id };
         } catch (error) {
-          return {
-            error,
-            orderId: order.id,
-          };
+          lastError = error;
+          if (!isRetryableError(error) || attempt >= MAX_RETRIES) {
+            break;
+          }
+          retried += 1;
+          const delay = RETRY_BASE_DELAY_MS * (attempt + 1) + Math.random() * 500;
+          await new Promise((r) => setTimeout(r, delay));
         }
-      }),
+      }
+      // 重试过仍然失败，补充重试次数到错误信息
+      if (retried > 0) {
+        const origMsg = lastError?.message || String(lastError || '');
+        lastError = new Error(`${origMsg}（已自动重试${retried}次仍失败）`);
+        if (lastError.cause === undefined) {
+          lastError.cause = {};
+        }
+      }
+      return { error: lastError, orderId: order.id };
+    };
+
+    const taskResults = await Promise.all(
+      orderRows.map((order) => submitLimiter(() => createTaskWithRetry(order))),
     );
     const taskResultByOrderId = new Map(taskResults.map((result) => [result.orderId, result]));
 

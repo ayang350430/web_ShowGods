@@ -50,6 +50,39 @@ const fullRefundingOrderId = ref<number>();
 const userStore = useUserStore();
 const expandedBatches = ref<Set<string>>(new Set());
 
+function collapseEnter(el: Element) {
+  const h = el as HTMLElement;
+  h.style.overflow = 'hidden';
+  h.style.height = '0';
+  h.style.opacity = '0';
+  void h.offsetHeight;
+  h.style.transition = 'height 0.3s ease-out, opacity 0.25s ease-out';
+  h.style.height = `${h.scrollHeight}px`;
+  h.style.opacity = '1';
+}
+function collapseAfterEnter(el: Element) {
+  const h = el as HTMLElement;
+  h.style.height = '';
+  h.style.overflow = '';
+  h.style.transition = '';
+}
+function collapseLeave(el: Element) {
+  const h = el as HTMLElement;
+  h.style.overflow = 'hidden';
+  h.style.height = `${h.scrollHeight}px`;
+  void h.offsetHeight;
+  h.style.transition = 'height 0.25s ease-in, opacity 0.2s ease-in';
+  h.style.height = '0';
+  h.style.opacity = '0';
+}
+function collapseAfterLeave(el: Element) {
+  const h = el as HTMLElement;
+  h.style.height = '';
+  h.style.overflow = '';
+  h.style.transition = '';
+  h.style.opacity = '';
+}
+
 const filters = reactive({
   keyword: '',
   status: '',
@@ -602,6 +635,12 @@ onMounted(loadRecords);
           </div>
 
           <!-- 展开的订单列表 -->
+          <Transition
+            @enter="collapseEnter"
+            @after-enter="collapseAfterEnter"
+            @leave="collapseLeave"
+            @after-leave="collapseAfterLeave"
+          >
           <div v-if="expandedBatches.has(group.batch_no)" class="batch-body">
             <div
               v-for="row in group.orders"
@@ -657,6 +696,7 @@ onMounted(loadRecords);
               </div>
             </div>
           </div>
+          </Transition>
         </div>
       </div>
 

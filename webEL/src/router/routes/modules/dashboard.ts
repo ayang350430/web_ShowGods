@@ -93,6 +93,17 @@ const routes: RouteRecordRaw[] = [
     },
   },
   {
+    name: 'CheckRecords',
+    path: '/orders/check-records',
+    component: () => import('#/views/orders/check-records/index.vue'),
+    meta: {
+      authority: ['super', 'admin', 'user'],
+      icon: 'lucide:link-2',
+      order: 1.8,
+      title: '链接检测记录',
+    },
+  },
+  {
     name: 'OpenApiKeys',
     path: '/open-api/keys',
     component: () => import('#/views/open-api/keys/index.vue'),

@@ -129,27 +129,37 @@ onMounted(loadRecords);
 <template>
   <div class="replenishment-page">
     <section class="page-head">
-      <div>
+      <div class="head-text">
+        <span class="eyebrow">Replenishment</span>
         <h1>补单列表</h1>
         <p>用户提交补单申请后，管理员在这里同意，同意后才会发送上游补单。</p>
       </div>
-      <ElButton :loading="loading" type="primary" @click="loadRecords">
-        刷新
-      </ElButton>
+      <button class="head-btn" :disabled="loading" @click="loadRecords">
+        {{ loading ? '刷新中…' : '刷新' }}
+      </button>
     </section>
 
     <section class="summary-grid">
-      <div>
-        <span>申请数</span>
-        <strong>{{ summary.total }}</strong>
+      <div class="stat-card stat-card--primary">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z" /><path fill-rule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd" /></svg></div>
+        <div class="stat-body">
+          <span>申请数</span>
+          <strong>{{ summary.total }}</strong>
+        </div>
       </div>
-      <div>
-        <span>当前待同意</span>
-        <strong>{{ summary.pending }}</strong>
+      <div class="stat-card stat-card--warning">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd" /></svg></div>
+        <div class="stat-body">
+          <span>当前待同意</span>
+          <strong>{{ summary.pending }}</strong>
+        </div>
       </div>
-      <div>
-        <span>待补数量</span>
-        <strong>{{ summary.quantity.toLocaleString('zh-CN') }}</strong>
+      <div class="stat-card stat-card--success">
+        <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd" /></svg></div>
+        <div class="stat-body">
+          <span>待补数量</span>
+          <strong>{{ summary.quantity.toLocaleString('zh-CN') }}</strong>
+        </div>
       </div>
     </section>
 
@@ -258,62 +268,97 @@ onMounted(loadRecords);
   gap: 16px;
   min-height: 100%;
   padding: 20px;
-  color: hsl(var(--foreground));
-  background: hsl(var(--background));
+  color: var(--el-text-color-primary);
 }
 
-.page-head,
-.record-panel,
-.summary-grid > div {
-  border: 1px solid hsl(var(--border));
-  border-radius: 8px;
-  background: hsl(var(--card));
-}
-
+/* ---- header ---- */
 .page-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  padding: 18px 20px;
+  padding: 20px 24px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
 }
 
-.page-head h1 {
-  margin: 0;
-  font-size: 22px;
+.eyebrow {
+  font-size: 11px;
   font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--el-color-primary);
 }
 
-.page-head p,
-.main-cell span,
-.muted {
-  color: hsl(var(--muted-foreground));
-}
+.page-head h1 { margin: 2px 0 0; font-size: 22px; font-weight: 700; }
+.page-head p { margin: 4px 0 0; font-size: 13px; color: var(--el-text-color-secondary); }
 
+.head-btn {
+  padding: 8px 20px;
+  border: 1px solid var(--el-color-primary-light-5);
+  border-radius: 8px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
+}
+.head-btn:hover:not(:disabled) { background: var(--el-color-primary); color: #fff; }
+.head-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ---- stat cards ---- */
 .summary-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
 }
 
-.summary-grid > div {
+.stat-card {
   display: flex;
-  flex-direction: column;
-  gap: 10px;
-  min-height: 88px;
-  padding: 18px;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.stat-card:hover {
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
 }
 
-.summary-grid strong {
-  font-size: 24px;
+.stat-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  flex-shrink: 0;
 }
 
+.stat-card--primary .stat-icon { background: var(--el-color-primary-light-8); color: var(--el-color-primary); }
+.stat-card--warning .stat-icon { background: var(--el-color-warning-light-8); color: var(--el-color-warning); }
+.stat-card--success .stat-icon { background: var(--el-color-success-light-8); color: var(--el-color-success); }
+
+.stat-body { display: flex; flex-direction: column; gap: 4px; }
+.stat-body span { font-size: 12px; color: var(--el-text-color-secondary); }
+.stat-body strong { font-size: 22px; font-weight: 700; line-height: 1.1; }
+
+/* ---- record panel ---- */
 .record-panel {
-  padding: 16px;
+  padding: 18px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
 }
 
 .filter-bar {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 10px;
   margin-bottom: 16px;
 }
@@ -322,27 +367,48 @@ onMounted(loadRecords);
   width: 180px;
 }
 
+/* ---- table ---- */
+:deep(.el-table) {
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-header-bg-color: var(--el-fill-color-light);
+}
+:deep(.el-table th.el-table__cell) { background: var(--el-fill-color-light); }
+
 .main-cell {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+  line-height: 1.3;
+}
+
+.main-cell strong {
+  font-size: 13px;
+  font-family: Consolas, 'SF Mono', monospace;
+}
+
+.main-cell span,
+.muted {
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.reason-text {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+  line-height: 1.4;
 }
 
 .pagination-bar {
   display: flex;
   justify-content: flex-end;
-  margin-top: 16px;
+  padding-top: 16px;
 }
 
 @media (max-width: 900px) {
-  .page-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-
-  .summary-grid {
-    grid-template-columns: 1fr;
-  }
+  .replenishment-page { padding: 12px; }
+  .page-head { align-items: flex-start; flex-direction: column; }
+  .summary-grid { grid-template-columns: 1fr; }
 }
 </style>
 

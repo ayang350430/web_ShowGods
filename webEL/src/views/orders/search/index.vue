@@ -192,13 +192,23 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
 
 <template>
   <div class="batch-search-page">
+    <!-- 页面头部 -->
+    <section class="page-head">
+      <div class="head-left">
+        <span class="eyebrow">SEARCH</span>
+        <h2>批量订单查找</h2>
+        <p class="head-desc">输入链接后查询所有匹配的下单记录，支持批量查找和日期筛选。</p>
+      </div>
+    </section>
+
+    <!-- 搜索区域 -->
     <section class="search-panel">
-      <div class="panel-title">
-        <div>
-          <h2>批量订单查找</h2>
-          <p>输入链接后查询所有匹配的下单记录。</p>
+      <div class="search-toolbar">
+        <div class="input-label">
+          <strong>批量内容（查询）</strong>
+          <ElTag v-if="lineCount > 0" size="small" type="info" disable-transitions>{{ lineCount }} 行</ElTag>
         </div>
-        <div class="action-row">
+        <div class="toolbar-right">
           <ElDatePicker
             v-model="dateRange"
             end-placeholder="结束日期"
@@ -206,30 +216,38 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
             start-placeholder="开始日期"
             type="daterange"
             value-format="YYYY-MM-DD"
+            style="width: 260px"
+            clearable
           />
           <ElButton :loading="loading" type="primary" @click="searchOrders">
             查询
           </ElButton>
         </div>
       </div>
-
-      <div class="input-label">
-        <strong>批量内容（查询）</strong>
-        <span>已输入 {{ lineCount }} 行</span>
-      </div>
       <textarea
         v-model="content"
         class="batch-textarea"
-        placeholder="示例：https://xhslink.com/xxxxxx"
+        placeholder="每行一条链接，例如：&#10;https://xhslink.com/xxxxxx&#10;https://www.xiaohongshu.com/explore/xxxxxx"
         spellcheck="false"
+        @keydown.ctrl.enter="searchOrders"
       />
+      <div class="textarea-hint">
+        按 <kbd>Ctrl</kbd> + <kbd>Enter</kbd> 快速查询
+      </div>
     </section>
 
+    <!-- 查询结果 -->
     <section v-if="result" class="result-panel">
       <div class="result-head">
-        <strong>查询结果</strong>
-        <span>
-          输入 {{ result.total_count }} 条，找到 {{ result.matched_count }} 条订单
+        <div class="result-title">
+          <strong>查询结果</strong>
+          <ElTag size="small" type="success" disable-transitions>{{ result.matched_count }} 条匹配</ElTag>
+        </div>
+        <span class="result-meta">
+          输入 {{ result.total_count }} 条链接，找到 {{ result.matched_count }} 条订单
+          <template v-if="invalidLinks.length > 0">
+            ，{{ invalidLinks.length }} 条无效
+          </template>
         </span>
       </div>
 
@@ -243,37 +261,52 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
       <div v-if="orders.length > 0" class="order-list">
         <div v-for="order in orders" :key="order.id" class="order-card">
           <article class="order-row" @click="toggleExpand(order.id)">
-            <div class="image-box">
-              <img v-if="order.avatar_url" :src="order.avatar_url" alt="" />
-              <span v-else>{{ serviceLabel(order.target_type).slice(0, 1) }}</span>
-            </div>
-            <div class="main-info">
-              <div class="meta-line">
-                <span>订单编号：{{ order.order_no }}</span>
-                <span>订单创建时间：{{ formatDateTime(order.created_at) }}</span>
+            <div class="row-top">
+              <div class="product-cell">
+                <div class="product-thumb">
+                  <img v-if="order.avatar_url" :src="order.avatar_url" alt="" />
+                  <span v-else>{{ serviceLabel(order.target_type).slice(0, 1) }}</span>
+                </div>
+                <div class="product-text">
+                  <div class="order-meta">
+                    <span>订单编号：{{ order.order_no }}</span>
+                    <span>订单创建时间：{{ formatDateTime(order.created_at) }}</span>
+                  </div>
+                  <strong>{{ order.title || order.note_id }}</strong>
+                  <span class="author-line">{{ order.author_name || '-' }} / {{ order.note_id }}</span>
+                  <span class="link-line">{{ order.source_note_url || order.note_url }}</span>
+                </div>
               </div>
-              <strong>{{ order.title || order.note_id }}</strong>
-              <small>{{ order.author_name || '-' }} / {{ order.note_id }}</small>
-              <em>{{ order.source_note_url || order.note_url }}</em>
+              <div class="tag-cell">
+                <span class="tag-head">{{ serviceLabel(order.target_type) }}服务</span>
+                <span>订单ID：{{ order.id }}</span>
+                <span>批次：{{ order.batch_no }}</span>
+                <span>匹配：{{ order.matched_input || '-' }}</span>
+              </div>
+              <div class="num-cell">
+                <span class="num-label">单价</span>
+                <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
+              </div>
+              <div class="num-cell">
+                <span class="num-label">数量</span>
+                <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
+                <span class="num-sub">{{ (order.completed_quantity || 0).toLocaleString('zh-CN') }} 已完成</span>
+              </div>
+              <div class="status-cell">
+                <ElTag :type="statusTagType(order.order_status)" effect="plain" size="small">
+                  {{ displayStatusLabel(order) }}
+                </ElTag>
+              </div>
+              <div class="num-cell">
+                <span class="num-label">售后退款</span>
+                <span class="refund-text" :class="{ 'has-refund': Number(order.refund_amount) > 0 }">{{ refundLabel(order) }}</span>
+              </div>
+              <div class="num-cell num-right">
+                <span class="num-label">实际付款金额</span>
+                <strong class="amount-text">{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
+              </div>
+              <span class="row-expand-arrow" :class="{ rotated: expandedIds.has(order.id) }">▾</span>
             </div>
-            <div class="service-info">
-              <strong>{{ serviceLabel(order.target_type) }}服务</strong>
-              <span>批次：{{ order.batch_no }}</span>
-              <span>匹配：{{ order.matched_input || '-' }}</span>
-            </div>
-            <div class="quantity-info">
-              <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              <span>{{ order.completed_quantity.toLocaleString('zh-CN') }} 已完成</span>
-            </div>
-            <div class="status-info">
-              <ElTag :type="statusTagType(order.order_status)" effect="plain">
-                {{ displayStatusLabel(order) }}
-              </ElTag>
-            </div>
-            <div class="amount-info">
-              <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
-            </div>
-            <span class="row-expand-arrow" :class="{ rotated: expandedIds.has(order.id) }">▾</span>
           </article>
 
           <Transition @enter="expandEnter" @after-enter="expandAfterEnter" @leave="expandLeave" @after-leave="expandAfterLeave">
@@ -469,76 +502,135 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
   color: hsl(var(--foreground));
 }
 
+/* ---- 页面头部 ---- */
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px 24px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+}
+
+.eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: var(--el-color-primary);
+}
+
+.page-head h2 {
+  margin: 4px 0 6px;
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.head-desc {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+  margin: 0;
+}
+
+/* ---- 搜索面板 ---- */
 .search-panel,
 .result-panel {
-  padding: 24px 32px;
-  background: hsl(var(--card));
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
+  padding: 20px 24px;
+  background: var(--el-bg-color);
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
 }
 
-.panel-title,
-.result-head {
+.search-toolbar {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 24px;
-}
-
-.panel-title h2 {
-  margin: 0 0 6px;
-  font-size: 22px;
-}
-
-.panel-title p,
-.result-head span,
-.input-label span,
-.main-info small,
-.main-info em,
-.service-info span,
-.quantity-info span {
-  color: var(--el-text-color-secondary);
+  margin-bottom: 12px;
 }
 
 .input-label {
   display: flex;
-  gap: 18px;
+  gap: 10px;
   align-items: center;
-  margin-bottom: 10px;
+}
+
+.input-label strong {
+  font-size: 14px;
+}
+
+.toolbar-right {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-shrink: 0;
 }
 
 .batch-textarea {
   width: 100%;
-  min-height: 275px;
-  padding: 16px;
+  min-height: 200px;
+  padding: 14px 16px;
+  font-size: 13px;
+  font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+  line-height: 1.7;
   color: hsl(var(--foreground));
   resize: vertical;
-  background: transparent;
+  background: var(--el-fill-color-blank);
   border: 1px solid var(--el-border-color);
   border-radius: 8px;
   outline: none;
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 .batch-textarea:focus {
   border-color: var(--el-color-primary);
+  box-shadow: 0 0 0 3px var(--el-color-primary-light-8);
 }
 
-.action-row {
+.textarea-hint {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+  text-align: right;
+}
+
+.textarea-hint kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: inherit;
+  line-height: 1.4;
+  color: var(--el-text-color-secondary);
+  background: var(--el-fill-color-light);
+  border: 1px solid var(--el-border-color);
+  border-radius: 3px;
+}
+
+/* ---- 结果面板 ---- */
+.result-head {
   display: flex;
-  gap: 12px;
   align-items: center;
-  justify-content: flex-end;
-  width: min(520px, 45vw);
-  padding-top: 2px;
-  margin-left: auto;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
 }
 
-.action-row :deep(.el-date-editor) {
-  flex: 1;
-  min-width: 360px;
-  max-width: 440px;
+.result-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
+
+.result-title strong {
+  font-size: 16px;
+}
+
+.result-meta {
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
+}
+
 
 .invalid-box {
   display: flex;
@@ -555,95 +647,190 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
 .order-list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .order-card {
   border: 1px solid var(--el-border-color-light);
-  border-radius: 8px;
+  border-radius: 10px;
   overflow: hidden;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.order-card:hover {
+  border-color: var(--el-color-primary-light-5);
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.04);
 }
 
 .order-row {
-  display: grid;
-  grid-template-columns: 80px minmax(220px, 1fr) 200px 100px 100px 100px 24px;
-  gap: 16px;
-  align-items: center;
-  padding: 14px 16px;
   cursor: pointer;
-  transition: background 0.15s;
 }
 
-.order-row:hover {
-  background: var(--el-fill-color-light);
-}
-
-.image-box {
+.row-top {
   display: grid;
+  grid-template-columns: minmax(320px, 2fr) minmax(160px, 1fr) 90px 90px 90px 90px 120px 28px;
+  gap: 14px;
+  align-items: center;
+  padding: 16px 18px;
+}
+
+/* ---- 商品信息 ---- */
+.product-cell {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  min-width: 0;
+}
+
+.product-thumb {
   width: 80px;
   height: 80px;
-  place-items: center;
+  border-radius: 8px;
   overflow: hidden;
+  flex-shrink: 0;
+  background: var(--el-fill-color-light);
+  display: grid;
+  place-items: center;
   color: var(--el-color-primary);
   font-weight: 700;
   font-size: 20px;
-  background: var(--el-fill-color-light);
-  border-radius: 6px;
 }
 
-.image-box img {
+.product-thumb img {
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
 
-.main-info,
-.service-info,
-.quantity-info,
-.status-info,
-.amount-info {
+.product-text {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
 }
 
-.main-info strong,
-.main-info small,
-.main-info em,
-.service-info span {
+.order-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.product-text > strong {
+  font-size: 14px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.4;
+}
+
+.author-line {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.main-info em {
-  font-style: normal;
+.link-line {
   font-size: 12px;
+  font-family: Consolas, 'SF Mono', monospace;
+  color: var(--el-color-primary-light-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.meta-line {
+/* ---- 标签列 ---- */
+.tag-cell {
   display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  font-size: 13px;
   color: var(--el-text-color-secondary);
-  font-size: 12px;
+  line-height: 1.5;
 }
 
-.amount-info strong {
+.tag-cell span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tag-head {
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+
+/* ---- 数值列 ---- */
+.num-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.num-label {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.num-cell > strong {
+  font-size: 15px;
+  font-weight: 700;
+  font-family: Consolas, 'SF Mono', monospace;
+  white-space: nowrap;
+}
+
+.num-sub {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.num-right {
+  text-align: right;
+}
+
+.amount-text {
   color: var(--el-color-primary);
 }
 
-.row-expand-arrow {
-  display: inline-flex;
+/* ---- 状态列 ---- */
+.status-cell {
+  display: flex;
+  align-items: center;
   justify-content: center;
+}
+
+/* ---- 退款文本 ---- */
+.refund-text {
+  font-size: 13px;
   color: var(--el-text-color-secondary);
+}
+
+.refund-text.has-refund {
+  color: var(--el-color-warning);
+  font-weight: 600;
+}
+
+/* ---- 展开箭头 ---- */
+.row-expand-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--el-text-color-placeholder);
   font-size: 14px;
   transition: transform 0.25s;
 }
 
 .row-expand-arrow.rotated {
   transform: rotate(180deg);
+  color: var(--el-color-primary);
 }
 
 /* Expand panel */
@@ -818,25 +1005,25 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
 }
 
 @media (max-width: 1200px) {
-  .order-row {
-    grid-template-columns: 80px 1fr;
+  .row-top {
+    grid-template-columns: 1fr;
+    gap: 10px;
   }
 }
 
 @media (max-width: 900px) {
-  .panel-title {
+  .search-toolbar {
     flex-direction: column;
+    align-items: flex-start;
   }
 
-  .action-row {
-    justify-content: flex-start;
+  .toolbar-right {
     width: 100%;
-    margin-left: 0;
   }
 
-  .action-row :deep(.el-date-editor) {
-    min-width: 0;
-    max-width: none;
+  .result-head {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
 </style>

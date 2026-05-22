@@ -105,6 +105,8 @@ export namespace OrderApi {
     status: string;
     submitted_at: string;
     succeeded_count: number;
+    target_type?: string;
+    total_actual_paid?: number;
     total_count: number;
   }
 
@@ -436,10 +438,18 @@ export async function getBatchOrderRecordsApi(
   },
   options?: { silent?: boolean },
 ) {
-  return requestClient.get<OrderApi.PageResult<OrderApi.BatchOrderRecord>>(
-    '/v1/orders/batch/records',
-    { params, skipBackendLoading: options?.silent } as any,
-  );
+  return requestClient.get<
+    OrderApi.PageResult<OrderApi.BatchOrderRecord> & {
+      summary?: {
+        processing_orders: number;
+        total_actual_paid: number;
+        total_orders: number;
+      };
+    }
+  >('/v1/orders/batch/records', {
+    params,
+    skipBackendLoading: options?.silent,
+  } as any);
 }
 
 export async function searchBatchOrdersApi(data: {
