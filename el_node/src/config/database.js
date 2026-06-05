@@ -1287,6 +1287,19 @@ const initializeDatabase = async () => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS password_reset_requests (
+      id INT UNSIGNED NOT NULL AUTO_INCREMENT,
+      user_id INT UNSIGNED NOT NULL,
+      username VARCHAR(100) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      handled_at DATETIME DEFAULT NULL,
+      PRIMARY KEY (id),
+      KEY idx_pwr_user_status (user_id, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
   await seedRolesAndPermissions(db);
   await createGoodsTables(db);
   await require('../services/openApi.service').ensureOpenApiKeyTable(db);

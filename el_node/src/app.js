@@ -10,6 +10,7 @@ const { notFoundHandler, errorHandler } = require('./middlewares/errorHandlers')
 const app = express();
 
 app.use(helmet({ contentSecurityPolicy: false }));
+// 允许process.env.CORS_ORIGIN指定的来源或所有来源的 CORS 请求
 app.use(
   cors({
     origin: process.env.CORS_ORIGIN || '*',

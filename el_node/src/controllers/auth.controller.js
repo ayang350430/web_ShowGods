@@ -99,10 +99,49 @@ const logout = (req, res) => {
   });
 };
 
+const requestPasswordReset = async (req, res, next) => {
+  try {
+    const { username } = req.body;
+    if (!username) {
+      return res.status(400).json({ message: '请输入账号' });
+    }
+    const data = await authService.requestPasswordReset({ username });
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const getPasswordResetRequests = async (req, res, next) => {
+  try {
+    const data = await authService.getPasswordResetRequests();
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const handlePasswordResetRequest = async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { action, newPassword } = req.body;
+    if (!['approve', 'reject'].includes(action)) {
+      return res.status(400).json({ message: 'action must be approve or reject' });
+    }
+    const data = await authService.handlePasswordResetRequest(Number(id), { action, newPassword });
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   getAccessCodes,
+  getPasswordResetRequests,
+  handlePasswordResetRequest,
   login,
   logout,
   register,
   refreshToken,
+  requestPasswordReset,
 };

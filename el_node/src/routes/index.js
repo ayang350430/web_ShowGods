@@ -10,19 +10,24 @@ const openApiRoutes = require('./openApi.routes');
 const orderRoutes = require('./order.routes');
 const userRoutes = require('./user.routes');
 const weatherRoutes = require('./weather.routes');
+const requireAuth = require('../middlewares/requireAuth');
 
 const router = express.Router();
 
-// 批量下单路由
+// 公开路由（无需登录）：登录/注册/刷新/找回密码在 auth 内部细分；健康检查、天气公开
 router.use('/auth', authRoutes);
 router.use('/health', healthRoutes);
-router.use('/menu', menuRoutes);
-router.use(openApiRoutes);
-router.use('/v1/orders', orderRoutes);
-router.use('/user', userRoutes);
 router.use('/weather', weatherRoutes);
-router.use('/v1/admin/dashboard', adminDashboardRoutes);
-router.use('/v1/admin/permissions', adminPermissionRoutes);
-router.use('/v1/dashboard', dashboardRoutes);
+
+// 开放 API：keys 管理需登录、open/orders 用 API Key，鉴权在该路由内部细分
+router.use(openApiRoutes);
+
+// 受保护路由（需登录，token 失效统一返回 401，触发前端重新登录）
+router.use('/menu', requireAuth, menuRoutes);
+router.use('/v1/orders', requireAuth, orderRoutes);
+router.use('/user', requireAuth, userRoutes);
+router.use('/v1/admin/dashboard', requireAuth, adminDashboardRoutes);
+router.use('/v1/admin/permissions', requireAuth, adminPermissionRoutes);
+router.use('/v1/dashboard', requireAuth, dashboardRoutes);
 
 module.exports = router;

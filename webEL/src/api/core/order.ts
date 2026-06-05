@@ -220,6 +220,7 @@ export namespace OrderApi {
     id: number;
     note_id: string;
     note_url: string;
+    source_note_url?: string;
     order_id: number;
     order_no: string;
     order_status: string;
@@ -236,12 +237,27 @@ export namespace OrderApi {
     username: string;
   }
 
+  export interface ReplenishmentOrderDetail {
+    actual_quantity: number;
+    author_name: string;
+    avatar_url?: string;
+    note_id: string;
+    note_url: string;
+    order_id: number;
+    order_no: string;
+    ordered_quantity: number;
+    shortage_quantity: number;
+    target_type: string;
+    title: string;
+  }
+
   export interface ReplenishmentRequest {
     batch_id: number;
     batch_no: string;
     batch_uuid: string;
     estimated_amount: number;
     id: number;
+    orders: ReplenishmentOrderDetail[];
     pending_order_count: number;
     pending_quantity: number;
     reason_message: string;
@@ -432,6 +448,11 @@ export async function submitBatchOrderApi(
 
 export async function getBatchOrderRecordsApi(
   params?: {
+    batch_id?: number | string;
+    batch_no?: string;
+    note_id?: string;
+    note_url?: string;
+    order_no?: string;
     page?: number;
     page_size?: number;
     skip_status_sync?: 1;
@@ -695,4 +716,11 @@ export async function getOrderTypeStatusApi() {
   return requestClient.get<OrderApi.OrderTypeStatus>(
     '/v1/orders/batch/type-status',
   );
+}
+
+export async function recheckRepairOrdersApi(batchId: number) {
+  return requestClient.post<{
+    total: number;
+    message: string;
+  }>('/v1/orders/batch/recheck-repair', { batch_id: batchId });
 }

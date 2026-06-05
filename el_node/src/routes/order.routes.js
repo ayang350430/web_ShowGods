@@ -30,5 +30,6 @@ router.post('/refund-batch-reject', batchOrderController.batchRejectRefunds);
 router.post('/:orderId/refund-review', batchOrderController.reviewOrderRefund);
 router.post('/:orderId/full-refund', batchOrderController.fullRefundOrder);
 router.post('/full-refund-batch', batchOrderController.fullRefundBatch);
+router.post('/batch/recheck-repair', batchOrderController.recheckRepairOrders);
 
 module.exports = router;

@@ -57,6 +57,7 @@ function serviceTagType(type: string) {
 
 function statusLabel(status: string) {
   const map: Record<string, string> = {
+    cancelled: '已终止',
     completed: '订单完成',
     failed: '订单失败',
     manual_review: '人工处理',
@@ -73,6 +74,7 @@ function statusLabel(status: string) {
 
 function statusTagType(status: string) {
   if (status === 'completed') return 'success';
+  if (status === 'cancelled') return 'info';
   if (['failed', 'manual_review'].includes(status)) return 'danger';
   if (['refund_approved', 'refund_requested', 'repair_review'].includes(status)) return 'warning';
   return 'primary';
@@ -148,7 +150,7 @@ function expandAfterLeave(el: Element) {
 
 async function searchOrders() {
   if (!content.value.trim()) {
-    ElMessage.warning('请输入要查询的链接');
+    ElMessage.warning('请输入要查询的链接或笔记ID');
     return;
   }
   loading.value = true;
@@ -197,7 +199,7 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
       <div class="head-left">
         <span class="eyebrow">SEARCH</span>
         <h2>批量订单查找</h2>
-        <p class="head-desc">输入链接后查询所有匹配的下单记录，支持批量查找和日期筛选。</p>
+        <p class="head-desc">输入链接或笔记ID后查询所有匹配的下单记录，支持批量查找和日期筛选。</p>
       </div>
     </section>
 
@@ -227,7 +229,7 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
       <textarea
         v-model="content"
         class="batch-textarea"
-        placeholder="每行一条链接，例如：&#10;https://xhslink.com/xxxxxx&#10;https://www.xiaohongshu.com/explore/xxxxxx"
+        placeholder="每行一条链接或笔记ID，例如：&#10;https://xhslink.com/xxxxxx&#10;https://www.xiaohongshu.com/explore/xxxxxx&#10;6123456789abcdef01234567"
         spellcheck="false"
         @keydown.ctrl.enter="searchOrders"
       />
@@ -244,7 +246,7 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
           <ElTag size="small" type="success" disable-transitions>{{ result.matched_count }} 条匹配</ElTag>
         </div>
         <span class="result-meta">
-          输入 {{ result.total_count }} 条链接，找到 {{ result.matched_count }} 条订单
+          输入 {{ result.total_count }} 条，找到 {{ result.matched_count }} 条订单
           <template v-if="invalidLinks.length > 0">
             ，{{ invalidLinks.length }} 条无效
           </template>

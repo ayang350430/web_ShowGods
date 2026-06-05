@@ -249,3 +249,29 @@ export async function updateAdminUserDiscountsApi(
     user_id: number;
   }>(`/v1/admin/permissions/users/${userId}/discounts`, data);
 }
+
+export interface PasswordResetRequest {
+  created_at: string;
+  handled_at: null | string;
+  id: number;
+  real_name: string;
+  status: string;
+  user_id: number;
+  username: string;
+}
+
+export async function getPasswordResetRequestsApi() {
+  return requestClient.get<PasswordResetRequest[]>(
+    '/v1/admin/permissions/password-reset-requests',
+  );
+}
+
+export async function handlePasswordResetRequestApi(
+  id: number,
+  data: { action: 'approve' | 'reject'; newPassword?: string },
+) {
+  return requestClient.put<{ status: string }>(
+    `/v1/admin/permissions/password-reset-requests/${id}`,
+    data,
+  );
+}

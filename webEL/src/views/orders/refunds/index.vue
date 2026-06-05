@@ -49,6 +49,17 @@ const fullRefundingBatchNo = ref<string>();
 const fullRefundingOrderId = ref<number>();
 const userStore = useUserStore();
 const expandedBatches = ref<Set<string>>(new Set());
+const brokenAvatars = ref(new Set<number>());
+
+function avatarVisible(row: OrderApi.RefundRecord) {
+  return Boolean(row.avatar_url) && !brokenAvatars.value.has(row.order_id);
+}
+
+function onAvatarError(orderId: number) {
+  const next = new Set(brokenAvatars.value);
+  next.add(orderId);
+  brokenAvatars.value = next;
+}
 
 function collapseEnter(el: Element) {
   const h = el as HTMLElement;
@@ -188,6 +199,16 @@ function formatMoney(value?: number) {
   })}`;
 }
 
+function orderNoteLink(row: OrderApi.RefundRecord) {
+  return row.source_note_url || row.note_url || '';
+}
+
+function authorInitial(row: OrderApi.RefundRecord) {
+  const name = row.author_name?.trim();
+  if (name) return name[0]?.toUpperCase() || '?';
+  return targetTypeLabel(row.target_type)[0] || '?';
+}
+
 function formatDateTime(value?: null | string) {
   if (!value) {
     return '-';
@@ -218,15 +239,83 @@ function statusLabel(status: string) {
     completed: '订单完成',
     failed: '订单失败',
     manual_review: '人工处理',
+    refunded: '已退款',
     repair_review: '待补单',
     running: '进行中',
-    refund_calculating: '退款中',
-    refund_approved: '退款通过',
+    refund_calculating: '退款计算中',
+    refund_approved: '已退款',
     refund_rejected: '退款拒绝',
-    refund_requested: '退款中',
+    refund_requested: '退款待审',
     stopping: '停止中',
   };
   return map[status] || status || '-';
+}
+
+function formatShortDateTime(value?: null | string) {
+  if (!value) {
+    return '-';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const pad = (number: number) => String(number).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function shortenBatchNo(batchNo: string) {
+  if (!batchNo || batchNo.length <= 24) {
+    return batchNo || '无批次';
+  }
+  return `${batchNo.slice(0, 14)}…${batchNo.slice(-6)}`;
+}
+
+function batchHeadStatusLabel(group: BatchGroup) {
+  if (batchHasPending(group)) {
+    return '待审核';
+  }
+  if (group.remaining <= 0 && group.total_refunded > 0) {
+    return '已退完';
+  }
+  if (group.total_refunded > 0) {
+    return '部分退款';
+  }
+  return '可退款';
+}
+
+function batchHeadStatusClass(group: BatchGroup) {
+  if (batchHasPending(group)) {
+    return 'batch-badge--warning';
+  }
+  if (group.remaining <= 0 && group.total_refunded > 0) {
+    return 'batch-badge--muted';
+  }
+  if (group.total_refunded > 0) {
+    return 'batch-badge--primary';
+  }
+  return 'batch-badge--success';
+}
+
+function batchRefundProgress(group: BatchGroup) {
+  if (group.total_paid <= 0) {
+    return group.total_refunded > 0 ? 100 : 0;
+  }
+  return Math.min(100, Math.round((group.total_refunded / group.total_paid) * 100));
+}
+
+function syncDefaultExpanded() {
+  if (expandedBatches.value.size > 0) {
+    return;
+  }
+  for (const group of batchGroups.value) {
+    if (batchHasPending(group)) {
+      expandedBatches.value.add(group.batch_no);
+    }
+  }
+  const first = batchGroups.value[0];
+  if (expandedBatches.value.size === 0 && first) {
+    expandedBatches.value.add(first.batch_no);
+  }
 }
 
 function statusTagType(status: string) {
@@ -300,7 +389,7 @@ async function handleBatchFullRefund(group: BatchGroup) {
     return;
   }
   try {
-    await ElMessageBox.confirm(
+    const { value: inputBatchNo } = await ElMessageBox.prompt(
       `<div style="line-height:1.8">
         <div><b>批次号：</b>${group.batch_no}</div>
         <div><b>订单数：</b>${group.orders.length} 条</div>
@@ -309,6 +398,7 @@ async function handleBatchFullRefund(group: BatchGroup) {
         <div style="margin-top:6px;padding-top:6px;border-top:1px solid #eee">
           <b>本次退款：</b><span style="color:#f56c6c;font-size:16px;font-weight:700">${formatMoney(group.remaining)}</span>
         </div>
+        <div style="margin-top:8px;color:#f56c6c;font-size:13px">请输入批次号确认退款</div>
       </div>`,
       '批次全额退款',
       {
@@ -316,8 +406,18 @@ async function handleBatchFullRefund(group: BatchGroup) {
         cancelButtonText: '取消',
         dangerouslyUseHTMLString: true,
         type: 'warning',
+        inputPlaceholder: '请输入批次号',
+        inputValidator: (val: string) => {
+          if (!val || val.trim() !== group.batch_no) {
+            return '批次号不匹配，请重新输入';
+          }
+          return true;
+        },
       },
     );
+    if (!inputBatchNo || inputBatchNo.trim() !== group.batch_no) {
+      return;
+    }
   } catch {
     return;
   }
@@ -423,10 +523,12 @@ async function loadRecords() {
     loading.value = false;
   }
   loadPendingBatches();
+  syncDefaultExpanded();
 }
 
 function searchRecords() {
   pagination.page = 1;
+  expandedBatches.value.clear();
   loadRecords();
 }
 
@@ -434,6 +536,7 @@ function resetFilters() {
   filters.keyword = '';
   filters.status = '';
   pagination.page = 1;
+  expandedBatches.value.clear();
   loadRecords();
 }
 
@@ -465,16 +568,16 @@ onMounted(loadRecords);
     </section>
 
     <section class="summary-grid">
-      <div class="stat-card">
+      <div class="stat-card stat-card--primary">
         <div class="stat-icon stat-icon--total">
           <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M4 4a2 2 0 00-2 2v1h16V6a2 2 0 00-2-2H4z" /><path fill-rule="evenodd" d="M18 9H2v5a2 2 0 002 2h12a2 2 0 002-2V9zM4 13a1 1 0 011-1h1a1 1 0 110 2H5a1 1 0 01-1-1zm5-1a1 1 0 100 2h1a1 1 0 100-2H9z" clip-rule="evenodd" /></svg>
         </div>
         <div class="stat-body">
-          <span>退款批次</span>
-          <strong>{{ summary.total.toLocaleString('zh-CN') }}</strong>
+          <span>本页批次</span>
+          <strong>{{ summary.batchCount }}</strong>
         </div>
       </div>
-      <div class="stat-card">
+      <div class="stat-card" :class="{ 'stat-card--alert': summary.requested > 0 }">
         <div class="stat-icon stat-icon--requested">
           <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-12a1 1 0 10-2 0v4a1 1 0 00.293.707l2.828 2.829a1 1 0 101.415-1.415L11 9.586V6z" clip-rule="evenodd" /></svg>
         </div>
@@ -488,8 +591,8 @@ onMounted(loadRecords);
           <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M11 17a1 1 0 001.447.894l4-2A1 1 0 0017 15V9.236a1 1 0 00-1.447-.894l-4 2a1 1 0 00-.553.894V17zM15.211 6.276a1 1 0 000-1.788l-4.764-2.382a1 1 0 00-.894 0L4.789 4.488a1 1 0 000 1.788l4.764 2.382a1 1 0 00.894 0l4.764-2.382zM4.447 8.342A1 1 0 003 9.236V15a1 1 0 00.553.894l4 2A1 1 0 009 17v-5.764a1 1 0 00-.553-.894l-4-2z" /></svg>
         </div>
         <div class="stat-body">
-          <span>当前订单数</span>
-          <strong>{{ records.length }}</strong>
+          <span>退款计算中</span>
+          <strong>{{ summary.calculating }}</strong>
         </div>
       </div>
       <div class="stat-card stat-card--highlight">
@@ -497,32 +600,49 @@ onMounted(loadRecords);
           <svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path fill-rule="evenodd" d="M4 4a2 2 0 00-2 2v4a2 2 0 002 2V6h10a2 2 0 00-2-2H4zm2 6a2 2 0 012-2h8a2 2 0 012 2v4a2 2 0 01-2 2H8a2 2 0 01-2-2v-4zm6 4a2 2 0 100-4 2 2 0 000 4z" clip-rule="evenodd" /></svg>
         </div>
         <div class="stat-body">
-          <span>已退金额</span>
+          <span>本页已退</span>
           <strong class="money-highlight">{{ formatMoney(summary.refundedAmount) }}</strong>
         </div>
       </div>
     </section>
 
-    <!-- 待审核批次快捷操作 -->
-    <section
-      v-if="canReviewRefund && pendingBatches.length > 0"
-      class="batch-approve-panel"
-    >
-      <div class="batch-approve-title">
-        <span>待审核批次</span>
-        <small>以下批次有退款待审核，可一键通过整个批次</small>
+    <!-- 按批次分组列表 -->
+    <section class="record-panel" v-loading="loading">
+      <div class="filter-bar">
+        <ElInput
+          v-model="filters.keyword"
+          clearable
+          placeholder="搜索订单号、批次、链接、笔记ID、作者"
+          @keyup.enter="searchRecords"
+        />
+        <ElSelect v-model="filters.status" placeholder="全部状态">
+          <ElOption label="全部状态" value="" />
+          <ElOption label="退款待审" value="refund_requested" />
+          <ElOption label="退款计算中" value="refund_calculating" />
+          <ElOption label="停止中" value="stopping" />
+          <ElOption label="已退款" value="refund_approved" />
+          <ElOption label="退款拒绝" value="refund_rejected" />
+          <ElOption label="已完成" value="completed" />
+          <ElOption label="进行中" value="running" />
+        </ElSelect>
+        <ElButton type="primary" @click="searchRecords">查询</ElButton>
+        <ElButton @click="resetFilters">重置</ElButton>
+        <span class="filter-count">共 {{ pagination.total }} 条 / {{ batchGroups.length }} 批</span>
       </div>
-      <div class="batch-approve-list">
-        <div
-          v-for="batch in pendingBatches"
-          :key="batch.batch_no"
-          class="batch-approve-item"
-        >
-          <div class="batch-approve-info">
-            <span class="batch-no">{{ batch.batch_no }}</span>
-            <span class="batch-meta">{{ batch.user }} / {{ batch.count }} 条待审核</span>
-          </div>
-          <div class="batch-approve-actions">
+
+      <div
+        v-if="canReviewRefund && pendingBatches.length > 0"
+        class="pending-strip"
+      >
+        <span class="pending-strip-label">待审核 {{ pendingBatches.length }} 批</span>
+        <div class="pending-strip-list">
+          <div
+            v-for="batch in pendingBatches"
+            :key="batch.batch_no"
+            class="pending-chip"
+          >
+            <code :title="batch.batch_no">{{ shortenBatchNo(batch.batch_no) }}</code>
+            <span>{{ batch.count }} 条</span>
             <ElPopconfirm
               :title="`确认通过批次 ${batch.batch_no} 的全部 ${batch.count} 条退款申请？`"
               confirm-button-text="全部通过"
@@ -531,13 +651,13 @@ onMounted(loadRecords);
               @confirm="batchApproveByBatchNo(batch.batch_no)"
             >
               <template #reference>
-                <ElButton
-                  :loading="batchApprovingNo === batch.batch_no"
-                  size="small"
-                  type="primary"
+                <button
+                  class="rv-btn rv-btn--approve rv-btn--sm"
+                  :disabled="batchApprovingNo === batch.batch_no"
+                  @click.stop
                 >
-                  一键通过 ({{ batch.count }})
-                </ElButton>
+                  通过
+                </button>
               </template>
             </ElPopconfirm>
             <ElPopconfirm
@@ -548,129 +668,121 @@ onMounted(loadRecords);
               @confirm="batchRejectByBatchNo(batch.batch_no)"
             >
               <template #reference>
-                <ElButton
-                  :loading="batchRejectingNo === batch.batch_no"
-                  size="small"
-                  type="danger"
+                <button
+                  class="rv-btn rv-btn--reject rv-btn--sm"
+                  :disabled="batchRejectingNo === batch.batch_no"
+                  @click.stop
                 >
-                  一键拒绝 ({{ batch.count }})
-                </ElButton>
+                  拒绝
+                </button>
               </template>
             </ElPopconfirm>
           </div>
         </div>
       </div>
-    </section>
 
-    <!-- 按批次分组列表 -->
-    <section class="record-panel">
-      <div class="filter-bar">
-        <ElInput
-          v-model="filters.keyword"
-          clearable
-          placeholder="搜索订单号、批次、链接、笔记ID、作者"
-          @keyup.enter="searchRecords"
-        />
-        <ElSelect v-model="filters.status" placeholder="全部状态">
-          <ElOption label="全部状态" value="" />
-          <ElOption label="退款中" value="refund_requested" />
-          <ElOption label="退款中" value="refund_calculating" />
-          <ElOption label="停止中" value="stopping" />
-          <ElOption label="退款通过" value="refund_approved" />
-          <ElOption label="退款拒绝" value="refund_rejected" />
-          <ElOption label="已完成" value="completed" />
-          <ElOption label="进行中" value="running" />
-        </ElSelect>
-        <ElButton type="primary" @click="searchRecords">查询</ElButton>
-        <ElButton @click="resetFilters">重置</ElButton>
+      <div v-if="!loading && batchGroups.length === 0" class="empty-hint">
+        <p>暂无退款记录</p>
+        <small>调整筛选条件后重试</small>
       </div>
 
-      <div v-loading="loading" class="batch-list">
-        <div v-if="!loading && batchGroups.length === 0" class="empty-hint">暂无退款记录</div>
-
+      <div v-else class="batch-list">
         <div
           v-for="group in batchGroups"
           :key="group.batch_no || '_none'"
           class="batch-card"
+          :class="{ 'batch-card--expanded': expandedBatches.has(group.batch_no), 'batch-card--pending': batchHasPending(group) }"
         >
-          <!-- 批次头部 -->
-          <div class="batch-head" @click="toggleExpand(group.batch_no)">
-            <div class="batch-head-left">
-              <span class="expand-icon" :class="{ 'expand-icon--open': expandedBatches.has(group.batch_no) }">▶</span>
-              <div class="batch-head-info">
-                <div class="batch-head-top">
-                  <strong class="batch-no-text">{{ group.batch_no || '无批次' }}</strong>
-                  <ElTag size="small" effect="plain">{{ group.orders.length }} 条</ElTag>
-                  <span class="batch-type-chip">{{ targetTypeLabel(group.target_type) }}</span>
-                </div>
-                <span class="batch-head-user">{{ group.display_name }}</span>
+          <div
+            class="batch-head"
+            :style="{ '--progress': `${batchRefundProgress(group)}%` }"
+            @click="toggleExpand(group.batch_no)"
+          >
+            <span class="expand-arrow" :class="{ open: expandedBatches.has(group.batch_no) }">›</span>
+            <div class="batch-main">
+              <div class="batch-top">
+                <span class="batch-badge" :class="batchHeadStatusClass(group)">
+                  {{ batchHeadStatusLabel(group) }}
+                </span>
+                <ElTag size="small" effect="plain">{{ group.orders.length }} 条</ElTag>
+                <ElTag size="small" effect="plain" type="primary">{{ targetTypeLabel(group.target_type) }}</ElTag>
+              </div>
+              <span class="batch-no-text" :title="group.batch_no">{{ shortenBatchNo(group.batch_no) }}</span>
+              <div class="batch-sub">
+                <span v-if="group.display_name">{{ group.display_name }}</span>
+                <span>{{ group.orders.length }} 单</span>
               </div>
             </div>
-            <div class="batch-head-right" @click.stop>
-              <div class="batch-amounts">
-                <div class="ba-row">
-                  <span class="ba-label">总付款</span>
-                  <strong class="ba-value">{{ formatMoney(group.total_paid) }}</strong>
-                </div>
-                <div class="ba-row">
-                  <span class="ba-label">已退</span>
-                  <strong class="ba-value ba-value--refunded">{{ formatMoney(group.total_refunded) }}</strong>
-                </div>
-                <div class="ba-row" v-if="group.remaining > 0">
-                  <span class="ba-label">可退</span>
-                  <strong class="ba-value ba-value--remaining">{{ formatMoney(group.remaining) }}</strong>
-                </div>
+            <div class="batch-side">
+              <div class="batch-money-row">
+                <span>总付 <strong>{{ formatMoney(group.total_paid) }}</strong></span>
+                <span>已退 <strong class="text-warning">{{ formatMoney(group.total_refunded) }}</strong></span>
+                <span>可退 <strong :class="group.remaining > 0 ? 'text-danger' : ''">{{ formatMoney(group.remaining) }}</strong></span>
               </div>
-              <div v-if="canReviewRefund" class="batch-head-actions">
-                <button
-                  v-if="group.batch_no"
-                  class="rv-btn rv-btn--full-refund"
-                  :disabled="fullRefundingBatchNo === group.batch_no || group.remaining <= 0"
-                  @click="handleBatchFullRefund(group)"
-                >
-                  {{ fullRefundingBatchNo === group.batch_no ? '退款中…' : '批次全额退款' }}
-                </button>
-              </div>
+              <button
+                v-if="canReviewRefund && group.batch_no"
+                class="rv-btn rv-btn--full-refund rv-btn--sm"
+                :disabled="fullRefundingBatchNo === group.batch_no || group.remaining <= 0"
+                @click.stop="handleBatchFullRefund(group)"
+              >
+                {{ fullRefundingBatchNo === group.batch_no ? '退款中…' : '全额退款' }}
+              </button>
             </div>
           </div>
 
-          <!-- 展开的订单列表 -->
           <Transition
             @enter="collapseEnter"
             @after-enter="collapseAfterEnter"
             @leave="collapseLeave"
             @after-leave="collapseAfterLeave"
           >
-          <div v-if="expandedBatches.has(group.batch_no)" class="batch-body">
-            <div
-              v-for="row in group.orders"
-              :key="row.order_id"
-              class="order-row"
-            >
-              <div class="order-row-left">
-                <div class="order-row-no">
-                  <span class="order-no-text">{{ row.order_no }}</span>
+            <div v-if="expandedBatches.has(group.batch_no)" class="batch-body">
+              <article
+                v-for="row in group.orders"
+                :key="row.order_id"
+                class="order-row"
+                :class="{ 'order-row--pending': canReviewStatus(row.order_status) }"
+              >
+                <div class="order-thumb">
+                  <img
+                    v-if="avatarVisible(row)"
+                    :src="row.avatar_url"
+                    alt=""
+                    referrerpolicy="no-referrer"
+                    @error="onAvatarError(row.order_id)"
+                  />
+                  <span v-else>{{ authorInitial(row) }}</span>
                 </div>
-                <div class="order-row-note">
-                  <img v-if="row.avatar_url" :src="row.avatar_url" class="note-avatar" alt="" />
-                  <div v-else class="note-avatar-ph">{{ (row.author_name || '?')[0] }}</div>
-                  <div class="note-info">
-                    <span class="note-title">{{ row.title || row.note_id || '-' }}</span>
-                    <span class="note-author">{{ row.author_name || '-' }}</span>
+                <div class="order-row-main">
+                  <div class="order-row-title">
+                    <strong>{{ row.title || row.note_id || '未命名笔记' }}</strong>
+                    <ElTag :type="statusTagType(row.order_status)" effect="plain" size="small">
+                      {{ statusLabel(row.order_status) }}
+                    </ElTag>
                   </div>
+                  <div class="order-author-row">
+                    <span class="order-author-name">{{ row.author_name || '未知博主' }}</span>
+                    <span v-if="row.note_id" class="order-note-id">{{ row.note_id }}</span>
+                  </div>
+                  <a
+                    v-if="orderNoteLink(row)"
+                    class="order-link"
+                    :href="orderNoteLink(row)"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    :title="orderNoteLink(row)"
+                    @click.stop
+                  >{{ orderNoteLink(row) }}</a>
+                  <p v-else class="order-link order-link--empty">暂无链接</p>
+                  <p class="order-meta">{{ row.order_no }}</p>
                 </div>
-                <span class="order-qty-chip">{{ row.ordered_quantity.toLocaleString('zh-CN') }} 个</span>
-              </div>
-              <div class="order-row-right">
-                <div class="order-money">
-                  <span class="om-paid">{{ formatMoney(row.actual_paid_amount) }}</span>
-                  <span class="om-refunded" v-if="Number(row.refund_amount_total) > 0">已退 {{ formatMoney(row.refund_amount_total) }}</span>
-                </div>
-                <ElTag :type="statusTagType(row.order_status)" effect="plain" size="small">
-                  {{ statusLabel(row.order_status) }}
-                </ElTag>
-                <div v-if="canReviewRefund" class="order-row-actions">
-                  <template v-if="canReviewStatus(row.order_status)">
+                <div class="order-row-side">
+                  <span class="order-qty">{{ row.ordered_quantity.toLocaleString('zh-CN') }}</span>
+                  <strong>{{ formatMoney(row.actual_paid_amount) }}</strong>
+                  <span v-if="Number(row.refund_amount_total) > 0" class="order-refunded">
+                    已退 {{ formatMoney(row.refund_amount_total) }}
+                  </span>
+                  <div v-if="canReviewRefund && canReviewStatus(row.order_status)" class="order-actions">
                     <ElPopconfirm
                       title="确认通过并退款到余额？"
                       confirm-button-text="通过"
@@ -691,11 +803,10 @@ onMounted(loadRecords);
                         <button class="rv-btn rv-btn--reject rv-btn--sm" :disabled="reviewingOrderId === row.order_id">拒绝</button>
                       </template>
                     </ElPopconfirm>
-                  </template>
+                  </div>
                 </div>
-              </div>
+              </article>
             </div>
-          </div>
           </Transition>
         </div>
       </div>
@@ -721,9 +832,15 @@ onMounted(loadRecords);
   display: flex;
   flex-direction: column;
   gap: 16px;
-  min-height: 100%;
+  min-height: calc(100dvh - 88px);
   padding: 20px;
+  box-sizing: border-box;
   color: var(--el-text-color-primary);
+}
+
+.page-head,
+.summary-grid {
+  flex-shrink: 0;
 }
 
 /* ---- header ---- */
@@ -790,8 +907,8 @@ onMounted(loadRecords);
 .stat-card {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 18px 20px;
+  gap: 12px;
+  padding: 14px 16px;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
   background: var(--el-bg-color);
@@ -818,6 +935,12 @@ onMounted(loadRecords);
   flex-shrink: 0;
 }
 
+.stat-card--primary .stat-icon--total { background: var(--el-color-primary-light-8); color: var(--el-color-primary); }
+.stat-card--alert {
+  border-color: var(--el-color-warning-light-5);
+  background: var(--el-color-warning-light-9);
+}
+
 .stat-icon--total { background: var(--el-color-primary-light-8); color: var(--el-color-primary); }
 .stat-icon--requested { background: var(--el-color-info-light-8); color: var(--el-color-info); }
 .stat-icon--calc { background: var(--el-color-warning-light-8); color: var(--el-color-warning); }
@@ -835,7 +958,7 @@ onMounted(loadRecords);
 }
 
 .stat-body strong {
-  font-size: 22px;
+  font-size: 20px;
   font-weight: 700;
   line-height: 1.1;
 }
@@ -844,57 +967,13 @@ onMounted(loadRecords);
   color: var(--el-color-warning);
 }
 
-/* ---- batch approve ---- */
-.batch-approve-panel {
-  padding: 16px 20px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 12px;
-  background: var(--el-bg-color);
-}
-
-.batch-approve-title {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  margin-bottom: 12px;
-}
-
-.batch-approve-title > span { font-size: 15px; font-weight: 600; }
-.batch-approve-title > small { font-size: 12px; color: var(--el-text-color-secondary); }
-
-.batch-approve-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.batch-approve-item {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 8px;
-  background: var(--el-fill-color-lighter);
-}
-
-.batch-approve-actions { display: flex; gap: 8px; }
-
-.batch-approve-info { display: flex; flex-direction: column; gap: 2px; }
-
-.batch-no {
-  font-size: 13px;
-  font-weight: 600;
-  font-family: Consolas, monospace;
-}
-
-.batch-meta {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-
 /* ---- record panel ---- */
 .record-panel {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   padding: 18px;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
@@ -902,279 +981,420 @@ onMounted(loadRecords);
 }
 
 .filter-bar {
-  display: grid;
-  grid-template-columns: minmax(240px, 1fr) 160px auto auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.filter-bar :deep(.el-input) {
+  flex: 1;
+  min-width: 200px;
+}
+
+.filter-bar :deep(.el-select) {
+  width: 130px;
+}
+
+.filter-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.pending-strip {
+  flex-shrink: 0;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-color-warning-light-5);
+  border-radius: 10px;
+  background: var(--el-color-warning-light-9);
+}
+
+.pending-strip-label {
+  display: block;
+  margin-bottom: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-color-warning);
+}
+
+.pending-strip-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.pending-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-bg-color);
+  font-size: 12px;
+}
+
+.pending-chip code {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.pending-chip > span {
+  color: var(--el-text-color-secondary);
 }
 
 .empty-hint {
-  text-align: center;
-  padding: 60px 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   color: var(--el-text-color-secondary);
+}
+
+.empty-hint p {
+  margin: 0;
   font-size: 14px;
 }
 
-/* ---- batch list ---- */
+.empty-hint small {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.text-warning { color: var(--el-color-warning); }
+.text-danger { color: var(--el-color-danger); }
+
 .batch-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
+  padding-right: 4px;
 }
 
 .batch-card {
+  flex-shrink: 0;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 10px;
   overflow: hidden;
-  transition: border-color 0.15s;
+  background: var(--el-bg-color);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 
 .batch-card:hover {
   border-color: var(--el-color-primary-light-5);
 }
 
-/* ---- batch head ---- */
+.batch-card--expanded {
+  border-color: var(--el-color-primary-light-5);
+  box-shadow: 0 2px 8px rgb(0 0 0 / 4%);
+}
+
+.batch-card--pending {
+  border-color: var(--el-color-warning-light-5);
+}
+
 .batch-head {
-  display: flex;
+  position: relative;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  gap: 12px;
   align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 14px 18px;
+  padding: 12px 14px;
   cursor: pointer;
-  transition: background 0.15s;
+  overflow: hidden;
+  transition: background 0.12s;
+}
+
+.batch-head::before {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--progress);
+  background: color-mix(in srgb, var(--el-color-warning) 8%, transparent);
+  content: '';
+  pointer-events: none;
+}
+
+.batch-head > * {
+  position: relative;
+  z-index: 1;
 }
 
 .batch-head:hover {
   background: var(--el-fill-color-lighter);
 }
 
-.batch-head-left {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  min-width: 0;
-}
-
-.expand-icon {
-  font-size: 10px;
+.expand-arrow {
+  font-size: 18px;
+  line-height: 1;
   color: var(--el-text-color-secondary);
   transition: transform 0.2s;
-  flex-shrink: 0;
 }
 
-.expand-icon--open {
+.expand-arrow.open {
   transform: rotate(90deg);
-}
-
-.batch-head-info {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  min-width: 0;
-}
-
-.batch-head-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.batch-no-text {
-  font-size: 14px;
-  font-weight: 600;
-  font-family: Consolas, monospace;
   color: var(--el-color-primary);
 }
 
-.batch-type-chip {
-  padding: 1px 8px;
-  border-radius: 4px;
-  background: var(--el-fill-color-light);
-  font-size: 11px;
-  color: var(--el-text-color-regular);
+.batch-main {
+  min-width: 0;
 }
 
-.batch-head-user {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-
-.batch-head-right {
+.batch-top {
   display: flex;
   align-items: center;
-  gap: 16px;
-  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
 }
 
-.batch-amounts {
-  display: flex;
-  gap: 16px;
-}
-
-.ba-row {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 1px;
-}
-
-.ba-label {
-  font-size: 11px;
-  color: var(--el-text-color-secondary);
-}
-
-.ba-value {
-  font-size: 14px;
+.batch-badge {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 10px;
   font-weight: 600;
-  font-family: Consolas, monospace;
+  white-space: nowrap;
 }
 
-.ba-value--refunded {
+.batch-badge--warning {
+  background: var(--el-color-warning-light-9);
   color: var(--el-color-warning);
 }
 
-.ba-value--remaining {
-  color: var(--el-color-danger);
+.batch-badge--success {
+  background: var(--el-color-success-light-9);
+  color: var(--el-color-success);
 }
 
-.batch-head-actions {
+.batch-badge--primary {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+}
+
+.batch-badge--muted {
+  background: var(--el-fill-color);
+  color: var(--el-text-color-secondary);
+}
+
+.batch-no-text {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.batch-sub {
   display: flex;
-  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
 }
 
-/* ---- batch body (expanded orders) ---- */
+.batch-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.batch-money-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px 12px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.batch-money-row strong {
+  margin-left: 2px;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--el-text-color-primary);
+}
+
 .batch-body {
   border-top: 1px solid var(--el-border-color-lighter);
+  padding: 8px 10px 10px;
   background: var(--el-fill-color-blank);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 
 .order-row {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 10px 18px 10px 42px;
-  border-bottom: 1px solid var(--el-border-color-extra-light);
-  transition: background 0.1s;
-}
-
-.order-row:last-child {
-  border-bottom: none;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-bg-color);
+  transition: border-color 0.12s;
 }
 
 .order-row:hover {
-  background: var(--el-fill-color-lighter);
+  border-color: var(--el-color-primary-light-5);
 }
 
-.order-row-left {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex: 1;
-  min-width: 0;
+.order-row--pending {
+  border-color: var(--el-color-warning-light-5);
+  background: color-mix(in srgb, var(--el-color-warning) 4%, var(--el-bg-color));
 }
 
-.order-row-no {
-  min-width: 180px;
-  max-width: 220px;
-}
-
-.order-no-text {
-  font-size: 12px;
-  font-family: Consolas, monospace;
-  color: var(--el-text-color-regular);
-}
-
-.order-row-note {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex: 1;
-  max-width: 260px;
-}
-
-.note-avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  object-fit: cover;
-  flex-shrink: 0;
-}
-
-.note-avatar-ph {
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  background: var(--el-color-primary-light-8);
-  color: var(--el-color-primary);
+.order-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--el-fill-color);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--el-color-primary);
   flex-shrink: 0;
 }
 
-.note-info {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
+.order-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.order-row-main {
+  flex: 1;
   min-width: 0;
 }
 
-.note-title {
-  font-size: 12px;
-  font-weight: 500;
+.order-row-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.order-row-title strong {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.order-meta {
+  margin: 4px 0 0;
+  font-size: 11px;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.note-author {
+.order-author-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  min-width: 0;
+}
+
+.order-author-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-regular);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.order-note-id {
+  flex-shrink: 0;
   font-size: 11px;
+  font-family: ui-monospace, Consolas, monospace;
   color: var(--el-text-color-secondary);
 }
 
-.order-qty-chip {
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: var(--el-fill-color-light);
-  font-size: 11px;
-  color: var(--el-text-color-regular);
+.order-link {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-color-primary);
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  flex-shrink: 0;
 }
 
-.order-row-right {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-shrink: 0;
+.order-link:hover {
+  text-decoration: underline;
 }
 
-.order-money {
+.order-link--empty {
+  color: var(--el-text-color-placeholder);
+  font-style: normal;
+}
+
+.order-row-side {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 1px;
-  min-width: 90px;
+  gap: 4px;
+  flex-shrink: 0;
+  min-width: 88px;
 }
 
-.om-paid {
+.order-qty {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.order-row-side strong {
   font-size: 13px;
-  font-weight: 600;
-  font-family: Consolas, monospace;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
-.om-refunded {
+.order-refunded {
   font-size: 11px;
   color: var(--el-color-warning);
+  white-space: nowrap;
 }
 
-.order-row-actions {
+.order-actions {
   display: flex;
   gap: 4px;
+  margin-top: 4px;
 }
 
 /* ---- buttons ---- */
@@ -1235,31 +1455,34 @@ onMounted(loadRecords);
 .pagination-bar {
   display: flex;
   justify-content: flex-end;
-  padding-top: 16px;
+  padding-top: 12px;
+  flex-shrink: 0;
 }
 
 /* ---- responsive ---- */
 @media (max-width: 1200px) {
   .batch-head {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 10px;
+    grid-template-columns: 24px minmax(0, 1fr);
   }
 
-  .batch-head-right {
-    flex-wrap: wrap;
+  .batch-side {
+    grid-column: 2;
+    align-items: stretch;
+  }
+
+  .batch-money-row {
+    justify-content: flex-start;
   }
 
   .order-row {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 8px;
-    padding-left: 18px;
+    flex-wrap: wrap;
   }
 
-  .order-row-right {
-    justify-content: flex-end;
-    flex-wrap: wrap;
+  .order-row-side {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
   }
 }
 
@@ -1268,28 +1491,39 @@ onMounted(loadRecords);
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .filter-bar {
-    grid-template-columns: 1fr 140px;
+  .filter-count {
+    width: 100%;
+    margin-left: 0;
   }
 
-  .batch-amounts {
-    flex-wrap: wrap;
-    gap: 8px;
+  .filter-bar :deep(.el-select) {
+    width: 100%;
   }
 }
 
 @media (max-width: 640px) {
   .refund-page {
     padding: 12px;
+    min-height: calc(100dvh - 72px);
   }
 
-  .summary-grid,
-  .filter-bar {
+  .summary-grid {
     grid-template-columns: 1fr;
   }
 
-  .batch-approve-list {
+  .filter-bar :deep(.el-input) {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .pending-chip {
+    flex-wrap: wrap;
+    width: 100%;
+  }
+
+  .order-row-title {
     flex-direction: column;
+    align-items: flex-start;
   }
 }
 </style>

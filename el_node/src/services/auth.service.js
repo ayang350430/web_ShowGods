@@ -71,7 +71,95 @@ const register = async ({ username, password }) => {
   };
 };
 
+const requestPasswordReset = async ({ username }) => {
+  const db = getPool();
+  const [[user]] = await db.execute(
+    'SELECT id, username, real_name FROM users WHERE username = ? LIMIT 1',
+    [username],
+  );
+  if (!user) {
+    const error = new Error('账号不存在');
+    error.statusCode = 404;
+    throw error;
+  }
+
+  // 防重复：5 分钟内同一用户只能提交一次
+  const [[recent]] = await db.execute(
+    `SELECT id FROM password_reset_requests
+     WHERE user_id = ? AND status = 'pending' AND created_at > DATE_SUB(NOW(), INTERVAL 5 MINUTE)
+     LIMIT 1`,
+    [user.id],
+  );
+  if (recent) {
+    const error = new Error('已提交过申请，请等待管理员处理');
+    error.statusCode = 429;
+    throw error;
+  }
+
+  await db.execute(
+    `INSERT INTO password_reset_requests (user_id, username, status, created_at)
+     VALUES (?, ?, 'pending', NOW())`,
+    [user.id, user.username],
+  );
+
+  return { username: user.username };
+};
+
+const getPasswordResetRequests = async () => {
+  const db = getPool();
+  const [rows] = await db.execute(
+    `SELECT pr.id, pr.user_id, pr.username, u.real_name, pr.status, pr.created_at, pr.handled_at
+     FROM password_reset_requests pr
+     LEFT JOIN users u ON u.id = pr.user_id
+     ORDER BY pr.id DESC
+     LIMIT 50`,
+  );
+  return rows;
+};
+
+const handlePasswordResetRequest = async (requestId, { action, newPassword }) => {
+  const db = getPool();
+  const [[req]] = await db.execute(
+    'SELECT id, user_id, status FROM password_reset_requests WHERE id = ? LIMIT 1',
+    [requestId],
+  );
+  if (!req) {
+    const error = new Error('申请不存在');
+    error.statusCode = 404;
+    throw error;
+  }
+  if (req.status !== 'pending') {
+    const error = new Error('该申请已处理');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  if (action === 'approve') {
+    if (!newPassword || newPassword.length < 6) {
+      const error = new Error('新密码至少 6 位');
+      error.statusCode = 400;
+      throw error;
+    }
+    const passwordHash = await bcrypt.hash(newPassword, 10);
+    await db.execute('UPDATE users SET password_hash = ? WHERE id = ?', [passwordHash, req.user_id]);
+    await db.execute(
+      "UPDATE password_reset_requests SET status = 'approved', handled_at = NOW() WHERE id = ?",
+      [requestId],
+    );
+    return { status: 'approved' };
+  }
+
+  await db.execute(
+    "UPDATE password_reset_requests SET status = 'rejected', handled_at = NOW() WHERE id = ?",
+    [requestId],
+  );
+  return { status: 'rejected' };
+};
+
 module.exports = {
+  getPasswordResetRequests,
+  handlePasswordResetRequest,
   login,
   register,
+  requestPasswordReset,
 };

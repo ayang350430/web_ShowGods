@@ -1,24 +1,21 @@
-<script setup lang="ts">
+﻿<script setup lang="ts">
 import type { OrderApi } from '#/api';
 
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 
 import { createIconifyIcon } from '@vben/icons';
 
 import {
-  ElAlert,
   ElButton,
   ElCheckbox,
   ElDrawer,
   ElInput,
   ElMessage,
   ElMessageBox,
-  ElOption,
-  ElRadioButton,
-  ElRadioGroup,
-  ElSelect,
   ElTag,
 } from 'element-plus';
+
+import { useUserStore } from '@vben/stores';
 
 import {
   checkBackendConnectionApi,
@@ -32,6 +29,13 @@ import {
   saveProblemLinkRecordsApi,
   submitBatchOrderApi,
 } from '#/api';
+
+const userStore = useUserStore();
+const isAdmin = computed(() =>
+  (userStore.userInfo?.roles ?? []).some((role: any) =>
+    ['admin', 'super'].includes(typeof role === 'string' ? role : role?.value),
+  ),
+);
 
 const vReveal = {
   mounted(el: HTMLElement) {
@@ -52,9 +56,37 @@ const vReveal = {
 
 const AlertIcon = createIconifyIcon('lucide:triangle-alert');
 const CheckIcon = createIconifyIcon('lucide:circle-check');
+const EyeIcon = createIconifyIcon('lucide:eye');
+const HeartIcon = createIconifyIcon('lucide:heart');
 const InfoIcon = createIconifyIcon('lucide:info');
 const LinkIcon = createIconifyIcon('lucide:link');
 const RefreshIcon = createIconifyIcon('lucide:refresh-cw');
+const SparklesIcon = createIconifyIcon('lucide:sparkles');
+const ClipboardIcon = createIconifyIcon('lucide:clipboard-list');
+const CopyIcon = createIconifyIcon('lucide:copy');
+const SearchIcon = createIconifyIcon('lucide:search');
+
+const typeOptions = [
+  { label: '阅读', value: 'view' as const, icon: EyeIcon },
+  { label: '点赞', value: 'like' as const, icon: HeartIcon },
+  { label: '曝光', value: 'impression' as const, icon: SparklesIcon },
+];
+
+const typeLabelMap = { view: '阅读', like: '点赞', impression: '曝光' };
+
+const WalletIcon = createIconifyIcon('lucide:wallet');
+const ListIcon = createIconifyIcon('lucide:list-checks');
+
+const submitHint = computed(() => {
+  if (isAdmin.value) return '管理员账号不允许下单';
+  if (connectionOk.value === false) return '连接异常，请先恢复后端服务';
+  if (!content.value) return '请先输入批量内容';
+  if (!preview.value) return '请先手动预校验';
+  if (preview.value.warnings.length) return preview.value.warnings[0]!;
+  if (!agreePolicy.value) return '请确认公告内容';
+  if (canSubmit.value) return '校验通过，可以提交';
+  return '当前不可提交';
+});
 
 const content = ref('');
 const agreePolicy = ref(false);
@@ -67,11 +99,18 @@ const previewing = ref(false);
 const streamTotal = ref(0);
 const streamResolved = ref(0);
 const removedDrawerVisible = ref(false);
+const windowWidth = ref(typeof window !== 'undefined' ? window.innerWidth : 1024);
+const drawerSize = computed(() => (windowWidth.value <= 768 ? '100%' : '760px'));
+
+function handleWindowResize() {
+  windowWidth.value = window.innerWidth;
+}
 const orderRecords = ref<OrderApi.BatchOrderRecord[]>([]);
 const orderRecordTotal = ref(0);
 const batchOrdersCache = ref<Map<number, OrderApi.BatchOrderRecordItem[]>>(new Map());
 const selectedDrawerBatchKey = ref('');
 const orderDrawerKeyword = ref('');
+const drawerBatchKeyword = ref('');
 const orderDrawerStatus = ref<'all' | 'failed' | 'success'>('all');
 const removedProblemLinks = ref<OrderApi.ProblemLinkRecord[]>([]);
 const recordKeyword = ref('');
@@ -124,6 +163,7 @@ function isTypeDisabled(type: 'impression' | 'like' | 'view') {
 
 const canSubmit = computed(
   () =>
+    !isAdmin.value &&
     Boolean(preview.value?.can_submit) &&
     agreePolicy.value &&
     connectionOk.value === true &&
@@ -261,7 +301,7 @@ const drawerBatches = computed(() => {
     batchNo: record.batch_no,
     failedCount: Number(record.failed_count) || 0,
     key: `order-${record.id}`,
-    label: `${record.batch_no} / 确认提交 / ${formatDateTime(record.submitted_at || record.created_at)}`,
+    label: `${record.batch_no} · ${formatShortDateTime(record.submitted_at || record.created_at)}`,
     record,
     status: record.status,
     successCount: Number(record.succeeded_count) || 0,
@@ -278,7 +318,7 @@ const drawerBatches = computed(() => {
     batchNo: group.batchNo,
     failedCount: group.failedCount,
     key: `problem-${group.batchNo}`,
-    label: `${group.batchNo} / 问题链接 / ${formatDateTime(group.time)}`,
+    label: `${group.batchNo} · ${formatShortDateTime(group.time)}`,
     records: group.records,
     status: group.failedCount > 0 ? 'failed' : 'completed',
     successCount: group.successCount,
@@ -386,6 +426,128 @@ function formatMoneyParts(value?: number) {
   };
 }
 
+function formatShortDateTime(value?: string) {
+  const full = formatDateTime(value);
+  if (full === '-') return full;
+  return full.slice(5, 16).replace(' ', ' · ');
+}
+
+function shortenBatchNo(batchNo: string) {
+  if (batchNo.length <= 18) return batchNo;
+  return `${batchNo.slice(0, 10)}…${batchNo.slice(-6)}`;
+}
+
+function drawerBatchStatus(batch: (typeof drawerBatches.value)[number]) {
+  if (batch.type === 'order') {
+    return {
+      class: batchStatusPillClass(batch.record),
+      label: batchDisplayStatusLabel(batch.record),
+    };
+  }
+  return { class: 'pill--warning', label: '问题' };
+}
+
+const filteredDrawerBatches = computed(() => {
+  const keyword = drawerBatchKeyword.value.trim().toLowerCase();
+  if (!keyword) return drawerBatches.value;
+  return drawerBatches.value.filter((batch) =>
+    [batch.batchNo, batch.label, batch.type === 'order' ? batch.record.status : '']
+      .join(' ')
+      .toLowerCase()
+      .includes(keyword),
+  );
+});
+const drawerHero = computed(() => {
+  const batch = selectedDrawerBatch.value;
+  if (!batch) return null;
+
+  if (batch.type === 'order') {
+    return {
+      amount: formatMoney(batch.amount),
+      batchNo: batch.batchNo,
+      failedCount: batch.failedCount,
+      failedLabel: '失败',
+      statusClass: batchStatusPillClass(batch.record),
+      statusLabel: batchDisplayStatusLabel(batch.record),
+      successCount: batch.successCount,
+      successLabel: '成功',
+      time: formatDateTime(batch.record.submitted_at || batch.record.created_at),
+      total: batch.total,
+      type: 'order' as const,
+      typeLabel: '确认提交',
+    };
+  }
+
+  return {
+    amount: formatMoney(batch.amount),
+    batchNo: batch.batchNo,
+    failedCount: batch.failedCount,
+    failedLabel: '放弃',
+    statusClass: 'pill--danger',
+    statusLabel: '问题批次',
+    successCount: batch.successCount,
+    successLabel: '通过',
+    time: formatDateTime(batch.time),
+    total: batch.total,
+    type: 'problem' as const,
+    typeLabel: '问题链接',
+  };
+});
+
+const drawerListItems = computed(() => {
+  if (selectedOrderBatch.value) {
+    return visibleOrderDrawerItems.value.map((order) => ({
+      id: order.id,
+      avatar: order.avatar_url || '',
+      author: order.author_name || '',
+      link: order.source_note_url || order.note_url || '',
+      linkRaw: false,
+      noteId: order.note_id || '',
+      noteTitle: order.title || '',
+      qty: order.ordered_quantity,
+      rowClass: [
+        order.order_status === 'failed' ? 'is-failed' : '',
+        isRefundedOrder(order) ? 'is-refunded' : '',
+        isRefundingOrder(order) ? 'is-refunding' : '',
+        order.order_status === 'completed' ? 'is-success' : '',
+      ].filter(Boolean).join(' '),
+      statusClass: orderDrawerStatusPillClass(order),
+      statusLabel: orderDrawerStatusLabel(order),
+      subtitle: order.author_name ? `${order.author_name} · ID ${order.id}` : `订单 ID ${order.id}`,
+      title: order.order_no,
+    }));
+  }
+
+  if (selectedProblemBatch.value) {
+    return visibleProblemDrawerItems.value.map((record) => ({
+      id: record.id,
+      avatar: record.avatar_url || '',
+      link: record.raw,
+      linkRaw: true,
+      noteId: record.note_id || '',
+      noteTitle: record.title || record.note_id || '',
+      qty: record.ordered_quantity,
+      rowClass: record.valid ? 'is-success' : 'is-failed',
+      statusClass: record.valid ? 'pill--success' : 'pill--danger',
+      statusLabel: record.valid ? '成功' : '放弃',
+      subtitle: record.author_name || '',
+      title: record.raw,
+    }));
+  }
+
+  return [];
+});
+
+const drawerStatusTabs = [
+  { label: '全部', value: 'all' as const },
+  { label: '成功', value: 'success' as const },
+  { label: '失败', value: 'failed' as const },
+];
+
+const drawerFailedTabLabel = computed(() =>
+  selectedProblemBatch.value ? '放弃' : '失败',
+);
+
 function formatDateTime(value?: string) {
   if (!value) {
     return '-';
@@ -409,6 +571,7 @@ function orderRecordStatusLabel(status: string) {
     refund_rejected: '退款已拒绝',
     refund_requested: '退款中',
     stopping: '退款中',
+    refunded: '已退款',
   };
   return statusMap[status] || status || '-';
 }
@@ -474,17 +637,20 @@ function orderDrawerStatusLabel(order: OrderApi.BatchOrderRecordItem) {
   return '进行中';
 }
 
-function orderDrawerStatusTagType(order: OrderApi.BatchOrderRecordItem) {
-  if (isRefundedOrder(order)) {
-    return 'warning';
-  }
-  if (isRefundRejectedOrder(order) || order.order_status === 'failed') {
-    return 'danger';
-  }
-  if (order.order_status === 'completed') {
-    return 'success';
-  }
-  return 'warning';
+function orderDrawerStatusPillClass(order: OrderApi.BatchOrderRecordItem) {
+  if (isRefundedOrder(order)) return 'pill--warning';
+  if (isRefundRejectedOrder(order) || order.order_status === 'failed') return 'pill--danger';
+  if (order.order_status === 'completed') return 'pill--success';
+  return 'pill--info';
+}
+
+function batchStatusPillClass(record: OrderApi.BatchOrderRecord) {
+  if (hasRefundedOrder(record)) return 'pill--warning';
+  if (hasRefundingOrder(record)) return 'pill--warning';
+  if (hasRefundRejectedOrder(record)) return 'pill--danger';
+  if (record.status === 'completed') return 'pill--success';
+  if (record.status === 'failed') return 'pill--danger';
+  return 'pill--info';
 }
 
 function fillExample() {
@@ -710,6 +876,7 @@ async function loadOrderRecords(
 function openOrderRecords() {
   removedDrawerVisible.value = true;
   orderDrawerKeyword.value = '';
+  drawerBatchKeyword.value = '';
   orderDrawerStatus.value = 'all';
   loadOrderRecords();
   loadProblemLinkRecords();
@@ -843,6 +1010,10 @@ async function checkConnection(showSuccess = false) {
 }
 
 async function validateContent() {
+  if (isAdmin.value) {
+    ElMessage.error('管理员账号不允许下单');
+    return;
+  }
   // 先刷新类型开关状态
   await loadTypeStatus();
   if (typeDisabledMessage.value) {
@@ -901,6 +1072,10 @@ async function validateContent() {
 }
 
 async function submitOrder() {
+  if (isAdmin.value) {
+    ElMessage.error('管理员账号不允许下单');
+    return;
+  }
   await loadTypeStatus();
   if (typeDisabledMessage.value) {
     ElMessage.error(typeDisabledMessage.value);
@@ -982,6 +1157,12 @@ watch(currentInputKey, (key) => {
   }
 });
 
+watch(targetType, () => {
+  if (content.value.trim() && !isAdmin.value) {
+    validateContent();
+  }
+});
+
 async function loadTypeStatus() {
   try {
     typeStatus.value = await getOrderTypeStatusApi();
@@ -991,1465 +1172,1392 @@ async function loadTypeStatus() {
 }
 
 onMounted(() => {
+  window.addEventListener('resize', handleWindowResize, { passive: true });
   checkConnection();
   loadTypeStatus();
   loadOrderRecords();
   loadProblemLinkRecords();
 });
+
+onUnmounted(() => {
+  window.removeEventListener('resize', handleWindowResize);
+});
 </script>
 
 <template>
   <div class="batch-order-page">
-    <section
-      class="connection-card"
-      :class="{ danger: connectionOk === false, success: connectionOk === true }"
-    >
-      <div class="connection-main">
-        <component :is="connectionOk === false ? AlertIcon : LinkIcon" />
-        <div>
-          <strong>连接检测</strong>
-          <span>{{ connectionMessage }}</span>
-        </div>
+    <section class="page-head">
+      <div class="head-text">
+        <span class="eyebrow">Batch Order</span>
+        <h1>批量下单</h1>
+        <p>当前类型：{{ typeLabelMap[targetType] }} · 每行一条链接 + 数量，空格或 Tab 分隔</p>
       </div>
-      <ElButton :loading="checkingConnection" @click="checkConnection(true)">
-        <component :is="RefreshIcon" class="button-icon" />
-        重新检测
-      </ElButton>
+      <div class="head-actions">
+        <div class="type-switcher">
+          <button
+            v-for="opt in typeOptions"
+            :key="opt.value"
+            type="button"
+            class="type-pill"
+            :class="{
+              active: targetType === opt.value,
+              disabled: isTypeDisabled(opt.value),
+            }"
+            @click="targetType = opt.value"
+          >
+            <component :is="opt.icon" class="type-pill-icon" />
+            {{ opt.label }}
+            <span v-if="isTypeDisabled(opt.value)" class="type-off-badge">关</span>
+          </button>
+        </div>
+        <button
+          type="button"
+          class="head-btn head-btn--ghost"
+          :class="statusType"
+          :disabled="checkingConnection"
+          @click="checkConnection(true)"
+        >
+          <component :is="checkingConnection ? RefreshIcon : (connectionOk ? CheckIcon : LinkIcon)" />
+          {{ connectionMessage }}
+        </button>
+        <button type="button" class="head-btn" @click="openOrderRecords">
+          下单记录
+          <span class="head-badge">{{ orderRecordTotal + checkBatchGroups.length }}</span>
+        </button>
+      </div>
     </section>
 
-    <div class="order-layout">
-      <section class="panel input-panel">
-        <div class="panel-head">
-          <div>
-            <h2>批量内容输入</h2>
-            <p>格式：链接 + 数量，支持空格或 Tab 分隔。</p>
-          </div>
-          <ElRadioGroup v-model="targetType" size="small" @change="validateContent">
-            <ElRadioButton label="view">阅读<span v-if="isTypeDisabled('view')" class="type-off-dot" title="已关闭">●</span></ElRadioButton>
-            <ElRadioButton label="like">点赞<span v-if="isTypeDisabled('like')" class="type-off-dot" title="已关闭">●</span></ElRadioButton>
-            <ElRadioButton label="impression">曝光<span v-if="isTypeDisabled('impression')" class="type-off-dot" title="已关闭">●</span></ElRadioButton>
-          </ElRadioGroup>
+    <section class="summary-grid">
+      <div class="stat-card stat-card--primary">
+        <div class="stat-icon">
+          <component :is="WalletIcon" />
         </div>
+        <div class="stat-body">
+          <span>预计扣费</span>
+          <strong>{{ preview ? formatMoneyParts(preview.total_amount).symbol : '￥' }}{{ preview ? formatMoneyParts(preview.total_amount).amount : '0.00' }}</strong>
+          <em>{{ settlementLabels.totalQuantity }} {{ preview ? previewTotalQuantity.toLocaleString('zh-CN') : '0' }}</em>
+        </div>
+      </div>
+      <div class="stat-card stat-card--success">
+        <div class="stat-icon">
+          <component :is="CheckIcon" />
+        </div>
+        <div class="stat-body">
+          <span>有效行</span>
+          <strong>{{ preview ? preview.valid_count : 0 }}</strong>
+        </div>
+      </div>
+      <div class="stat-card stat-card--danger">
+        <div class="stat-icon">
+          <component :is="AlertIcon" />
+        </div>
+        <div class="stat-body">
+          <span>失败行</span>
+          <strong :class="{ 'text-danger': preview && preview.invalid_count > 0 }">
+            {{ preview ? preview.invalid_count : 0 }}
+          </strong>
+        </div>
+      </div>
+      <div class="stat-card stat-card--warning">
+        <div class="stat-icon">
+          <component :is="ListIcon" />
+        </div>
+        <div class="stat-body">
+          <span>可用余额</span>
+          <strong>{{ preview ? formatMoney(preview.available_balance) : formatMoney(0) }}</strong>
+          <em>单价 {{ preview ? previewPriceText : '￥ 0.0000' }}</em>
+        </div>
+      </div>
+    </section>
 
-        <ElAlert
-          v-if="typeDisabledMessage"
-          :title="typeDisabledMessage"
-          type="error"
-          show-icon
-          :closable="false"
-          class="type-disabled-alert"
-        />
+    <div
+      v-if="isAdmin || typeDisabledMessage"
+      class="alert-strip alert-strip--error"
+    >
+      <component :is="AlertIcon" />
+      <span>{{ isAdmin ? '管理员账号不允许下单，请使用普通账号操作' : typeDisabledMessage }}</span>
+    </div>
 
-        <label class="field-label">
-          批量内容（{{ { view: '阅读', like: '点赞', impression: '曝光' }[targetType] }}）
-          <span>
-            已输入 {{ parsedLines.length }} 行
-            <span v-if="formatErrorCount > 0" style="color: var(--el-color-danger)">
-              （{{ formatErrorCount }} 行格式有误，需要：链接 + 数量）
-            </span>
+    <section class="workspace">
+      <div class="workspace-head">
+        <h2>批量内容</h2>
+        <div class="workspace-meta">
+          <span class="meta-tag">{{ parsedLines.length }} 行</span>
+          <span v-if="formatErrorCount > 0" class="meta-tag meta-tag--danger">
+            {{ formatErrorCount }} 行格式有误
           </span>
-        </label>
-        <textarea
-          v-model="content"
-          class="batch-textarea"
-          placeholder="示例：https://xhslink.com/xxxxxx 100（仅阅读下单）"
-        />
+        </div>
+      </div>
 
-        <div class="actions">
-          <ElButton :loading="previewing" @click="validateContent">
-            {{ previewing && streamTotal > 0 ? `校验中 ${streamResolved}/${streamTotal}` : '手动预校验' }}
-          </ElButton>
-          <ElButton @click="fillExample">填充示例</ElButton>
-          <ElButton :disabled="!preview?.invalid_count" @click="removeProblemLinks">
-            一键删除问题链接并记录
-          </ElButton>
-          <ElButton @click="openOrderRecords">
-            下单记录（{{ orderRecordTotal + checkBatchGroups.length }} 批）
-          </ElButton>
-          <ElButton @click="clearContent">清空</ElButton>
+      <textarea
+        v-model="content"
+        class="batch-textarea"
+        :disabled="isAdmin"
+        placeholder="https://xhslink.com/xxxxxx 100&#10;https://www.xiaohongshu.com/explore/xxxx 200"
+      />
+
+      <div class="toolbar">
+        <ElButton
+          :disabled="isAdmin"
+          :loading="previewing"
+          type="primary"
+          @click="validateContent"
+        >
+          {{ previewing && streamTotal > 0 ? `校验中 ${streamResolved}/${streamTotal}` : '手动预校验' }}
+        </ElButton>
+        <ElButton :disabled="isAdmin" @click="fillExample">填充示例</ElButton>
+        <ElButton
+          :disabled="isAdmin || !preview?.invalid_count"
+          type="warning"
+          plain
+          @click="removeProblemLinks"
+        >
+          删除问题链接
+        </ElButton>
+        <ElButton :disabled="isAdmin" text @click="clearContent">清空</ElButton>
+      </div>
+
+      <div class="submit-bar">
+        <div class="policy-block">
+          <p class="policy-text">
+            <component :is="InfoIcon" />
+            有封控风险，价格上涨，下单前请自行核对价格
+          </p>
+          <ElCheckbox v-model="agreePolicy">
+            我已阅读并确认上述公告
+          </ElCheckbox>
+        </div>
+        <div class="submit-block">
+          <span
+            class="submit-hint"
+            :class="{ ready: canSubmit, danger: !canSubmit && (isAdmin || connectionOk === false) }"
+          >
+            {{ submitHint }}
+          </span>
           <ElButton
+            class="submit-btn"
             type="primary"
+            size="large"
             :disabled="!canSubmit || submitting"
             :loading="submitting"
             @click="submitOrder"
           >
-            {{ submitting ? '提交中...' : `确认提交${{ view: '阅读', like: '点赞', impression: '曝光' }[targetType]}` }}
+            {{ submitting ? '提交中...' : `确认提交${typeLabelMap[targetType]}` }}
           </ElButton>
         </div>
+      </div>
+    </section>
 
-        <ElAlert
-          class="risk-alert"
-          :closable="false"
-          show-icon
-          type="info"
-          title="有封控"
-          description="价格上涨，下单自行查看价格"
-        />
+    <section v-if="preview && preview.warnings.length" class="alert-strip alert-strip--warning">
+      <component :is="AlertIcon" />
+      <span>{{ preview.warnings.join('；') }}</span>
+    </section>
 
-        <ElCheckbox v-model="agreePolicy">
-          我已阅读并确认上述公告内容
-        </ElCheckbox>
-
-        <div class="submit-state" :class="{ danger: !canSubmit }">
-          <ElTag :type="canSubmit ? 'success' : 'warning'" size="small">
-            {{ canSubmit ? '可提交' : '当前不可提交' }}
-          </ElTag>
-          <span v-if="connectionOk === false">连接检测失败，请先恢复后端服务</span>
-          <span v-else-if="!content">请先输入批量下单内容</span>
-          <span v-else-if="!preview">请先手动预校验</span>
-          <span v-else-if="preview?.warnings.length">{{ preview.warnings[0] }}</span>
-          <span v-else-if="!agreePolicy">请确认公告内容</span>
-          <span v-else>校验通过，可以提交</span>
-        </div>
-
-        <div v-if="preview?.items.length" class="result-list">
-          <div
-            v-for="item in preview.items"
-            v-reveal
-            :key="item.line_no"
-            class="result-row"
-            :class="{ invalid: !item.valid }"
-          >
-            <span>#{{ item.line_no }}</span>
-            <div class="note-avatar">
-              <img v-if="item.avatar_url" :src="item.avatar_url" alt="" />
-              <span v-else>{{ item.note_id.slice(0, 2).toUpperCase() || 'ID' }}</span>
-            </div>
-            <div class="note-info">
-              <strong>
-                {{ item.title || item.note_id || '未解析到笔记ID' }}
-                <small v-if="item.cache_hit">缓存</small>
-              </strong>
-              <span v-if="item.author_name">
-                {{ item.author_name }} / {{ item.note_id }}
-              </span>
-              <a v-if="item.note_url" :href="item.note_url" target="_blank">
-                {{ item.note_url }}
-              </a>
-            </div>
-            <em>{{ item.ordered_quantity.toLocaleString('zh-CN') }}</em>
-            <small>
-              {{ item.valid ? formatMoney(item.payable_amount) : item.errors.join('、') }}
-            </small>
+    <section v-if="invalidItemsSummary" class="invalid-panel">
+      <div class="invalid-panel-head">
+        <component :is="AlertIcon" />
+        <strong>{{ invalidItemsSummary.count }} 条校验失败</strong>
+        <ElButton size="small" type="warning" plain @click="copyInvalidPreviewLinks">
+          一键复制
+        </ElButton>
+      </div>
+      <div v-for="(group, idx) in invalidItemsSummary.groups" :key="idx" class="invalid-group">
+        <ElTag size="small" type="danger">{{ group.reason }}</ElTag>
+        <span class="invalid-group-count">{{ group.count }} 条</span>
+        <div class="invalid-group-links">
+          <div v-for="(link, li) in group.links" :key="li" class="invalid-link-item">
+            <span class="invalid-link-no">{{ li + 1 }}</span>
+            <span class="invalid-link-url">{{ link }}</span>
           </div>
         </div>
+      </div>
+      <p class="invalid-panel-tip">
+        请修正问题链接或使用「删除问题链接」移除后再提交
+      </p>
+    </section>
 
-      </section>
-
-      <div class="right-panels">
-      <aside class="panel settlement-panel">
-        <h2>结算与余额</h2>
-        <div class="settlement-body">
-          <div class="amount-main">
-            <span>预计扣费</span>
-            <strong class="amount-value">
-              <span>{{ preview ? formatMoneyParts(preview.total_amount).symbol : '￥' }}</span>
-              {{ preview ? formatMoneyParts(preview.total_amount).amount : '0.00' }}
+    <section v-if="preview?.items.length" class="preview-card">
+      <div class="preview-head">
+        <h3>校验结果</h3>
+        <span>{{ preview.valid_count }} 有效 / {{ preview.invalid_count }} 失败</span>
+      </div>
+      <div class="result-list">
+        <div
+          v-for="item in preview.items"
+          v-reveal
+          :key="item.line_no"
+          class="result-row"
+          :class="{ invalid: !item.valid }"
+        >
+          <span class="row-no">#{{ item.line_no }}</span>
+          <div class="note-avatar">
+            <img v-if="item.avatar_url" :src="item.avatar_url" alt="" referrerpolicy="no-referrer" />
+            <span v-else>{{ (item.author_name || item.note_id || 'ID').slice(0, 1).toUpperCase() }}</span>
+          </div>
+          <div class="note-info">
+            <strong>
+              {{ item.title || item.note_id || '未解析到笔记ID' }}
+              <small v-if="item.cache_hit">缓存</small>
             </strong>
-            <small>
-              {{ settlementLabels.totalQuantity }}
-              {{ preview ? previewTotalQuantity.toLocaleString('zh-CN') : '0' }}
-            </small>
+            <span v-if="item.author_name">{{ item.author_name }} / {{ item.note_id }}</span>
+            <a v-if="item.note_url" :href="item.note_url" target="_blank">{{ item.note_url }}</a>
           </div>
-          <div class="settlement-grid">
-            <div>
-              <span>有效行</span>
-              <strong>{{ preview ? preview.valid_count : 0 }}</strong>
-            </div>
-            <div>
-              <span>失败行</span>
-              <strong :class="{ red: preview && preview.invalid_count > 0 }">
-                {{ preview ? preview.invalid_count : 0 }}
-              </strong>
-            </div>
-            <div>
-              <span>可用余额</span>
-              <strong>{{ preview ? formatMoney(preview.available_balance) : formatMoney(0) }}</strong>
-            </div>
-            <div>
-              <span>单价</span>
-              <strong>{{ preview ? previewPriceText : '￥ 0.0000' }}</strong>
-            </div>
-          </div>
-          <div v-if="preview && preview.warnings.length" class="warning-box">
-            <component :is="AlertIcon" />
-            <span>{{ preview.warnings.join('；') }}</span>
-          </div>
-        </div>
-
-        <div class="connection-summary" :class="statusType">
-          <component :is="connectionOk ? CheckIcon : InfoIcon" />
-          <span>{{ connectionMessage }}</span>
-        </div>
-      </aside>
-
-      <div v-if="invalidItemsSummary" class="invalid-panel">
-        <div class="invalid-panel-head">
-          <component :is="AlertIcon" />
-          <strong>{{ invalidItemsSummary.count }} 条校验失败</strong>
-          <ElButton
-            size="small"
-            type="warning"
-            @click="copyInvalidPreviewLinks"
-          >
-            一键复制
-          </ElButton>
-        </div>
-        <div v-for="(group, idx) in invalidItemsSummary.groups" :key="idx" class="invalid-group">
-          <ElTag size="small" type="danger" effect="dark">
-            {{ group.reason }}
-          </ElTag>
-          <span class="invalid-group-count">{{ group.count }} 条</span>
-          <div class="invalid-group-links">
-            <div
-              v-for="(link, li) in group.links"
-              :key="li"
-              class="invalid-link-item"
-            >
-              <span class="invalid-link-no">{{ li + 1 }}</span>
-              <span class="invalid-link-url">{{ link }}</span>
-            </div>
-          </div>
-        </div>
-        <div class="invalid-panel-tip">
-          请修正问题链接或使用「一键删除问题链接并记录」移除后再提交
+          <em class="row-qty">{{ item.ordered_quantity.toLocaleString('zh-CN') }}</em>
+          <small class="row-amount">
+            {{ item.valid ? formatMoney(item.payable_amount) : item.errors.join('、') }}
+          </small>
         </div>
       </div>
-      </div>
-    </div>
+    </section>
 
     <ElDrawer
       v-model="removedDrawerVisible"
       append-to-body
-      class="problem-record-drawer"
+      class="order-records-drawer"
       direction="rtl"
-      size="560px"
-      title="下单记录"
+      :size="drawerSize"
+      :body-style="{ padding: 0, overflow: 'hidden', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }"
     >
-      <div v-if="drawerBatches.length" class="order-record-drawer-list">
-        <div class="drawer-actions">
-          <ElSelect
-            v-model="selectedDrawerBatchKey"
-            class="batch-select"
-            placeholder="选择批次"
-          >
-            <ElOption
-              v-for="record in drawerBatches"
-              :key="record.key"
-              :label="record.label"
-              :value="record.key"
-            />
-          </ElSelect>
-          <ElButton
-            v-if="removedProblemLinks.filter((r) => !r.valid).length > 0"
-            size="small"
-            type="warning"
-            @click="copyAllProblemLinks"
-          >
-            一键复制所有问题链接
-          </ElButton>
+      <template #header>
+        <div class="dr-header">
+          <h3>下单记录</h3>
+          <span v-if="drawerBatches.length" class="dr-header-count">{{ drawerBatches.length }} 批</span>
         </div>
-        <article
-          v-if="selectedOrderBatch"
-          class="order-record-drawer-row order-batch-card"
-        >
-          <div class="order-record-drawer-head">
-            <strong>{{ selectedOrderBatch.batch_no }}</strong>
-            <div class="drawer-title-tags">
-              <ElTag size="small" type="primary">确认提交</ElTag>
-              <ElTag size="small">
-              {{ batchDisplayStatusLabel(selectedOrderBatch) }}
-            </ElTag>
-            </div>
-          </div>
-          <div class="order-record-drawer-meta">
-            <span>
-              提交时间：{{
-                formatDateTime(
-                  selectedOrderBatch.submitted_at || selectedOrderBatch.created_at,
-                )
-              }}
-            </span>
-            <span>订单数：{{ selectedOrderBatch.total_count }}</span>
-            <span>金额：{{ formatMoney(selectedOrderBatch.estimated_amount) }}</span>
-          </div>
-          <div class="batch-summary-tags">
-            <ElTag size="small" type="success">
-              成功 {{ selectedOrderBatch.succeeded_count }}
-            </ElTag>
-            <ElTag size="small" type="danger">
-              失败 {{ selectedOrderBatch.failed_count }}
-            </ElTag>
-            <ElTag size="small">总数 {{ selectedOrderBatch.total_count }}</ElTag>
-          </div>
-          <div class="record-filters">
-            <ElInput
-              v-model="orderDrawerKeyword"
-              clearable
-              placeholder="搜索链接、订单号、笔记ID"
-            />
-            <ElSelect v-model="orderDrawerStatus" class="status-select">
-              <ElOption label="全部" value="all" />
-              <ElOption label="成功" value="success" />
-              <ElOption label="失败" value="failed" />
-            </ElSelect>
-          </div>
-          <div class="order-record-drawer-items">
-            <div
-              v-for="order in visibleOrderDrawerItems"
-              :key="order.id"
-              class="order-record-drawer-item"
-              :class="{
-                failed: order.order_status === 'failed',
-                refunded: isRefundedOrder(order),
-                refunding: isRefundingOrder(order),
-                success: order.order_status === 'completed',
-              }"
-            >
-              <div>
-                <span>{{ order.order_no }}</span>
-                <small>订单ID：{{ order.id }}</small>
-                <em>{{ order.source_note_url || order.note_url || '-' }}</em>
-              </div>
-              <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              <ElTag
-                class="order-status-tag"
-                size="small"
-                :type="orderDrawerStatusTagType(order)"
-              >
-                {{ orderDrawerStatusLabel(order) }}
-              </ElTag>
-            </div>
-            <div
-              v-if="visibleOrderDrawerItems.length === 0"
-              class="empty-records compact"
-            >
-              暂无匹配的下单记录
-            </div>
-          </div>
-        </article>
+      </template>
 
-        <article
-          v-else-if="selectedProblemBatch"
-          class="order-record-drawer-row problem-batch-card"
-        >
-          <div class="order-record-drawer-head">
-            <strong>{{ selectedProblemBatch.batchNo }}</strong>
-            <div class="drawer-title-tags">
-              <ElTag size="small" type="warning">问题链接</ElTag>
-              <ElTag size="small" type="danger">放弃</ElTag>
+      <div v-if="drawerBatches.length" class="dr-root">
+        <div class="dr-shell">
+        <aside class="dr-sidebar">
+          <ElInput
+            v-model="drawerBatchKeyword"
+            clearable
+            size="small"
+            placeholder="搜索批次"
+            :prefix-icon="SearchIcon"
+          />
+          <div class="dr-batch-list">
+            <button
+              v-for="batch in filteredDrawerBatches"
+              :key="batch.key"
+              type="button"
+              class="dr-batch-item"
+              :class="{
+                active: selectedDrawerBatchKey === batch.key,
+                'dr-batch-item--problem': batch.type === 'problem',
+              }"
+              @click="selectedDrawerBatchKey = batch.key"
+            >
+              <div class="dr-batch-item-row">
+                <span class="dr-batch-kind">{{ batch.type === 'order' ? '提交' : '问题' }}</span>
+                <span class="dr-badge" :class="drawerBatchStatus(batch).class">
+                  {{ drawerBatchStatus(batch).label }}
+                </span>
+              </div>
+              <strong class="dr-batch-no">{{ shortenBatchNo(batch.batchNo) }}</strong>
+              <div class="dr-batch-item-row dr-batch-item-meta">
+                <span>{{ formatShortDateTime(batch.time) }}</span>
+                <span>{{ formatMoney(batch.amount) }}</span>
+              </div>
+              <div class="dr-batch-counts">
+                <span class="ok">{{ batch.successCount }} 成</span>
+                <span class="bad">{{ batch.failedCount }} 败</span>
+                <span class="total">共 {{ batch.total }}</span>
+              </div>
+            </button>
+            <div v-if="filteredDrawerBatches.length === 0" class="dr-sidebar-empty">
+              无匹配批次
+            </div>
+          </div>
+        </aside>
+
+        <section v-if="drawerHero" class="dr-main">
+          <div class="dr-main-head">
+            <div class="dr-main-title">
+              <code>{{ drawerHero.batchNo }}</code>
+              <div class="dr-main-tags">
+                <span class="dr-badge" :class="drawerHero.statusClass">{{ drawerHero.statusLabel }}</span>
+                <span class="dr-main-amount">{{ drawerHero.amount }}</span>
+              </div>
+            </div>
+            <div class="dr-main-actions">
               <ElButton
+                v-if="selectedProblemBatch"
                 size="small"
+                plain
                 type="primary"
                 @click="copySelectedProblemBatchLinks"
               >
-                一键复制
+                <component :is="CopyIcon" class="button-icon" />
+                复制
+              </ElButton>
+              <ElButton
+                v-else-if="removedProblemLinks.filter((r) => !r.valid).length > 0"
+                size="small"
+                plain
+                type="warning"
+                @click="copyAllProblemLinks"
+              >
+                复制问题链接
               </ElButton>
             </div>
           </div>
-          <div class="order-record-drawer-meta">
-            <span>检测时间：{{ formatDateTime(selectedProblemBatch.time) }}</span>
-            <span>检测数：{{ selectedProblemBatch.total }}</span>
-            <span>预估金额：{{ formatMoney(selectedProblemBatch.amount) }}</span>
+
+          <div class="dr-main-stats">
+            <span>{{ drawerHero.time }}</span>
+            <span>{{ drawerHero.total }} 单</span>
+            <span class="ok">{{ drawerHero.successLabel }} {{ drawerHero.successCount }}</span>
+            <span class="bad">{{ drawerHero.failedLabel }} {{ drawerHero.failedCount }}</span>
           </div>
-          <div class="batch-summary-tags">
-            <ElTag size="small" type="success">
-              通过 {{ selectedProblemBatch.successCount }}
-            </ElTag>
-            <ElTag size="small" type="danger">
-              放弃 {{ selectedProblemBatch.failedCount }}
-            </ElTag>
-            <ElTag size="small">总数 {{ selectedProblemBatch.total }}</ElTag>
-          </div>
-          <ElButton
-            class="copy-problem-links-button"
-            type="primary"
-            @click="copySelectedProblemBatchLinks"
-          >
-            一键复制问题记录链接
-          </ElButton>
-          <div class="record-filters">
+
+          <div class="dr-main-toolbar">
             <ElInput
               v-model="orderDrawerKeyword"
               clearable
-              placeholder="搜索链接、标题、作者、笔记ID"
+              size="small"
+              :placeholder="selectedProblemBatch ? '搜索链接、标题' : '搜索订单、链接'"
+              :prefix-icon="SearchIcon"
             />
-            <ElSelect v-model="orderDrawerStatus" class="status-select">
-              <ElOption label="全部" value="all" />
-              <ElOption label="成功" value="success" />
-              <ElOption label="放弃" value="failed" />
-            </ElSelect>
-          </div>
-          <div class="order-record-drawer-items">
-            <div
-              v-for="record in visibleProblemDrawerItems"
-              :key="record.id"
-              class="order-record-drawer-item problem-link-item"
-              :class="{ failed: !record.valid, success: record.valid }"
-            >
-              <div>
-                <span>{{ record.title || record.note_id || '未解析到笔记ID' }}</span>
-                <em>{{ record.raw }}</em>
-              </div>
-              <strong>{{ record.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              <ElTag
-                class="order-status-tag"
-                size="small"
-                :type="record.valid ? 'success' : 'danger'"
+            <div class="dr-tabs">
+              <button
+                v-for="tab in drawerStatusTabs"
+                :key="tab.value"
+                type="button"
+                class="dr-tab"
+                :class="{ active: orderDrawerStatus === tab.value }"
+                @click="orderDrawerStatus = tab.value"
               >
-                {{ record.valid ? '成功' : '放弃' }}
-              </ElTag>
-            </div>
-            <div
-              v-if="visibleProblemDrawerItems.length === 0"
-              class="empty-records compact"
-            >
-              暂无匹配的问题链接记录
+                {{ tab.value === 'failed' ? drawerFailedTabLabel : tab.label }}
+              </button>
             </div>
           </div>
-        </article>
+
+          <div class="dr-list">
+            <article
+              v-for="item in drawerListItems"
+              :key="item.id"
+              class="dr-order"
+              :class="item.rowClass"
+            >
+              <div class="dr-order-avatar">
+                <img
+                  v-if="item.avatar"
+                  :src="item.avatar"
+                  alt=""
+                  referrerpolicy="no-referrer"
+                />
+                <span v-else>{{ (item.author || item.noteId || item.title || '单').slice(0, 1).toUpperCase() }}</span>
+              </div>
+              <div class="dr-order-body">
+                <div class="dr-order-top">
+                  <strong>{{ item.noteTitle || item.title || item.subtitle || '未命名订单' }}</strong>
+                  <div class="dr-order-side">
+                    <em>{{ item.qty.toLocaleString('zh-CN') }}</em>
+                    <span class="dr-badge" :class="item.statusClass">{{ item.statusLabel }}</span>
+                  </div>
+                </div>
+                <p v-if="item.noteTitle" class="dr-order-sub">{{ item.title }}</p>
+                <p v-else-if="item.subtitle" class="dr-order-sub">{{ item.subtitle }}</p>
+                <a
+                  v-if="item.link && !item.linkRaw"
+                  class="dr-order-link"
+                  :href="item.link"
+                  target="_blank"
+                >
+                  {{ item.link }}
+                </a>
+                <p v-else-if="item.link" class="dr-order-link dr-order-link--raw">{{ item.link }}</p>
+              </div>
+            </article>
+            <div v-if="drawerListItems.length === 0" class="dr-list-empty">
+              <component :is="ClipboardIcon" class="dr-list-empty-icon" />
+              <p>暂无匹配记录</p>
+            </div>
+          </div>
+        </section>
+
+        <section v-else class="dr-main dr-main--empty">
+          <p>请选择左侧批次查看详情</p>
+        </section>
+        </div>
       </div>
-      <div v-else class="empty-records">暂无下单记录</div>
+
+      <div v-else class="dr-empty">
+        <component :is="ClipboardIcon" class="dr-empty-icon" />
+        <p>暂无下单记录</p>
+      </div>
     </ElDrawer>
   </div>
 </template>
 
 <style scoped>
 .batch-order-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
   min-height: 100%;
-  padding: 24px;
-  max-width: 1680px;
-  margin: 0 auto;
-  background:
-    radial-gradient(circle at top left, color-mix(in srgb, var(--el-color-primary) 4%, transparent), transparent 30%),
-    radial-gradient(circle at top right, color-mix(in srgb, var(--el-color-success) 3%, transparent), transparent 28%),
-    linear-gradient(180deg, var(--el-fill-color-lighter), color-mix(in srgb, var(--el-bg-color) 92%, var(--el-fill-color-lighter)));
+  padding: 20px;
   color: var(--el-text-color-primary);
-  position: relative;
 }
 
-.batch-order-page::before {
-  content: '';
-  position: fixed;
-  inset: 0 auto auto 0;
-  width: 100%;
-  height: 4px;
-  background: linear-gradient(90deg, var(--el-color-primary), color-mix(in srgb, var(--el-color-primary) 20%, var(--el-color-success)));
-  opacity: 0.35;
-  pointer-events: none;
+.eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--el-color-primary);
 }
 
-.connection-card,
-.panel {
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 14px;
-  background: var(--el-bg-color);
-}
-
-.connection-card {
+.page-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
-  margin-bottom: 20px;
-  padding: 18px 22px;
-  box-shadow: 0 10px 30px rgb(15 23 42 / 4%);
-  position: relative;
-  overflow: hidden;
+  gap: 16px;
+  padding: 20px 24px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
 }
 
-.connection-card::after {
-  content: '';
-  position: absolute;
-  inset: auto 0 0 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--el-color-primary) 35%, transparent), transparent);
-  opacity: 0.8;
-}
+.page-head h1 { margin: 2px 0 0; font-size: 22px; font-weight: 700; }
+.page-head p { margin: 4px 0 0; font-size: 13px; color: var(--el-text-color-secondary); }
 
-.connection-card.danger {
-  border-color: var(--el-color-danger);
-  background: color-mix(in srgb, var(--el-color-danger) 10%, var(--el-bg-color));
-}
-
-.connection-card.success {
-  border-color: var(--el-color-success);
-}
-
-.connection-main,
-.actions,
-.submit-state,
-.result-row,
-.connection-summary,
-.warning-box {
+.head-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  flex-shrink: 0;
 }
 
-.connection-main {
-  gap: 14px;
+.head-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  border: 1px solid var(--el-color-primary-light-5);
+  border-radius: 8px;
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+  white-space: nowrap;
 }
 
-.connection-main svg,
-.connection-summary svg,
-.warning-box svg {
-  width: 17px;
-  height: 17px;
-  padding: 7px;
+.head-btn svg { width: 14px; height: 14px; }
+
+.head-btn:hover:not(:disabled) {
+  background: var(--el-color-primary);
+  color: #fff;
+}
+
+.head-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+.head-btn--ghost {
+  background: var(--el-bg-color);
+  border-color: var(--el-border-color);
+  color: var(--el-text-color-secondary);
+}
+
+.head-btn--ghost.success {
+  border-color: var(--el-color-success-light-5);
+  background: var(--el-color-success-light-9);
+  color: var(--el-color-success);
+}
+
+.head-btn--ghost.danger {
+  border-color: var(--el-color-danger-light-5);
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.head-btn--ghost.warning { color: var(--el-color-warning); }
+
+.head-badge {
+  margin-left: 2px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  background: rgb(255 255 255 / 70%);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.type-switcher {
+  display: flex;
+  gap: 4px;
+  padding: 3px;
   border-radius: 10px;
   background: var(--el-fill-color-light);
 }
 
-.connection-card.danger .connection-main svg,
-.connection-card.danger .connection-main strong,
-.submit-state.danger,
-.red {
-  color: var(--el-color-danger);
-}
-
-.connection-main strong,
-.connection-main span {
-  display: block;
-}
-
-.connection-main strong {
-  font-size: 14px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-}
-
-.connection-main span {
+.type-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 7px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
   color: var(--el-text-color-secondary);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-.button-icon {
-  width: 15px;
-  height: 15px;
-  margin-right: 6px;
-}
-
-.order-layout {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 396px;
-  gap: 24px;
-}
-
-.panel {
-  padding: 28px 30px;
-  box-shadow: 0 12px 34px rgb(15 23 42 / 4%);
-  position: relative;
-  overflow: hidden;
-}
-
-.input-panel {
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--el-bg-color) 96%, var(--el-color-primary)), var(--el-bg-color) 28%),
-    var(--el-bg-color);
-}
-
-.panel::before {
-  content: '';
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 3px;
-  background: linear-gradient(90deg, color-mix(in srgb, var(--el-color-primary) 70%, transparent), color-mix(in srgb, var(--el-color-success) 45%, transparent));
-  opacity: 0.45;
-}
-
-.panel-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 16px;
-}
-
-.input-panel .panel-head {
-  margin-bottom: 14px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-}
-
-.type-disabled-alert {
-  margin-bottom: 14px;
-}
-
-.type-off-dot {
-  margin-left: 3px;
-  color: var(--el-color-danger);
-  font-size: 8px;
-  vertical-align: super;
-}
-
-.panel h2 {
-  margin: 0 0 10px;
-  font-size: 17px;
-  line-height: 1.25;
-  letter-spacing: 0.01em;
-  position: relative;
-  padding-left: 12px;
-}
-
-.panel h2::before {
-  content: '';
-  position: absolute;
-  left: 0;
-  top: 0.2em;
-  width: 3px;
-  height: 0.9em;
-  border-radius: 999px;
-  background: linear-gradient(180deg, var(--el-color-primary), color-mix(in srgb, var(--el-color-primary) 25%, var(--el-color-success)));
-}
-
-.panel p,
-.field-label,
-.result-row small,
-.settlement-grid span,
-.amount-main span {
-  color: var(--el-text-color-secondary);
-}
-
-.panel p {
-  font-size: 12px;
-  line-height: 1.6;
-}
-
-.field-label {
-  display: block;
-  margin: 24px 0 10px;
-  font-weight: 700;
   font-size: 13px;
-  letter-spacing: 0.01em;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
 }
 
-.field-label span {
-  margin-left: 10px;
+.type-pill-icon { width: 14px; height: 14px; opacity: 0.75; }
+.type-pill:hover:not(.disabled) { color: var(--el-text-color-primary); }
+.type-pill.active {
+  background: var(--el-bg-color);
+  color: var(--el-color-primary);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 8%);
+}
+.type-pill.disabled { opacity: 0.5; cursor: not-allowed; }
+
+.type-off-badge {
+  padding: 0 4px;
+  border-radius: 4px;
+  background: var(--el-color-danger-light-8);
+  color: var(--el-color-danger);
+  font-size: 10px;
+}
+
+.summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.stat-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 18px 20px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+  transition: box-shadow 0.2s;
+}
+
+.stat-card:hover { box-shadow: 0 2px 12px rgb(0 0 0 / 6%); }
+
+.stat-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
+  flex-shrink: 0;
+}
+
+.stat-icon svg { width: 18px; height: 18px; }
+
+.stat-card--primary .stat-icon { background: var(--el-color-primary-light-8); color: var(--el-color-primary); }
+.stat-card--success .stat-icon { background: var(--el-color-success-light-8); color: var(--el-color-success); }
+.stat-card--danger .stat-icon { background: var(--el-color-danger-light-8); color: var(--el-color-danger); }
+.stat-card--warning .stat-icon { background: var(--el-color-warning-light-8); color: var(--el-color-warning); }
+
+.stat-body { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.stat-body span { font-size: 12px; color: var(--el-text-color-secondary); }
+.stat-body strong { font-size: 20px; font-weight: 700; line-height: 1.2; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.stat-body em { font-size: 11px; color: var(--el-text-color-secondary); font-style: normal; overflow-wrap: anywhere; }
+.stat-body .text-danger { color: var(--el-color-danger); }
+
+.alert-strip {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.alert-strip svg { width: 16px; height: 16px; flex-shrink: 0; }
+
+.alert-strip--error {
+  border: 1px solid var(--el-color-danger-light-5);
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.alert-strip--warning {
+  border: 1px solid var(--el-color-warning-light-5);
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+
+.workspace,
+.preview-card,
+.invalid-panel {
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+}
+
+.workspace { padding: 20px 24px 24px; }
+
+.workspace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.workspace-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+
+.workspace-meta { display: flex; gap: 8px; }
+
+.meta-tag {
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
   color: var(--el-text-color-secondary);
-  font-weight: 400;
+  font-size: 12px;
+}
+
+.meta-tag--danger {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
 }
 
 .batch-textarea {
   width: 100%;
-  min-height: 300px;
-  padding: 18px 16px;
+  min-height: 260px;
+  padding: 14px 16px;
   resize: vertical;
   border: 1px solid var(--el-border-color);
-  border-radius: 12px;
+  border-radius: 10px;
   outline: none;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--el-fill-color-light) 82%, white), var(--el-bg-color));
+  background: var(--el-fill-color-blank);
   color: var(--el-text-color-primary);
-  font-size: 14px;
-  line-height: 1.7;
-  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
-  letter-spacing: 0.01em;
-  font-variant-ligatures: none;
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 60%);
+  font-size: 13px;
+  line-height: 1.75;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 .batch-textarea:focus {
   border-color: var(--el-color-primary);
-  box-shadow:
-    0 0 0 4px color-mix(in srgb, var(--el-color-primary) 10%, transparent),
-    inset 0 1px 0 rgb(255 255 255 / 60%);
+  box-shadow: 0 0 0 3px var(--el-color-primary-light-8);
 }
 
-.actions {
+.batch-textarea:disabled {
+  background: var(--el-fill-color-light);
+  cursor: not-allowed;
+}
+
+.toolbar {
+  display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 16px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--el-border-color-lighter);
 }
 
-.input-panel .actions {
-  padding-top: 4px;
+.submit-bar {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 20px;
+  margin-top: 20px;
+  padding: 16px 18px;
+  border-radius: 10px;
+  background: var(--el-fill-color-light);
 }
 
-.actions :deep(.el-button) {
-  border-radius: 999px;
-  padding-inline: 16px;
-  box-shadow: none;
+.policy-block { flex: 1; min-width: 0; }
+
+.policy-text {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 10px;
+  color: var(--el-text-color-secondary);
+  font-size: 13px;
 }
 
-.actions :deep(.el-button--primary) {
-  background: linear-gradient(135deg, var(--el-color-primary), color-mix(in srgb, var(--el-color-primary) 78%, var(--el-color-success)));
-  border-color: transparent;
+.policy-text svg { width: 15px; height: 15px; color: var(--el-color-primary); flex-shrink: 0; }
+
+.submit-block {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
-.actions :deep(.el-button--primary:hover),
-.actions :deep(.el-button--primary:focus-visible) {
-  background: linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 88%, white), color-mix(in srgb, var(--el-color-primary) 70%, var(--el-color-success)));
-  border-color: transparent;
-}
+.submit-hint { font-size: 12px; color: var(--el-text-color-secondary); }
+.submit-hint.ready { color: var(--el-color-success); }
+.submit-hint.danger { color: var(--el-color-danger); }
 
-.actions :deep(.el-button--default),
-.actions :deep(.el-button--info),
-.actions :deep(.el-button--success),
-.actions :deep(.el-button--warning),
-.actions :deep(.el-button--danger) {
-  min-height: 34px;
-  font-weight: 600;
-}
+.submit-btn { min-width: 160px; border-radius: 8px !important; font-weight: 600; }
 
-.risk-alert {
-  margin: 18px 0 12px;
-}
+.button-icon { width: 14px; height: 14px; margin-right: 4px; }
 
-.submit-state {
-  gap: 10px;
-  margin-top: 16px;
-  padding: 12px 14px;
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 12px;
-  background: var(--el-fill-color-blank);
-  font-size: 12px;
-}
-
-.submit-state :deep(.el-tag),
-.drawer-title-tags :deep(.el-tag),
-.batch-summary-tags :deep(.el-tag),
-.invalid-panel :deep(.el-tag) {
-  border-radius: 999px;
-  border-color: color-mix(in srgb, currentColor 14%, var(--el-border-color-light));
-  font-weight: 650;
-  letter-spacing: 0.01em;
-  box-shadow: none;
-}
-
-.drawer-title-tags :deep(.el-tag),
-.batch-summary-tags :deep(.el-tag) {
-  min-height: 26px;
-  padding-inline: 10px;
-}
-
-.submit-state :deep(.el-tag) {
-  min-height: 24px;
-  padding-inline: 10px;
-}
-
-.invalid-panel {
-  padding: 18px 18px 16px;
-  border-radius: 14px;
-  border: 1px solid var(--el-color-danger-light-5);
-  background: var(--el-bg-color);
-  box-shadow: 0 12px 32px rgb(15 23 42 / 6%);
-  max-height: 420px;
-  overflow-y: auto;
-  position: relative;
-}
-
-.invalid-panel::before {
-  content: '';
-  position: absolute;
-  inset: 0 0 auto 0;
-  height: 3px;
-  background: linear-gradient(90deg, var(--el-color-danger), color-mix(in srgb, var(--el-color-danger) 30%, var(--el-color-warning)));
-  opacity: 0.55;
-}
+.invalid-panel { padding: 18px 20px; max-height: 360px; overflow-y: auto; }
 
 .invalid-panel-head {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
   color: var(--el-color-danger);
-  font-size: 13px;
+  font-size: 14px;
 }
 
-.invalid-panel-head strong {
-  font-weight: 600;
-}
+.invalid-panel-head svg { width: 16px; height: 16px; }
+.invalid-panel-head strong { flex: 1; }
 
-.invalid-group {
-  margin-top: 16px;
-}
-
-.invalid-group :deep(.el-tag) {
-  min-height: 24px;
-  padding-inline: 10px;
-}
-
-.invalid-group-count {
-  margin-left: 8px;
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-}
+.invalid-group { margin-top: 14px; }
+.invalid-group-count { margin-left: 8px; font-size: 12px; color: var(--el-text-color-secondary); }
 
 .invalid-group-links {
-  margin-top: 8px;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  margin-top: 8px;
 }
 
 .invalid-link-item {
   display: flex;
-  align-items: baseline;
   gap: 8px;
-  padding: 7px 10px;
-  border-radius: 10px;
-  background: var(--el-fill-color-lighter);
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
   font-size: 12px;
-  line-height: 1.6;
 }
 
-.invalid-link-no {
-  flex-shrink: 0;
-  width: 20px;
-  color: var(--el-text-color-placeholder);
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
-.invalid-link-url {
-  color: var(--el-text-color-regular);
-  font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
-  word-break: break-all;
-}
+.invalid-link-no { flex-shrink: 0; width: 18px; color: var(--el-text-color-placeholder); text-align: right; }
+.invalid-link-url { font-family: ui-monospace, Menlo, Consolas, monospace; word-break: break-all; }
 
 .invalid-panel-tip {
-  margin-top: 16px;
-  padding: 8px 10px;
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--el-color-warning) 10%, transparent);
-  color: var(--el-text-color-secondary);
+  margin: 14px 0 0;
   font-size: 12px;
-  line-height: 1.5;
+  color: var(--el-text-color-secondary);
 }
 
-.reveal-hidden {
-  opacity: 0;
-  transform: translateY(24px);
+.preview-card { padding: 18px 20px; }
+
+.preview-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
 }
 
-.reveal-visible {
-  animation: reveal-in 0.6s ease-out forwards;
-}
-
-@keyframes reveal-in {
-  from {
-    opacity: 0;
-    transform: translateY(24px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
+.preview-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+.preview-head span { font-size: 12px; color: var(--el-text-color-secondary); }
 
 .result-list {
-  display: grid;
-  gap: 12px;
-  margin-top: 16px;
-  max-height: 520px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 480px;
   overflow-y: auto;
-  padding-right: 4px;
 }
 
 .result-row {
-  grid-template-columns: 50px 44px minmax(0, 1fr) 88px 176px;
   display: grid;
-  gap: 12px;
-  padding: 13px 14px;
+  grid-template-columns: 40px 36px minmax(0, 1fr) 72px 120px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
-  background: var(--el-fill-color-light);
+  border-radius: 10px;
+  background: var(--el-fill-color-blank);
 }
 
 .result-row.invalid {
-  border-color: var(--el-color-danger);
-  background: color-mix(in srgb, var(--el-color-danger) 8%, var(--el-bg-color));
+  border-color: var(--el-color-danger-light-5);
+  background: var(--el-color-danger-light-9);
 }
 
-.result-row strong {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.row-no { font-size: 12px; color: var(--el-text-color-secondary); font-variant-numeric: tabular-nums; }
+.row-qty { font-style: normal; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+.row-amount { font-size: 12px; color: var(--el-text-color-secondary); text-align: right; }
 
 .note-avatar {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 40px;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
   overflow: hidden;
   background: var(--el-fill-color);
-  color: var(--el-text-color-secondary);
   font-size: 10px;
+  font-weight: 700;
+  color: var(--el-text-color-secondary);
+}
+
+.note-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.note-info { min-width: 0; }
+.note-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.note-info strong small { margin-left: 6px; color: var(--el-color-success); font-weight: 400; font-size: 11px; }
+.note-info span, .note-info a {
+  display: block;
+  overflow: hidden;
+  margin-top: 2px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  text-decoration: none;
+}
+.note-info a:hover { color: var(--el-color-primary); }
+
+.reveal-hidden { opacity: 0; transform: translateY(12px); }
+.reveal-visible { animation: reveal-in 0.4s ease-out forwards; }
+
+@keyframes reveal-in {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.order-records-drawer {
+  display: flex;
+  flex-direction: column;
+}
+
+.order-records-drawer :deep(.el-drawer__header) {
+  flex-shrink: 0;
+  margin-bottom: 0;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+
+.order-records-drawer :deep(.el-drawer__body) {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.order-records-drawer :deep(.el-drawer__close-btn) {
+  font-size: 18px;
+}
+
+.dr-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dr-header h3 {
+  margin: 0;
+  font-size: 17px;
   font-weight: 700;
 }
 
-.note-avatar img {
+.dr-header-count {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: var(--el-fill-color-light);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.dr-root {
+  flex: 1 1 0;
+  display: flex;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.dr-shell {
+  flex: 1 1 0;
+  display: flex;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+.dr-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 248px;
+  flex-shrink: 0;
+  align-self: stretch;
+  min-height: 0;
+  padding: 12px;
+  border-right: 1px solid var(--el-border-color-lighter);
+  background: var(--el-fill-color-light);
+  overflow: hidden;
+}
+
+.dr-sidebar > :deep(.el-input) {
+  flex-shrink: 0;
+}
+
+.dr-batch-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.dr-batch-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  padding: 10px 11px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-bg-color);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.dr-batch-item:last-child {
+  margin-bottom: 0;
+}
+
+.dr-batch-item:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+
+.dr-batch-item.active {
+  border-color: var(--el-color-primary);
+  box-shadow: 0 0 0 1px var(--el-color-primary-light-7);
+}
+
+.dr-batch-item--problem.active {
+  border-color: var(--el-color-warning);
+  box-shadow: 0 0 0 1px var(--el-color-warning-light-7);
+}
+
+.dr-batch-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.dr-batch-kind {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--el-color-primary);
+}
+
+.dr-batch-item--problem .dr-batch-kind {
+  color: var(--el-color-warning);
+}
+
+.dr-batch-no {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  color: var(--el-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dr-batch-item-meta {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.dr-batch-counts {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.dr-batch-counts .ok { color: var(--el-color-success); }
+.dr-batch-counts .bad { color: var(--el-color-danger); }
+.dr-batch-counts .total { color: var(--el-text-color-secondary); font-weight: 500; }
+
+.dr-sidebar-empty {
+  padding: 24px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.dr-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px 16px;
+  background: var(--el-bg-color);
+}
+
+.dr-main--empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--el-text-color-secondary);
+  font-size: 14px;
+}
+
+.dr-main-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.dr-main-title code {
+  display: block;
+  font-size: 12px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  word-break: break-all;
+  line-height: 1.45;
+}
+
+.dr-main-tags {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.dr-main-amount {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--el-color-primary);
+}
+
+.dr-main-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-top: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.dr-main-stats .ok { color: var(--el-color-success); font-weight: 600; }
+.dr-main-stats .bad { color: var(--el-color-danger); font-weight: 600; }
+
+.dr-main-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 12px 0;
+}
+
+.dr-main-toolbar :deep(.el-input) {
+  flex: 1;
+  min-width: 0;
+}
+
+.dr-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pill--success, .dr-badge.pill--success { background: var(--el-color-success-light-8); color: var(--el-color-success); }
+.pill--danger, .dr-badge.pill--danger { background: var(--el-color-danger-light-8); color: var(--el-color-danger); }
+.pill--warning, .dr-badge.pill--warning { background: var(--el-color-warning-light-8); color: var(--el-color-warning); }
+.pill--info, .dr-badge.pill--info { background: var(--el-color-primary-light-8); color: var(--el-color-primary); }
+
+.dr-tabs {
+  display: inline-flex;
+  flex-shrink: 0;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--el-fill-color-light);
+}
+
+.dr-tab {
+  padding: 5px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.dr-tab.active {
+  background: var(--el-bg-color);
+  color: var(--el-color-primary);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 6%);
+}
+
+.dr-list {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.dr-order {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-fill-color-blank);
+}
+
+.dr-order.is-success { border-left: 3px solid var(--el-color-success); }
+.dr-order.is-failed { border-left: 3px solid var(--el-color-danger); }
+.dr-order.is-refunded,
+.dr-order.is-refunding { border-left: 3px solid var(--el-color-warning); }
+
+.dr-order-avatar {
+  flex-shrink: 0;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--el-fill-color);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--el-text-color-secondary);
+}
+
+.dr-order-avatar img {
   width: 100%;
   height: 100%;
   object-fit: cover;
 }
 
-.note-info {
-  min-width: 0;
-}
-
-.note-info a {
-  display: block;
-  overflow: hidden;
-  margin-top: 2px;
-  color: var(--el-text-color-secondary);
-  text-decoration: none;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.note-info span {
-  display: block;
-  overflow: hidden;
-  margin-top: 2px;
-  color: var(--el-text-color-regular);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.note-info strong small {
-  margin-left: 8px;
-  color: var(--el-color-success);
-  font-weight: 400;
-}
-
-.note-info a:hover {
-  color: var(--el-color-primary);
-}
-
-.removed-records {
-  display: grid;
-  gap: 10px;
-}
-
-.drawer-actions,
-.removed-row-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.drawer-actions {
-  margin-bottom: 18px;
-  padding-bottom: 18px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-}
-
-.batch-select {
+.dr-order-body {
   min-width: 0;
   flex: 1;
 }
 
-.order-record-drawer-list {
-  display: grid;
-  gap: 16px;
-}
-
-.order-record-drawer-row {
-  padding: 16px;
-  border: 1px solid var(--el-border-color-light);
-  border-radius: 12px;
-  background: var(--el-bg-color);
-}
-
-.problem-batch-card {
-  border-color: var(--el-color-warning-light-5);
-  background: color-mix(in srgb, var(--el-color-warning) 5%, var(--el-bg-color));
-}
-
-.order-record-drawer-head,
-.order-record-drawer-meta,
-.order-record-drawer-item {
+.dr-order-top {
   display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.order-record-drawer-head {
+  align-items: flex-start;
   justify-content: space-between;
-}
-
-.drawer-title-tags {
-  display: flex;
-  align-items: center;
-  flex-shrink: 0;
-  gap: 6px;
-}
-
-.order-record-drawer-head strong {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.order-record-drawer-meta {
-  flex-wrap: wrap;
-  margin-top: 12px;
-  color: var(--el-text-color-secondary);
-  font-size: 11px;
-  line-height: 1.6;
-}
-
-.order-record-drawer-items {
-  display: grid;
-  gap: 12px;
-  margin-top: 16px;
-}
-
-.order-record-drawer-item {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(40px, auto) minmax(64px, auto);
-  align-items: center;
-  width: 100%;
-  box-sizing: border-box;
-  padding: 12px 12px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 12px;
-  background: var(--el-fill-color-light);
-}
-
-.order-record-drawer-item.success {
-  border-color: var(--el-color-success-light-5);
-  background: color-mix(in srgb, var(--el-color-success) 7%, var(--el-bg-color));
-}
-
-.order-record-drawer-item.failed {
-  border-color: var(--el-color-danger-light-5);
-  background: color-mix(in srgb, var(--el-color-danger) 7%, var(--el-bg-color));
-}
-
-.order-record-drawer-item.refunded,
-.order-record-drawer-item.refunding {
-  border-color: var(--el-color-warning-light-5);
-  background: color-mix(in srgb, var(--el-color-warning) 12%, var(--el-bg-color));
-}
-
-.order-record-drawer-item > div {
-  min-width: 0;
-}
-
-.order-record-drawer-item span,
-.order-record-drawer-item small,
-.order-record-drawer-item em {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.order-record-drawer-item small {
-  margin-top: 4px;
-  color: var(--el-text-color-secondary);
-}
-
-.order-record-drawer-item em {
-  margin-top: 4px;
-  color: var(--el-text-color-secondary);
-  font-style: normal;
-}
-
-.order-record-drawer-item strong {
-  min-width: 0;
-  justify-self: end;
-  white-space: nowrap;
-}
-
-.order-status-tag {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  justify-self: end;
-  min-width: 64px;
-  height: 24px;
-  padding: 0;
-  line-height: 24px;
-  text-align: center;
-}
-
-.order-status-tag :deep(.el-tag__content) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 100%;
-}
-
-.batch-summary {
-  display: flex;
-  flex-direction: column;
-  align-items: stretch;
-  gap: 10px;
-  margin-bottom: 16px;
-  padding: 13px 14px;
-  border-radius: 12px;
-  background: var(--el-fill-color-light);
-}
-
-.batch-summary-main,
-.batch-summary-tags {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
   gap: 8px;
 }
 
-.order-record-drawer-row .batch-summary-tags {
-  margin-top: 12px;
-}
-
-.copy-problem-links-button {
-  width: 100%;
-  margin-top: 12px;
-}
-
-.batch-summary-main {
-  justify-content: space-between;
-}
-
-.batch-summary-main span {
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-}
-
-.record-filters {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 120px;
-  gap: 10px;
-  margin-top: 20px;
-  margin-bottom: 12px;
-}
-
-.status-select {
-  width: 120px;
-}
-
-.removed-row {
-  padding: 12px;
-  border: 1px solid var(--el-color-danger-light-5);
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--el-color-danger) 7%, var(--el-bg-color));
-  cursor: pointer;
-  transition:
-    border-color 0.2s ease,
-    background 0.2s ease;
-}
-
-.removed-row.success {
-  border-color: var(--el-color-success-light-5);
-  background: color-mix(in srgb, var(--el-color-success) 7%, var(--el-bg-color));
-}
-
-.removed-row.active {
-  border-color: var(--el-color-primary);
-  background: color-mix(in srgb, var(--el-color-primary) 12%, var(--el-bg-color));
-}
-
-.removed-row strong {
-  display: block;
+.dr-order-top strong {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.35;
   overflow: hidden;
-  margin-top: 8px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.dr-order-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.dr-order-side em {
+  font-style: normal;
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.dr-order-sub {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.removed-row em {
+.dr-order-link {
   display: block;
   margin-top: 6px;
-  color: var(--el-color-danger);
-  font-style: normal;
-}
-
-.removed-row em.success {
-  color: var(--el-color-success);
-}
-
-.removed-row time {
+  font-size: 11px;
+  line-height: 1.45;
   color: var(--el-text-color-secondary);
-  font-size: 12px;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.empty-records {
-  padding: 40px 12px;
-  color: var(--el-text-color-secondary);
-  text-align: center;
+.dr-order-link:hover { color: var(--el-color-primary); }
+
+.dr-order-link--raw {
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  white-space: normal;
+  word-break: break-all;
 }
 
-.empty-records.compact {
-  padding: 16px 12px;
-}
-
-.right-panels {
+.dr-list-empty {
+  flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 20px;
-  align-self: start;
-  position: sticky;
-  top: 80px;
-}
-
-.settlement-panel {
-  align-self: start;
-  width: 100%;
-  min-width: 0;
-  padding: 0;
-  overflow: hidden;
-  box-shadow: 0 10px 28px rgb(15 23 42 / 6%);
-  border: 1px solid transparent;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--el-bg-color) 94%, var(--el-color-success)), var(--el-bg-color) 36%) padding-box,
-    linear-gradient(
-      90deg,
-      color-mix(in srgb, var(--el-color-primary) 72%, white),
-      color-mix(in srgb, var(--el-color-success) 68%, white),
-      color-mix(in srgb, var(--el-color-primary) 72%, white)
-    ) border-box;
-  background-repeat: no-repeat;
-  background-size: auto, 240% 100%;
-  background-position: 0 0, 0% 50%;
-  animation: settlement-border-flow 7s linear infinite;
-}
-
-.settlement-panel h2 {
-  padding: 22px 24px 18px;
-  border-bottom: 1px solid var(--el-border-color-lighter);
-}
-
-.settlement-panel h2::before {
-  display: none;
-}
-
-.settlement-body {
-  padding: 24px 24px 26px;
-}
-
-.amount-main {
-  position: relative;
-  padding: 22px 20px 18px;
-  border: 1px solid color-mix(in srgb, var(--el-color-primary) 10%, var(--el-border-color-light));
-  border-radius: 14px;
-  background:
-    linear-gradient(135deg, color-mix(in srgb, var(--el-color-primary) 5%, transparent), transparent 58%),
-    var(--el-fill-color-blank);
-}
-
-.amount-main::after {
-  content: '';
-  position: absolute;
-  inset: auto 20px 15px 20px;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--el-color-primary) 25%, transparent), transparent);
-  opacity: 0.6;
-}
-
-.amount-main span {
-  color: var(--el-text-color-secondary);
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-}
-
-.amount-main strong {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  margin-top: 10px;
-  color: var(--el-text-color-primary);
-  font-size: 33px;
-  line-height: 1;
-  letter-spacing: 0;
-  font-variant-numeric: tabular-nums;
-}
-
-.amount-main strong span {
-  color: inherit;
-  font-size: 25px;
-  font-weight: 900;
-}
-
-.amount-main small {
-  display: inline-flex;
   align-items: center;
-  gap: 4px;
-  margin-top: 14px;
-  padding: 4px 9px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--el-color-primary) 8%, var(--el-fill-color-light));
-  color: var(--el-color-primary);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.01em;
-}
-
-.settlement-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px;
-  margin-top: 18px;
-}
-
-.settlement-grid > div {
-  min-width: 0;
-  min-height: 70px;
-  padding: 13px 14px 12px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 14px;
-  background:
-    linear-gradient(180deg, color-mix(in srgb, var(--el-fill-color-lighter) 90%, white), var(--el-fill-color-lighter));
-}
-
-.settlement-grid > div:first-child {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-success) 6%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
-}
-
-.settlement-grid > div:nth-child(2) {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-danger) 6%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
-}
-
-.settlement-grid > div:nth-child(3) {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-primary) 5%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
-}
-
-.settlement-grid > div:nth-child(4) {
-  background: linear-gradient(180deg, color-mix(in srgb, var(--el-color-warning) 5%, var(--el-fill-color-lighter)), var(--el-fill-color-lighter));
-}
-
-.settlement-grid strong,
-.settlement-grid span {
-  display: block;
-}
-
-.settlement-grid span {
+  justify-content: center;
+  gap: 8px;
+  min-height: 120px;
   color: var(--el-text-color-secondary);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
 }
 
-.settlement-grid strong {
-  overflow-wrap: anywhere;
-  margin-top: 5px;
-  color: var(--el-text-color-primary);
-  font-size: 14px;
-  line-height: 1.25;
-  font-variant-numeric: tabular-nums;
+.dr-list-empty-icon {
+  width: 32px;
+  height: 32px;
+  opacity: 0.35;
 }
 
-.settlement-grid strong.red {
-  color: var(--el-color-danger);
+.dr-list-empty p { margin: 0; font-size: 13px; }
+
+.dr-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: var(--el-text-color-secondary);
 }
 
-.warning-box {
-  gap: 6px;
-  margin-top: 14px;
-  padding: 9px 11px;
-  border-radius: 12px;
-  background: color-mix(in srgb, var(--el-color-warning) 7%, var(--el-bg-color));
-  color: var(--el-color-warning);
-  border: 1px solid color-mix(in srgb, var(--el-color-warning) 14%, var(--el-border-color-lighter));
-  font-size: 12px;
-  line-height: 1.45;
+.dr-empty-icon { width: 40px; height: 40px; opacity: 0.4; }
+.dr-empty p { margin: 0; font-size: 14px; }
+
+@media (max-width: 1100px) {
+  .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
-.connection-summary {
-  gap: 6px;
-  margin: 0 24px 24px;
-  padding: 9px 12px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--el-bg-color) 96%, currentColor);
-  border: 1px solid color-mix(in srgb, currentColor 12%, var(--el-border-color-lighter));
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 60%);
-}
+@media (max-width: 768px) {
+  .batch-order-page { padding: 12px; }
+  .page-head { flex-direction: column; align-items: stretch; }
+  .head-actions { flex-direction: column; align-items: stretch; }
+  .type-switcher { overflow-x: auto; }
+  .summary-grid { grid-template-columns: 1fr; }
+  .submit-bar { flex-direction: column; align-items: stretch; }
+  .submit-block { align-items: stretch; }
+  .submit-btn { width: 100%; }
+  .result-row { grid-template-columns: 1fr; }
+  .row-qty, .row-amount { text-align: left; }
 
-.connection-summary svg {
-  color: currentColor;
-}
-
-.connection-summary span {
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0.01em;
-}
-
-.connection-summary.danger {
-  color: var(--el-color-danger);
-}
-
-.connection-summary.success {
-  color: var(--el-color-success);
-}
-
-@keyframes settlement-border-flow {
-  0% {
-    background-position: 0 0, 0% 50%;
+  .order-records-drawer :deep(.el-drawer__body) {
+    max-height: calc(100dvh - 56px);
   }
 
-  50% {
-    background-position: 0 0, 100% 50%;
+  .dr-root,
+  .dr-shell {
+    flex: 1 1 0;
+    min-height: 0;
+    height: 100%;
   }
 
-  100% {
-    background-position: 0 0, 0% 50%;
-  }
-}
-
-@media (max-width: 1180px) {
-  .order-layout {
-    grid-template-columns: 1fr;
-    gap: 16px;
-  }
-
-  .right-panels {
-    position: static;
-  }
-}
-
-@media (max-width: 720px) {
-  .batch-order-page {
-    padding: 12px;
-  }
-
-  .panel {
-    padding: 18px 16px;
-  }
-
-  .connection-card,
-  .panel-head {
-    align-items: flex-start;
+  .dr-shell {
     flex-direction: column;
   }
 
-  .result-row {
-    grid-template-columns: 1fr;
+  .dr-sidebar {
+    flex: 0 0 auto;
+    width: 100%;
+    max-height: min(36vh, 260px);
+    border-right: none;
+    border-bottom: 1px solid var(--el-border-color-lighter);
   }
 
-  .removed-row {
-    grid-template-columns: 1fr;
+  .dr-batch-list {
+    flex: 1 1 0;
+    min-height: 0;
   }
 
-  .record-filters {
-    grid-template-columns: 1fr;
+  .dr-main {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
+    padding: 12px;
   }
 
-  .status-select {
+  .dr-main-head {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .dr-main-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .dr-main-toolbar :deep(.el-input) {
     width: 100%;
   }
 
-  .order-record-drawer-item {
-    grid-template-columns: minmax(0, 1fr) minmax(40px, auto);
+  .dr-tabs {
+    display: flex;
+    width: 100%;
   }
 
-  .order-status-tag {
-    grid-column: 1 / -1;
-    justify-self: start;
+  .dr-tab {
+    flex: 1;
+    text-align: center;
+  }
+
+  .dr-list {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .dr-order {
+    align-items: flex-start;
+  }
+
+  .dr-order-top {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+
+  .dr-order-top strong {
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+  }
+
+  .dr-order-side {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .dr-order-sub,
+  .dr-order-link {
+    font-size: 12px;
+    white-space: normal;
+    word-break: break-all;
   }
 }
 </style>

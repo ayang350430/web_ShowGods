@@ -35,11 +35,17 @@ const XHS_API_ENDPOINTS = {
   view: '/api/v2/note_views',
 };
 let noteBasicCacheTableReady;
+let noteBasicCacheColumnsReady;
 let problemLinkRecordTableReady;
 let batchLinkCheckRecordTableReady;
 let orderSnapshotColumnsReady;
 let replenishmentRecordTableReady;
 let xhsTaskClientOverride = null;
+
+// note_basic_cache 的 URL 索引列常为 utf8mb4_bin，与 orders 默认 collation 不一致
+const SQL_URL_COLLATE = 'utf8mb4_unicode_ci';
+const sqlEqUrl = (leftExpr, rightExpr) =>
+  `${leftExpr} COLLATE ${SQL_URL_COLLATE} = ${rightExpr} COLLATE ${SQL_URL_COLLATE}`;
 
 // 金额和单价四舍五入保留4位小数
 const round4 = (value) => Math.round((Number(value) || 0) * 10_000) / 10_000;
@@ -176,42 +182,64 @@ const createDefaultXhsTaskClient = () => ({
       throw new Error(`Unsupported XHS task type: ${targetType}`);
     }
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
-    const url = `${config.baseUrl}${endpoint}`;
-    const headers = {
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    };
+    const maxRetries = 2;
+    let lastError = null;
 
-    try {
-      console.log(`POST ${endpoint}`, JSON.stringify(payload, null, 2));
-      const response = await fetch(url, {
-        body: JSON.stringify(payload),
-        headers,
-        method: 'POST',
-        signal: controller.signal,
-      });
-      const body = await response.json().catch(() => null);
-      console.log(`RESPONSE ${endpoint}`, JSON.stringify(body, null, 2));
-      if (!response.ok || body?.success === false || body?.code !== 0) {
-        throw new Error(body?.message || `XHS API request failed with HTTP ${response.status}`);
-      }
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+      const url = `${config.baseUrl}${endpoint}`;
+      const headers = {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      };
 
-      const taskId = normalizeXhsTaskId(body?.data?.id);
-      if (!taskId) {
-        throw new Error('XHS API response missing task id (numeric)');
-      }
+      try {
+        if (attempt > 0) {
+          console.log(`[Retry ${attempt}/${maxRetries}] POST ${endpoint}`);
+        }
+        console.log(`POST ${endpoint}`, JSON.stringify(payload, null, 2));
+        const response = await fetch(url, {
+          body: JSON.stringify(payload),
+          headers,
+          method: 'POST',
+          signal: controller.signal,
+        });
+        const body = await response.json().catch(() => null);
+        console.log(`RESPONSE ${endpoint}`, JSON.stringify(body, null, 2));
+        if (!response.ok || body?.success === false || body?.code !== 0) {
+          throw new Error(body?.message || `XHS API request failed with HTTP ${response.status}`);
+        }
 
-      return { id: taskId };
-    } catch (error) {
-      if (error?.name === 'AbortError') {
-        throw new Error(`XHS API request timed out after ${config.timeoutMs}ms`);
+        const taskId = normalizeXhsTaskId(body?.data?.id);
+        if (!taskId) {
+          throw new Error('XHS API response missing task id (numeric)');
+        }
+
+        return { id: taskId };
+      } catch (error) {
+        clearTimeout(timeout);
+        const isTimeout = error?.name === 'AbortError';
+        const isNetworkError = error?.code === 'ECONNRESET' || error?.code === 'ECONNREFUSED' || error?.code === 'ETIMEDOUT' || error?.code === 'UND_ERR_SOCKET' || error?.type === 'system';
+        const errMsg = String(error?.message || '').toLowerCase();
+        const isRateLimit = errMsg.includes('频繁') || errMsg.includes('rate') || errMsg.includes('too many') || errMsg.includes('too frequent');
+        const isUpstreamError = errMsg.includes('i/o timeout') || errMsg.includes('dial tcp') || errMsg.includes('connection refused') || errMsg.includes('eof') || errMsg.includes('broken pipe') || errMsg.includes('connection reset');
+        lastError = isTimeout
+          ? new Error(`XHS API request timed out after ${config.timeoutMs}ms`)
+          : error;
+
+        if ((isTimeout || isNetworkError || isRateLimit || isUpstreamError) && attempt < maxRetries) {
+          const retryDelay = isRateLimit ? 5000 * (attempt + 1) : 2000 * (attempt + 1);
+          console.warn(`[createTask] Attempt ${attempt + 1} failed (${isTimeout ? 'timeout' : isRateLimit ? 'rate-limit' : isUpstreamError ? 'upstream-error' : error?.code || 'network'}), retrying in ${retryDelay}ms...`);
+          await new Promise((r) => setTimeout(r, retryDelay));
+          continue;
+        }
+        throw lastError;
+      } finally {
+        clearTimeout(timeout);
       }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
     }
+    throw lastError;
   },
 
   updateTaskStatus: async (targetType, payload, options = {}) => {
@@ -459,20 +487,28 @@ const resolveShortLinkLocally = async (shortUrl) => {
 // 笔记解析服务地址
 const NOTE_API_BASE = 'http://192.168.31.189:9110/api/v1/note';
 
-// 通过链接获取笔记ID
+// 通过链接获取笔记ID（先 line_1070，失败换 line_1086）
+const NOTE_ID_PROXY_LINES = ['line_1070', 'line_1086'];
 const fetchNoteIdFromApi = async (url) => {
-  try {
-    const response = await fetch(`${NOTE_API_BASE}/id?url=${encodeURIComponent(url)}`, {
-      signal: AbortSignal.timeout(10000),
-    });
-    const body = await response.json();
-    if (body?.code === 0 && body?.data?.note_id) {
-      return body.data.note_id;
+  for (const line of NOTE_ID_PROXY_LINES) {
+    try {
+      const response = await fetch(
+        `${NOTE_API_BASE}/id?url=${encodeURIComponent(url)}&proxy_line=${line}`,
+        { signal: AbortSignal.timeout(10000) },
+      );
+      const body = await response.json();
+      if (body?.code === 0 && body?.data?.note_id) {
+        return body.data.note_id;
+      }
+      // 非 500 直接返空，500 换线路重试
+      if (response.status !== 500 && body?.code !== 500) {
+        return '';
+      }
+    } catch {
+      // 网络异常继续尝试下一条线路
     }
-    return '';
-  } catch {
-    return '';
   }
+  return '';
 };
 
 // 通过笔记ID获取笔记详情（标题、作者、头像）
@@ -541,6 +577,13 @@ const resolvePreviewLocally = async (content) => {
       // 第一次没拿到笔记ID，自动重试一次
       if (!noteId) {
         noteId = await limiter(() => fetchNoteIdFromApi(noteUrl));
+      }
+      // API 两次都失败，短链接尝试本地 HTTP 重定向解析
+      if (!noteId && isShortNoteLink(noteUrl)) {
+        const localResolved = await limiter(() => resolveShortLinkLocally(noteUrl));
+        if (localResolved?.note_id) {
+          noteId = localResolved.note_id;
+        }
       }
       const resolvedNoteUrl = noteId
         ? `https://www.xiaohongshu.com/explore/${noteId}`
@@ -724,22 +767,27 @@ const ensureNoteBasicCacheTable = async (db) => {
   }
 
   await noteBasicCacheTableReady;
-  const ensureColumn = async (name, definition) => {
-    const [[row]] = await db.execute(
-      `
-        SELECT COUNT(1) AS count
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE()
-          AND TABLE_NAME = 'note_basic_cache'
-          AND COLUMN_NAME = ?
-      `,
-      [name],
-    );
-    if (Number(row.count) === 0) {
-      await db.execute(`ALTER TABLE note_basic_cache ADD COLUMN ${name} ${definition}`);
-    }
-  };
-  await ensureColumn('author_id', 'VARCHAR(64) DEFAULT NULL AFTER title');
+  if (!noteBasicCacheColumnsReady) {
+    noteBasicCacheColumnsReady = (async () => {
+      const ensureColumn = async (name, definition) => {
+        const [[row]] = await db.execute(
+          `
+            SELECT COUNT(1) AS count
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'note_basic_cache'
+              AND COLUMN_NAME = ?
+          `,
+          [name],
+        );
+        if (Number(row.count) === 0) {
+          await db.execute(`ALTER TABLE note_basic_cache ADD COLUMN ${name} ${definition}`);
+        }
+      };
+      await ensureColumn('author_id', 'VARCHAR(64) DEFAULT NULL AFTER title');
+    })();
+  }
+  await noteBasicCacheColumnsReady;
 };
 
 // 确保订单快照和补单相关字段存在（不存在则自动添加）
@@ -1105,8 +1153,8 @@ const serializeBatchOrderRecord = (row, orders = []) => ({
 const serializeBatchOrderItem = (row) => ({
   actual_paid_amount: round4(row.actual_paid_amount),
   author_id: row.author_id || '',
-  author_name: row.author_name || '',
-  avatar_url: row.avatar_url || '',
+  author_name: row.author_name || row.cache_author_name || '',
+  avatar_url: normalizeMediaUrl(row.avatar_url || row.cache_avatar_url || ''),
   batch_item_id: Number(row.batch_item_id) || 0,
   completed_quantity: Number(row.completed_quantity) || 0,
   created_at: row.created_at,
@@ -1141,7 +1189,7 @@ const serializeBatchOrderItem = (row) => ({
       ? null
       : Number(row.snapshot_verified_like_count),
   target_type: normalizeTargetType(row.target_type),
-  title: row.title || '',
+  title: row.title || row.cache_title || '',
   updated_at: row.updated_at,
 });
 
@@ -1308,6 +1356,7 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
       order.external_status === 'completed' &&
       verifiedAt &&
       now.getTime() - verifiedAt.getTime() >= 5 * 60 * 1000;
+    let replenishChecked = false;
     if (canFinalize && ['like', 'view'].includes(normalizeTargetType(order.target_type))) {
       try {
         const replenishResult = await replenishOrderIfNeeded(db, userId, order, {
@@ -1318,6 +1367,11 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
           affectedBatchIds.add(order.batch_id);
           return;
         }
+        if (replenishResult.checked === false) {
+          // 实时数据未拿到，不能完成也不能补单，保持 running 等下次重试
+          return;
+        }
+        replenishChecked = true;
         if (Number.isFinite(replenishResult?.achieved_quantity)) {
           completedQuantity = Math.min(replenishResult.achieved_quantity, orderedQuantity || completedQuantity);
         }
@@ -1336,7 +1390,7 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
         return;
       }
     }
-    const nextOrderStatus = canFinalize ? 'completed' : 'running';
+    const nextOrderStatus = (canFinalize && replenishChecked) ? 'completed' : 'running';
     const nextVerifiedAt =
       taskFinished
         ? (order.external_status === 'completed' ? verifiedAt || now : now)
@@ -1441,9 +1495,12 @@ const syncRunningOrdersFromXhs = async (db, userId, batchIds = []) => {
 const listBatchOrderRecords = async (userId, query = {}) => {
   const { limit = 30, page, page_size: pageSize } = query;
   const db = getPool();
-  await ensureOrderSnapshotColumns(db);
-  await ensureNoteBasicCacheTable(db);
-  await refundFailedChargedOrders(db, userId);
+  await Promise.all([
+    ensureOrderSnapshotColumns(db),
+    ensureNoteBasicCacheTable(db),
+  ]);
+  // 退款处理改为后台执行，不阻塞列表响应
+  refundFailedChargedOrders(db, userId).catch(() => {});
   const viewAll = await canViewAllAccountRecords(db, userId);
   const skipStatusSync =
     query.skip_status_sync === '1' ||
@@ -1454,45 +1511,78 @@ const listBatchOrderRecords = async (userId, query = {}) => {
   const safePage = Math.max(Number(page) || 1, 1);
   const safeLimit = Math.min(Math.max(Number(pageSize || limit) || 10, 1), 100);
   const offset = (safePage - 1) * safeLimit;
-  const userFilter = viewAll ? '' : 'WHERE user_id = ?';
-  const userParams = viewAll ? [] : [userId];
-  const [[countRow]] = await db.execute(
-    `
-      SELECT COUNT(*) AS total
-      FROM order_batches
-      ${userFilter}
-    `,
-    userParams,
-  );
-  // 全局汇总：所有批次的订单总数、进行中数量、实际付款总额
+  const conditions = [];
+  const condParams = [];
+  if (!viewAll) {
+    conditions.push('user_id = ?');
+    condParams.push(userId);
+  }
+  if (query.batch_no) {
+    conditions.push('batch_no = ?');
+    condParams.push(query.batch_no);
+  }
+  if (query.batch_id) {
+    conditions.push('id = ?');
+    condParams.push(Number(query.batch_id));
+  }
+  if (query.order_no) {
+    conditions.push('id IN (SELECT batch_id FROM orders WHERE order_no = ?)');
+    condParams.push(query.order_no);
+  }
+  if (query.note_id) {
+    conditions.push('id IN (SELECT batch_id FROM orders WHERE note_id = ?)');
+    condParams.push(query.note_id);
+  }
+  if (query.note_url) {
+    const urlNoteId = extractNoteId(query.note_url);
+    if (urlNoteId) {
+      conditions.push('(id IN (SELECT batch_id FROM orders WHERE note_url LIKE ? OR note_id = ?) OR raw_content LIKE ?)');
+      condParams.push(`%${query.note_url}%`, urlNoteId, `%${query.note_url}%`);
+    } else {
+      conditions.push('(id IN (SELECT batch_id FROM orders WHERE note_url LIKE ?) OR raw_content LIKE ?)');
+      condParams.push(`%${query.note_url}%`, `%${query.note_url}%`);
+    }
+  }
+  const userFilter = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const userParams = condParams;
+  // 三条独立查询并行执行：批次计数、全局汇总、当前页批次
   const orderUserFilter = viewAll ? '' : 'WHERE o.user_id = ?';
-  const [[globalSummary]] = await db.execute(
-    `
-      SELECT
-        COUNT(*) AS total_orders,
-        COALESCE(SUM(CASE WHEN o.order_status IN ('running', 'stopping', 'refund_requested', 'refund_calculating', 'manual_review', 'repair_review') THEN 1 ELSE 0 END), 0) AS processing_orders,
-        COALESCE(SUM(ar.actual_paid_amount), 0) AS total_actual_paid
-      FROM orders o
-      LEFT JOIN (
-        SELECT order_id, SUM(actual_paid_amount) AS actual_paid_amount
-        FROM account_records
-        WHERE record_type = 'order_charge'
-        GROUP BY order_id
-      ) ar ON ar.order_id = o.id
-      ${orderUserFilter}
-    `,
-    viewAll ? [] : [userId],
-  );
-  let [batches] = await db.execute(
-    `
-      SELECT *
-      FROM order_batches
-      ${userFilter}
-      ORDER BY id DESC
-      LIMIT ${safeLimit} OFFSET ${offset}
-    `,
-    userParams,
-  );
+  const [countResult, summaryResult, batchResult] = await Promise.all([
+    db.execute(
+      `SELECT COUNT(*) AS total FROM order_batches ${userFilter}`,
+      userParams,
+    ),
+    db.execute(
+      `
+        SELECT
+          COUNT(*) AS total_orders,
+          COALESCE(SUM(CASE WHEN o.order_status IN ('running', 'stopping', 'refund_requested', 'refund_calculating', 'manual_review', 'repair_review') THEN 1 ELSE 0 END), 0) AS processing_orders,
+          COALESCE(SUM(ar.actual_paid_amount), 0) AS total_actual_paid
+        FROM orders o
+        LEFT JOIN (
+          SELECT order_id, SUM(actual_paid_amount) AS actual_paid_amount
+          FROM account_records
+          WHERE record_type = 'order_charge'
+          GROUP BY order_id
+        ) ar ON ar.order_id = o.id
+        ${orderUserFilter}
+      `,
+      viewAll ? [] : [userId],
+    ),
+    db.execute(
+      `
+        SELECT *
+        FROM order_batches
+        ${userFilter}
+        ORDER BY id DESC
+        LIMIT ${safeLimit} OFFSET ${offset}
+      `,
+      userParams,
+    ),
+  ]);
+  const [[countRow]] = countResult;
+  const [[globalSummary]] = summaryResult;
+  let [batches] = batchResult;
 
   if (batches.length === 0) {
     if (!paginationRequested) {
@@ -1507,64 +1597,66 @@ const listBatchOrderRecords = async (userId, query = {}) => {
   }
 
   const batchIds = batches.map((batch) => batch.id);
-  if (!skipStatusSync) {
-    if (viewAll) {
-      const ownerIds = [...new Set(batches.map((b) => b.user_id))];
-      for (const ownerId of ownerIds) {
-        const ownerBatchIds = batches.filter((b) => Number(b.user_id) === Number(ownerId)).map((b) => b.id);
-        await syncRunningOrdersFromXhs(db, ownerId, ownerBatchIds);
-        await refundFailedChargedOrders(db, ownerId);
+  // XHS 状态同步 + 退款 + 批次统计刷新改为后台异步执行，不阻塞列表响应
+  // 下次刷新页面时就能看到最新数据
+  const backgroundSync = async () => {
+    try {
+      if (!skipStatusSync) {
+        if (viewAll) {
+          const ownerIds = [...new Set(batches.map((b) => b.user_id))];
+          for (const ownerId of ownerIds) {
+            const ownerBatchIds = batches.filter((b) => Number(b.user_id) === Number(ownerId)).map((b) => b.id);
+            await syncRunningOrdersFromXhs(db, ownerId, ownerBatchIds);
+            await refundFailedChargedOrders(db, ownerId);
+          }
+        } else {
+          await syncRunningOrdersFromXhs(db, userId, batchIds);
+          await refundFailedChargedOrders(db, userId);
+        }
       }
-    } else {
-      await syncRunningOrdersFromXhs(db, userId, batchIds);
-      await refundFailedChargedOrders(db, userId);
+      if (viewAll) {
+        const ownerIds = [...new Set(batches.map((b) => b.user_id))];
+        for (const ownerId of ownerIds) {
+          const ownerBatchIds = batches.filter((b) => Number(b.user_id) === Number(ownerId)).map((b) => b.id);
+          await refreshBatchStats(db, ownerId, ownerBatchIds);
+        }
+      } else {
+        await refreshBatchStats(db, userId, batchIds);
+      }
+    } catch (err) {
+      console.error('[backgroundSync] batch records sync error:', err?.message || err);
     }
-  }
-  if (viewAll) {
-    const ownerIds = [...new Set(batches.map((b) => b.user_id))];
-    for (const ownerId of ownerIds) {
-      const ownerBatchIds = batches.filter((b) => Number(b.user_id) === Number(ownerId)).map((b) => b.id);
-      await refreshBatchStats(db, ownerId, ownerBatchIds);
-    }
-  } else {
-    await refreshBatchStats(db, userId, batchIds);
-  }
-  [batches] = await db.execute(
-    `
-      SELECT *
-      FROM order_batches
-      ${userFilter}
-      ORDER BY id DESC
-      LIMIT ${safeLimit} OFFSET ${offset}
-    `,
-    userParams,
-  );
+  };
+  backgroundSync();
 
-  // 查询每个批次的订单状态汇总 + 实际付款金额 + target_type
+  // 两条批次维度查询并行执行
   const batchIdPlaceholders = batchIds.map(() => '?').join(',');
-  const [orderStatusRows] = await db.execute(
-    `SELECT batch_id, order_status, COUNT(1) AS cnt
-     FROM orders
-     WHERE batch_id IN (${batchIdPlaceholders})
-     GROUP BY batch_id, order_status`,
-    batchIds,
-  );
+  const [statusResult2, summaryResult2] = await Promise.all([
+    db.execute(
+      `SELECT batch_id, order_status, COUNT(1) AS cnt
+       FROM orders
+       WHERE batch_id IN (${batchIdPlaceholders})
+       GROUP BY batch_id, order_status`,
+      batchIds,
+    ),
+    db.execute(
+      `SELECT o.batch_id,
+              COALESCE(SUM(ar.actual_paid_amount), 0) AS total_actual_paid,
+              MAX(o.target_type) AS target_type
+       FROM orders o
+       LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
+       WHERE o.batch_id IN (${batchIdPlaceholders})
+       GROUP BY o.batch_id`,
+      batchIds,
+    ),
+  ]);
+  const [orderStatusRows] = statusResult2;
   const batchOrderStatusMap = {};
   for (const row of orderStatusRows) {
     if (!batchOrderStatusMap[row.batch_id]) batchOrderStatusMap[row.batch_id] = {};
     batchOrderStatusMap[row.batch_id][row.order_status] = Number(row.cnt) || 0;
   }
-
-  const [batchSummaryRows] = await db.execute(
-    `SELECT o.batch_id,
-            COALESCE(SUM(ar.actual_paid_amount), 0) AS total_actual_paid,
-            MAX(o.target_type) AS target_type
-     FROM orders o
-     LEFT JOIN account_records ar ON ar.order_id = o.id AND ar.record_type = 'order_charge'
-     WHERE o.batch_id IN (${batchIdPlaceholders})
-     GROUP BY o.batch_id`,
-    batchIds,
-  );
+  const [batchSummaryRows] = summaryResult2;
   const batchSummaryMap = {};
   for (const row of batchSummaryRows) {
     batchSummaryMap[row.batch_id] = {
@@ -1624,9 +1716,9 @@ const getBatchOrders = async (userId, batchId) => {
         ar.payable_amount,
         ar.refund_amount,
         ar.status AS record_status,
-        nbc.title AS cache_title,
-        nbc.author_name AS cache_author_name,
-        nbc.avatar_url AS cache_avatar_url
+        COALESCE(nbc.title, nbc_url.title, nbc_res.title) AS cache_title,
+        COALESCE(nbc.author_name, nbc_url.author_name, nbc_res.author_name) AS cache_author_name,
+        COALESCE(nbc.avatar_url, nbc_url.avatar_url, nbc_res.avatar_url) AS cache_avatar_url
       FROM orders o
       LEFT JOIN (
         SELECT
@@ -1640,14 +1732,11 @@ const getBatchOrders = async (userId, batchId) => {
         GROUP BY order_id
       ) ar ON ar.order_id = o.id
       LEFT JOIN (
-        SELECT
-          note_id,
-          MAX(title) AS title,
-          MAX(author_name) AS author_name,
-          MAX(avatar_url) AS avatar_url
-        FROM note_basic_cache
-        GROUP BY note_id
+        SELECT note_id, MAX(title) AS title, MAX(author_name) AS author_name, MAX(avatar_url) AS avatar_url
+        FROM note_basic_cache GROUP BY note_id
       ) nbc ON nbc.note_id = o.note_id
+      LEFT JOIN note_basic_cache nbc_url ON ${sqlEqUrl('nbc_url.source_url', 'o.note_url')}
+      LEFT JOIN note_basic_cache nbc_res ON ${sqlEqUrl('nbc_res.resolved_note_url', 'o.note_url')}
       WHERE o.batch_id = ?
       ORDER BY o.batch_item_id ASC, o.id ASC
     `,
@@ -1679,7 +1768,8 @@ const searchBatchOrdersByLinks = async (userId, params = {}) => {
   }
 
   const viewAll = await canViewAllAccountRecords(db, userId);
-  const urls = [...new Set(validLinks.map((item) => item.note_url).filter(Boolean))];
+  const urls = [...new Set(validLinks.filter((item) => !item.is_note_id).map((item) => item.note_url).filter(Boolean))];
+  const noteIds = [...new Set(validLinks.filter((item) => item.is_note_id).map((item) => item.note_id).filter(Boolean))];
   const urlSet = new Set(urls);
 
   // Step 1: find batches whose raw_content contains any search URL, resolve precise batch_item_ids
@@ -1702,12 +1792,16 @@ const searchBatchOrdersByLinks = async (userId, params = {}) => {
     }
   }
 
-  // Step 2: build WHERE clause — match by note_url OR by precise (batch_id, batch_item_id)
+  // Step 2: build WHERE clause — match by note_url, note_id, OR by precise (batch_id, batch_item_id)
   const linkWhere = [];
   const queryParams = [];
   if (urls.length > 0) {
     linkWhere.push(`o.note_url IN (${urls.map(() => '?').join(',')})`);
     queryParams.push(...urls);
+  }
+  if (noteIds.length > 0) {
+    linkWhere.push(`o.note_id IN (${noteIds.map(() => '?').join(',')})`);
+    queryParams.push(...noteIds);
   }
   for (const pair of precisePairs) {
     linkWhere.push('(o.batch_id = ? AND o.batch_item_id = ?)');
@@ -1796,7 +1890,8 @@ const searchBatchOrdersByLinks = async (userId, params = {}) => {
     const matchedLink =
       validLinks.find((item) =>
         item.note_url === row.note_url ||
-        item.note_url === sourceUrl,
+        item.note_url === sourceUrl ||
+        (item.is_note_id && item.note_id && item.note_id === row.note_id),
       ) || null;
     if (!matchedLink) {
       return [];
@@ -3460,14 +3555,15 @@ const batchRejectRefunds = async (actorUserId, { batch_no, order_ids, reason = '
 // 序列化退款记录
 const serializeRefundRecord = (row) => ({
   actual_paid_amount: round4(row.actual_paid_amount),
-  author_name: row.author_name || '',
-  avatar_url: row.avatar_url || '',
+  author_name: row.merged_author_name || row.author_name || '',
+  avatar_url: normalizeMediaUrl(row.merged_avatar_url || row.avatar_url || ''),
   batch_no: row.batch_no || '',
   created_at: row.created_at,
   display_name: row.display_name || row.username || '',
   id: Number(row.id),
   note_id: row.note_id || '',
   note_url: row.note_url || '',
+  source_note_url: row.source_note_url || row.note_url || '',
   order_id: Number(row.id),
   order_no: row.order_no || '',
   order_status: row.order_status || '',
@@ -3482,7 +3578,7 @@ const serializeRefundRecord = (row) => ({
   refund_requested_at: row.refund_requested_at || null,
   refunded_quantity: Number(row.refunded_quantity) || 0,
   target_type: normalizeTargetType(row.target_type),
-  title: row.title || '',
+  title: row.merged_title || row.title || '',
   updated_at: row.updated_at,
   user_id: Number(row.user_id),
   username: row.username || '',
@@ -3546,6 +3642,8 @@ const listRefundRecords = async (userId, query = {}) => {
       SELECT note_id, MAX(title) AS title, MAX(author_name) AS author_name, MAX(avatar_url) AS avatar_url
       FROM note_basic_cache GROUP BY note_id
     ) nbc ON nbc.note_id = o.note_id
+    LEFT JOIN note_basic_cache nbc_url ON ${sqlEqUrl('nbc_url.source_url', 'o.note_url')}
+    LEFT JOIN note_basic_cache nbc_res ON ${sqlEqUrl('nbc_res.resolved_note_url', 'o.note_url')}
     WHERE ${orderWhere.join(' AND ')}
   `;
 
@@ -3600,6 +3698,8 @@ const listRefundRecords = async (userId, query = {}) => {
       SELECT note_id, MAX(title) AS title, MAX(author_name) AS author_name, MAX(avatar_url) AS avatar_url
       FROM note_basic_cache GROUP BY note_id
     ) nbc ON nbc.note_id = o.note_id
+    LEFT JOIN note_basic_cache nbc_url ON ${sqlEqUrl('nbc_url.source_url', 'o.note_url')}
+    LEFT JOIN note_basic_cache nbc_res ON ${sqlEqUrl('nbc_res.resolved_note_url', 'o.note_url')}
     LEFT JOIN (
       SELECT order_id, SUM(actual_paid_amount) AS actual_paid_amount, SUM(payable_amount) AS payable_amount,
              SUM(refund_amount) AS refund_amount, MAX(status) AS status
@@ -3613,17 +3713,32 @@ const listRefundRecords = async (userId, query = {}) => {
   `;
 
   const [rows] = await db.execute(
-    `SELECT o.*, ob.batch_no, u.username,
+    `SELECT o.*, ob.batch_no, ob.raw_content AS batch_raw_content, u.username,
        COALESCE(NULLIF(u.real_name, ''), NULLIF(u.nickname, ''), u.username) AS display_name,
-       nbc.title, nbc.author_name, nbc.avatar_url, ar.actual_paid_amount,
+       COALESCE(nbc.title, nbc_url.title, nbc_res.title, o.title) AS merged_title,
+       COALESCE(nbc.author_name, nbc_url.author_name, nbc_res.author_name, o.author_name) AS merged_author_name,
+       COALESCE(nbc.avatar_url, nbc_url.avatar_url, nbc_res.avatar_url, o.avatar_url) AS merged_avatar_url,
+       ar.actual_paid_amount,
        rr.after_available_amount AS refund_after_available_amount
      ${detailFromSql}
      ORDER BY ob.batch_no DESC, o.id DESC`,
     detailParams,
   );
 
+  const batchRawMap = new Map();
+  for (const row of rows) {
+    const batchId = Number(row.batch_id) || 0;
+    if (batchId > 0 && !batchRawMap.has(batchId)) {
+      batchRawMap.set(batchId, buildRawUrlMap(row.batch_raw_content));
+    }
+  }
+
   return {
-    items: rows.map(serializeRefundRecord),
+    items: rows.map((row) => {
+      const rawMap = batchRawMap.get(Number(row.batch_id) || 0);
+      const sourceNoteUrl = rawMap?.get(Number(row.batch_item_id)) || row.note_url || '';
+      return serializeRefundRecord({ ...row, source_note_url: sourceNoteUrl });
+    }),
     page: safePage,
     page_size: safeLimit,
     total: totalBatches,
@@ -3813,40 +3928,66 @@ const normalizeNoteRealtimeViewCountResponse = (payload) => {
 // 兼容旧版的点赞数查询入口（外部API已禁用，始终返回null）
 const fetchNoteRealtimeData = async (noteId) => {
   if (!noteId) return null;
-  try {
-    const response = await fetch(
-      `${NOTE_API_BASE}/realtime?note_id=${encodeURIComponent(noteId)}&proxy_line=line_1086`,
-      { signal: AbortSignal.timeout(10000) },
-    );
-    const body = await response.json();
-    if (body?.code === 0 && body?.data?.realTime) {
-      return { realTime: body.data.realTime, raw: body.data };
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        console.warn(`[fetchNoteRealtimeData] Retry ${attempt}/${maxRetries} for note ${noteId}`);
+      }
+      const response = await fetch(
+        `${NOTE_API_BASE}/realtime?note_id=${encodeURIComponent(noteId)}&proxy_line=line_1086`,
+        { signal: AbortSignal.timeout(15000) },
+      );
+      const body = await response.json();
+      if (body?.code === 0 && body?.data?.realTime) {
+        return { realTime: body.data.realTime, raw: body.data };
+      }
+      if (attempt < maxRetries) continue;
+      return null;
+    } catch (error) {
+      if (attempt < maxRetries) {
+        console.warn(`[fetchNoteRealtimeData] Attempt ${attempt + 1} failed: ${error?.message || error}`);
+        continue;
+      }
+      return null;
     }
-    return null;
-  } catch {
-    return null;
   }
+  return null;
 };
 
 const requestNoteLikeCount = async ({ note_id: noteId } = {}) => {
   if (!noteId) return { like_count: null, payload: null };
-  try {
-    const response = await fetch(
-      `${NOTE_API_BASE}/likes?note_id=${encodeURIComponent(noteId)}&proxy_line=line_1086`,
-      { signal: AbortSignal.timeout(10000) },
-    );
-    const body = await response.json();
-    if (body?.code === 0 && body?.data) {
-      const likesNum = Number(body.data.likes_num);
-      return {
-        like_count: Number.isFinite(likesNum) ? likesNum : null,
-        payload: body.data,
-      };
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      if (attempt > 0) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        console.warn(`[requestNoteLikeCount] Retry ${attempt}/${maxRetries} for note ${noteId}`);
+      }
+      const response = await fetch(
+        `${NOTE_API_BASE}/likes?note_id=${encodeURIComponent(noteId)}&proxy_line=line_1086`,
+        { signal: AbortSignal.timeout(15000) },
+      );
+      const body = await response.json();
+      if (body?.code === 0 && body?.data) {
+        const likesNum = Number(body.data.likes_num);
+        return {
+          like_count: Number.isFinite(likesNum) ? likesNum : null,
+          payload: body.data,
+        };
+      }
+      if (attempt < maxRetries) continue;
+      return { like_count: null, payload: null };
+    } catch (error) {
+      if (attempt < maxRetries) {
+        console.warn(`[requestNoteLikeCount] Attempt ${attempt + 1} failed: ${error?.message || error}`);
+        continue;
+      }
+      return { like_count: null, payload: null };
     }
-    return { like_count: null, payload: null };
-  } catch {
-    return { like_count: null, payload: null };
   }
+  return { like_count: null, payload: null };
 };
 
 const requestNoteRealtimeViewCount = async ({ note_id: noteId } = {}) => {
@@ -4579,12 +4720,14 @@ const parseBatchSearchLinks = (content) => {
     const [noteUrl = ''] = line.split(/\s+/);
     const noteId = extractNoteId(noteUrl);
     const errors = [];
+    // 支持直接输入笔记ID（16-24位十六进制字符串）
+    const isNoteIdInput = /^[0-9a-f]{16,24}$/i.test(noteUrl);
 
-    if (!/^https?:\/\/\S+/i.test(noteUrl)) {
+    if (!isNoteIdInput && !/^https?:\/\/\S+/i.test(noteUrl)) {
       errors.push('Invalid link format');
     }
 
-    const key = noteId || noteUrl;
+    const key = isNoteIdInput ? noteUrl : (noteId || noteUrl);
     const duplicate = Boolean(key) && seenKeys.has(key);
     if (duplicate) {
       errors.push('链接重复');
@@ -4596,9 +4739,10 @@ const parseBatchSearchLinks = (content) => {
     return {
       duplicate,
       errors,
+      is_note_id: isNoteIdInput,
       line_no: index + 1,
-      note_id: noteId,
-      note_url: noteUrl,
+      note_id: isNoteIdInput ? noteUrl : noteId,
+      note_url: isNoteIdInput ? '' : noteUrl,
       raw: line,
       valid: errors.length === 0,
     };
@@ -4642,6 +4786,19 @@ const getBoolConfig = async (db, group, key, defaultValue) => {
     if (typeof value?.enabled === 'boolean') return value.enabled;
     if (typeof value === 'boolean') return value;
     return defaultValue;
+  } catch { return defaultValue; }
+};
+
+const getStringConfig = async (db, group, key, defaultValue) => {
+  const [[row]] = await db.execute(
+    `SELECT config_value FROM system_configs
+     WHERE config_group = ? AND config_key = ? AND status = 'active' LIMIT 1`,
+    [group, key],
+  );
+  if (!row) return defaultValue;
+  try {
+    const parsed = typeof row.config_value === 'string' ? JSON.parse(row.config_value) : row.config_value;
+    return typeof parsed?.value === 'string' ? parsed.value : (typeof parsed === 'string' ? parsed : defaultValue);
   } catch { return defaultValue; }
 };
 
@@ -5436,7 +5593,7 @@ const replenishViewOrderIfNeeded = async (db, userId, order, options = {}) => {
   const realtime = await requestNoteRealtimeViewCount({ note_id: order.note_id });
   const latest = realtime.view_count;
   const payloadText = realtime.payload ? JSON.stringify(realtime.payload).slice(0, 8000) : null;
-  if (!Number.isFinite(Number(latest))) {
+  if (latest === null || latest === undefined || !Number.isFinite(Number(latest))) {
     const verifiedAt = order.last_verified_at ? new Date(order.last_verified_at) : null;
     const staleSince = verifiedAt ? now.getTime() - verifiedAt.getTime() : 0;
     if (staleSince > 60 * 60 * 1000) {
@@ -5446,7 +5603,7 @@ const replenishViewOrderIfNeeded = async (db, userId, order, options = {}) => {
       );
       return { checked: true, reason: 'missing_realtime_count_timeout', replenished: false };
     }
-    return { checked: false, reason: 'missing_realtime_count', needs_replenish: true, replenished: false };
+    return { checked: false, reason: 'missing_realtime_count', needs_replenish: false, replenished: false };
   }
 
   const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
@@ -5572,8 +5729,8 @@ const replenishLikeOrderIfNeeded = async (db, userId, order, options = {}) => {
   const latestResult = await requestNoteLikeCount({ note_id: order.note_id });
   const latest = latestResult.like_count;
   const payloadText = latestResult.payload ? JSON.stringify(latestResult.payload).slice(0, 8000) : null;
-  if (!Number.isFinite(Number(latest))) {
-    return { checked: true, reason: 'missing_like_count', replenished: false };
+  if (latest === null || latest === undefined || !Number.isFinite(Number(latest))) {
+    return { checked: false, reason: 'missing_like_count', replenished: false };
   }
 
   const orderedQuantity = Math.max(Number(order.ordered_quantity) || 0, 0);
@@ -5967,24 +6124,68 @@ const listReplenishmentRequests = async (actorUserId, query = {}) => {
     params,
   );
 
+  // 查询每组的具体订单明细
+  const groupKeys = rows.map((r) => [Number(r.batch_id), Number(r.user_id), r.status]);
+  let orderDetailsMap = {};
+  if (groupKeys.length > 0) {
+    const detailConditions = groupKeys.map(() => '(rr.batch_id = ? AND rr.user_id = ? AND rr.status = ?)');
+    const detailParams = groupKeys.flat();
+    const [detailRows] = await db.execute(
+      `SELECT rr.batch_id, rr.user_id, rr.status, rr.order_id, rr.order_no, rr.note_url, rr.note_id,
+              rr.ordered_quantity, rr.actual_quantity, rr.shortage_quantity, rr.target_type,
+              o.title, o.author_name,
+              COALESCE(o.avatar_url, nbc.avatar_url) AS avatar_url
+       FROM order_replenishment_records rr
+       LEFT JOIN orders o ON o.id = rr.order_id
+       LEFT JOIN (
+         SELECT note_id, MAX(avatar_url) AS avatar_url
+         FROM note_basic_cache GROUP BY note_id
+       ) nbc ON nbc.note_id = o.note_id
+       WHERE ${detailConditions.join(' OR ')}
+       ORDER BY rr.id ASC`,
+      detailParams,
+    );
+    for (const d of detailRows) {
+      const key = `${d.batch_id}-${d.user_id}-${d.status}`;
+      if (!orderDetailsMap[key]) orderDetailsMap[key] = [];
+      orderDetailsMap[key].push({
+        actual_quantity: Number(d.actual_quantity) || 0,
+        author_name: d.author_name || '',
+        avatar_url: normalizeMediaUrl(d.avatar_url || ''),
+        note_id: d.note_id || '',
+        note_url: d.note_url || '',
+        order_id: Number(d.order_id),
+        order_no: d.order_no || '',
+        ordered_quantity: Number(d.ordered_quantity) || 0,
+        shortage_quantity: Number(d.shortage_quantity) || 0,
+        target_type: d.target_type || '',
+        title: d.title || '',
+      });
+    }
+  }
+
   return {
-    items: rows.map((row) => ({
-      batch_id: Number(row.batch_id),
-      batch_no: row.batch_no,
-      batch_uuid: row.batch_uuid,
-      estimated_amount: round4(row.estimated_amount),
-      id: Number(row.id),
-      pending_order_count: Number(row.pending_order_count) || 0,
-      pending_quantity: Number(row.pending_quantity) || 0,
-      reason_message: row.reason_message || '',
-      real_name: row.real_name || '',
-      requested_at: row.requested_at,
-      reviewed_at: row.reviewed_at || null,
-      status: row.status,
-      target_count: Number(row.target_count) || 0,
-      user_id: Number(row.user_id),
-      username: row.username || '',
-    })),
+    items: rows.map((row) => {
+      const key = `${row.batch_id}-${row.user_id}-${row.status}`;
+      return {
+        batch_id: Number(row.batch_id),
+        batch_no: row.batch_no,
+        batch_uuid: row.batch_uuid,
+        estimated_amount: round4(row.estimated_amount),
+        id: Number(row.id),
+        orders: orderDetailsMap[key] || [],
+        pending_order_count: Number(row.pending_order_count) || 0,
+        pending_quantity: Number(row.pending_quantity) || 0,
+        reason_message: row.reason_message || '',
+        real_name: row.real_name || '',
+        requested_at: row.requested_at,
+        reviewed_at: row.reviewed_at || null,
+        status: row.status,
+        target_count: Number(row.target_count) || 0,
+        user_id: Number(row.user_id),
+        username: row.username || '',
+      };
+    }),
     page: safePage,
     page_size: safePageSize,
     total: Number(countRow.total) || 0,
@@ -5993,6 +6194,15 @@ const listReplenishmentRequests = async (actorUserId, query = {}) => {
 
 // 提交批量订单（扣费、创建订单、调用上游任务API）
 const submitBatch = async (userId, params) => {
+  // 管理员账号不允许下单
+  const db0 = getPool();
+  const isAdminUser = await canViewAllAccountRecords(db0, userId);
+  if (isAdminUser) {
+    const error = new Error('管理员账号不允许下单，请使用普通账号');
+    error.statusCode = 403;
+    throw error;
+  }
+
   if (!params?.agree_policy) {
     const error = new Error('Please confirm the order policy');
     error.statusCode = 400;
@@ -6140,140 +6350,10 @@ const submitBatch = async (userId, params) => {
       });
     }
 
-    // 并发控制 + 自动重试：避免同时发送过多请求导致上游限流
-    const SUBMIT_CONCURRENCY = 5;
-    const MAX_RETRIES = 2;
-    const RETRY_BASE_DELAY_MS = 2000;
-    const submitLimiter = createAsyncLimiter(SUBMIT_CONCURRENCY);
-
-    const isRetryableError = (error) => {
-      const msg = String(error?.message || error?.cause?.message || '').toLowerCase();
-      return msg.includes('繁忙') || msg.includes('busy')
-        || msg.includes('etimedout') || msg.includes('econnreset')
-        || msg.includes('rate') || msg.includes('too many');
-    };
-
-    const createTaskWithRetry = async (order) => {
-      let lastError;
-      let retried = 0;
-      for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-        try {
-          const xhsResult = await getXhsTaskClient().createTask(
-            preview.target_type,
-            createXhsTaskPayload({
-              batchNo,
-              item: order.item,
-              orderNo: order.orderNo,
-              source: params.source || `goodsAdmin:${order.id}`,
-              targetType: preview.target_type,
-            }),
-            { token: createCurrentUserToken(userId) },
-          );
-          const externalTaskId = normalizeXhsTaskId(xhsResult?.id);
-          if (!externalTaskId) {
-            throw new Error('XHS API response missing task id (numeric)');
-          }
-          return { externalTaskId, orderId: order.id };
-        } catch (error) {
-          lastError = error;
-          if (!isRetryableError(error) || attempt >= MAX_RETRIES) {
-            break;
-          }
-          retried += 1;
-          const delay = RETRY_BASE_DELAY_MS * (attempt + 1) + Math.random() * 500;
-          await new Promise((r) => setTimeout(r, delay));
-        }
-      }
-      // 重试过仍然失败，补充重试次数到错误信息
-      if (retried > 0) {
-        const origMsg = lastError?.message || String(lastError || '');
-        lastError = new Error(`${origMsg}（已自动重试${retried}次仍失败）`);
-        if (lastError.cause === undefined) {
-          lastError.cause = {};
-        }
-      }
-      return { error: lastError, orderId: order.id };
-    };
-
-    const taskResults = await Promise.all(
-      orderRows.map((order) => submitLimiter(() => createTaskWithRetry(order))),
-    );
-    const taskResultByOrderId = new Map(taskResults.map((result) => [result.orderId, result]));
+    // 先扣费入库，立即返回前端；后台异步创建上游任务
+    const totalChargedAmount = orderRows.reduce((sum, o) => round4(sum + o.item.payable_amount), 0);
 
     for (const order of orderRows) {
-      let orderStatus = 'running';
-      const taskResult = taskResultByOrderId.get(order.id);
-      const externalTaskId = taskResult?.externalTaskId || null;
-
-      try {
-        if (taskResult?.error) {
-          throw taskResult.error;
-        }
-        if (!externalTaskId) {
-          throw new Error('XHS API response missing task id (numeric)');
-        }
-        await connection.execute(
-          `
-            UPDATE orders
-            SET external_task_id = ?,
-                external_status = 'accepted',
-                reason_message = NULL,
-                updated_at = ?
-            WHERE id = ?
-          `,
-          [externalTaskId, now, order.id],
-        );
-      } catch (error) {
-        orderStatus = 'failed';
-        await connection.execute(
-          `
-            UPDATE orders
-            SET order_status = 'failed',
-                reason_message = ?,
-                updated_at = ?
-            WHERE id = ?
-          `,
-          [normalizeXhsErrorMessage(error), now, order.id],
-        );
-      }
-
-      if (orderStatus === 'failed') {
-        failedCount += 1;
-        const failReason = taskResultByOrderId.get(order.id)?.error?.message || '上游任务创建失败';
-        await connection.execute(
-          `
-            INSERT INTO account_records
-              (
-                record_no, user_id, record_type, direction, order_id, order_no,
-                status, ordered_quantity, original_unit_price, original_total_amount,
-                discount_rate, discounted_unit_price, discount_amount, payable_amount,
-                actual_paid_amount, net_amount, before_available_amount, after_available_amount,
-                reason_message, created_at, updated_at
-              )
-            VALUES (?, ?, 'order_charge', 'debit', ?, ?, 'failed', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
-          `,
-          [
-            order.recordNo,
-            userId,
-            order.id,
-            order.orderNo,
-            order.item.ordered_quantity,
-            preview.unit_price,
-            order.item.original_amount ?? preview.unit_price,
-            preview.discount_rate,
-            preview.discounted_unit_price,
-            order.item.discount_amount,
-            order.item.payable_amount,
-            beforeBalance,
-            beforeBalance,
-            failReason,
-            now,
-            now,
-          ],
-        );
-        continue;
-      }
-
       const afterBalance = round4(beforeBalance - order.item.payable_amount);
       await connection.execute(
         `
@@ -6308,10 +6388,7 @@ const submitBatch = async (userId, params) => {
           now,
         ],
       );
-
       beforeBalance = afterBalance;
-      submittedCount += 1;
-      chargedAmount = round4(chargedAmount + order.item.payable_amount);
     }
 
     await connection.execute(
@@ -6319,33 +6396,122 @@ const submitBatch = async (userId, params) => {
       [beforeBalance, now, userId],
     );
 
-    const batchStatus =
-      submittedCount > 0
-        ? 'processing'
-        : 'failed';
     await connection.execute(
       `
         UPDATE order_batches
-        SET status = ?,
+        SET status = 'processing',
             processing_count = ?,
-            succeeded_count = ?,
-            failed_count = ?,
-            retryable_count = ?,
-            finished_at = CASE WHEN ? = 'failed' THEN ? ELSE finished_at END,
+            succeeded_count = 0,
+            failed_count = 0,
+            retryable_count = 0,
             updated_at = ?
         WHERE id = ?
       `,
-      [batchStatus, submittedCount, 0, failedCount, failedCount, batchStatus, now, now, batch.id],
+      [orderRows.length, now, batch.id],
     );
 
     await connection.commit();
 
+    // ---- 后台异步创建上游任务（10 并发） ----
+    const bgBatchId = batch.id;
+    const bgTargetType = preview.target_type;
+    const bgUnitPrice = preview.unit_price;
+    const bgDiscountRate = preview.discount_rate;
+    const bgDiscountedUnitPrice = preview.discounted_unit_price;
+
+    (async () => {
+      const SUBMIT_CONCURRENCY = 5;
+      const MAX_RETRIES = 2;
+      const RETRY_BASE_DELAY_MS = 2000;
+      const submitLimiter = createAsyncLimiter(SUBMIT_CONCURRENCY);
+
+      const isRetryableError = (error) => {
+        const msg = String(error?.message || error?.cause?.message || '').toLowerCase();
+        return msg.includes('繁忙') || msg.includes('busy')
+          || msg.includes('etimedout') || msg.includes('econnreset')
+          || msg.includes('rate') || msg.includes('too many')
+          || msg.includes('i/o timeout') || msg.includes('dial tcp')
+          || msg.includes('connection refused') || msg.includes('broken pipe');
+      };
+
+      const createTaskWithRetry = async (order) => {
+        let lastError;
+        let retried = 0;
+        for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            const xhsResult = await getXhsTaskClient().createTask(
+              bgTargetType,
+              createXhsTaskPayload({
+                batchNo,
+                item: order.item,
+                orderNo: order.orderNo,
+                source: params.source || `goodsAdmin:${order.id}`,
+                targetType: bgTargetType,
+              }),
+              { token: createCurrentUserToken(userId) },
+            );
+            const externalTaskId = normalizeXhsTaskId(xhsResult?.id);
+            if (!externalTaskId) {
+              throw new Error('XHS API response missing task id (numeric)');
+            }
+            return { externalTaskId, orderId: order.id };
+          } catch (error) {
+            lastError = error;
+            if (!isRetryableError(error) || attempt >= MAX_RETRIES) break;
+            retried += 1;
+            const delay = RETRY_BASE_DELAY_MS * (attempt + 1) + Math.random() * 500;
+            await new Promise((r) => setTimeout(r, delay));
+          }
+        }
+        if (retried > 0) {
+          const origMsg = lastError?.message || String(lastError || '');
+          lastError = new Error(`${origMsg}（已自动重试${retried}次仍失败）`);
+        }
+        return { error: lastError, orderId: order.id };
+      };
+
+      const bgDb = getPool();
+      let bgFailedCount = 0;
+      let bgSuccessCount = 0;
+
+      const taskResults = await Promise.all(
+        orderRows.map((order) => submitLimiter(() => createTaskWithRetry(order))),
+      );
+
+      for (const result of taskResults) {
+        const bgNow = new Date();
+        if (result.externalTaskId) {
+          await bgDb.execute(
+            `UPDATE orders SET external_task_id = ?, external_status = 'accepted', reason_message = NULL, updated_at = ? WHERE id = ?`,
+            [result.externalTaskId, bgNow, result.orderId],
+          );
+          bgSuccessCount++;
+        } else {
+          const errMsg = normalizeXhsErrorMessage(result.error);
+          await bgDb.execute(
+            `UPDATE orders SET order_status = 'failed', reason_message = ?, updated_at = ? WHERE id = ?`,
+            [errMsg, bgNow, result.orderId],
+          );
+          bgFailedCount++;
+        }
+      }
+
+      // 刷新批次统计
+      try {
+        await refreshBatchStats(bgDb, userId, [bgBatchId]);
+      } catch {}
+
+      console.log(`[submitBatch] batch_no=${batchNo} 后台创建完成: 成功${bgSuccessCount}, 失败${bgFailedCount}`);
+    })().catch((err) => {
+      console.error(`[submitBatch] batch_no=${batchNo} 后台创建异常:`, err);
+    });
+
     return {
       batch_id: batchUuid,
       batch_no: batchNo,
-      failed_count: failedCount,
-      submitted_count: submittedCount,
-      total_amount: chargedAmount,
+      failed_count: 0,
+      submitted_count: orderRows.length,
+      total_amount: totalChargedAmount,
     };
   } catch (error) {
     await connection.rollback();
@@ -6395,20 +6561,27 @@ const replenishBatch = async (userId, batchId) => {
     [targetBatchId, userId],
   );
 
+  const BATCH_CONCURRENCY = 20;
   const results = [];
-  for (const order of orders) {
-    try {
-      const result = await replenishOrderIfNeeded(db, userId, order, { now: new Date() });
-      results.push({
-        order_id: Number(order.id),
-        ...result,
-      });
-    } catch (error) {
-      results.push({
-        error: normalizeXhsErrorMessage(error),
-        order_id: Number(order.id),
-        replenished: false,
-      });
+  for (let i = 0; i < orders.length; i += BATCH_CONCURRENCY) {
+    const chunk = orders.slice(i, i + BATCH_CONCURRENCY);
+    const settled = await Promise.allSettled(
+      chunk.map(async (order) => {
+        const result = await replenishOrderIfNeeded(db, userId, order, { now: new Date() });
+        return { order_id: Number(order.id), ...result };
+      }),
+    );
+    for (const entry of settled) {
+      if (entry.status === 'fulfilled') {
+        results.push(entry.value);
+      } else {
+        const order = chunk[settled.indexOf(entry)];
+        results.push({
+          error: normalizeXhsErrorMessage(entry.reason),
+          order_id: Number(order.id),
+          replenished: false,
+        });
+      }
     }
   }
 
@@ -6463,54 +6636,56 @@ const approveReplenishmentRequest = async (actorUserId, requestId) => {
   }
 
   const now = new Date();
-  try {
-    const result = await replenishBatch(record.user_id, record.batch_id);
-    await db.execute(
-      `
-        UPDATE order_replenishment_records
-        SET status = 'approved',
-            reviewed_at = ?,
-            reviewed_by = ?,
-            result_json = ?,
-            updated_at = ?
-        WHERE batch_id = ?
-          AND user_id = ?
-          AND status = 'pending'
-      `,
-      [
-        now,
-        actorUserId,
-        JSON.stringify(result).slice(0, 8000),
-        now,
-        record.batch_id,
-        record.user_id,
-      ],
-    );
 
-    return {
-      batch_id: Number(record.batch_id),
-      batch_no: record.batch_no,
-      id: targetRequestId,
-      result,
-      status: 'approved',
-    };
-  } catch (error) {
-    await db.execute(
-      `
-        UPDATE order_replenishment_records
-        SET status = 'failed',
-            reviewed_at = ?,
-            reviewed_by = ?,
-            reason_message = ?,
-            updated_at = ?
-        WHERE batch_id = ?
-          AND user_id = ?
-          AND status = 'pending'
-      `,
-      [now, actorUserId, normalizeXhsErrorMessage(error), now, record.batch_id, record.user_id],
-    );
-    throw error;
-  }
+  // 先将状态标记为 approved，立即返回响应
+  await db.execute(
+    `
+      UPDATE order_replenishment_records
+      SET status = 'approved',
+          reviewed_at = ?,
+          reviewed_by = ?,
+          updated_at = ?
+      WHERE batch_id = ?
+        AND user_id = ?
+        AND status = 'pending'
+    `,
+    [now, actorUserId, now, record.batch_id, record.user_id],
+  );
+
+  // 后台异步执行补单，不阻塞 HTTP 响应
+  replenishBatch(record.user_id, record.batch_id)
+    .then(async (result) => {
+      await db.execute(
+        `
+          UPDATE order_replenishment_records
+          SET result_json = ?, updated_at = ?
+          WHERE batch_id = ? AND user_id = ? AND status = 'approved'
+            AND reviewed_at = ?
+        `,
+        [JSON.stringify(result).slice(0, 8000), new Date(), record.batch_id, record.user_id, now],
+      );
+    })
+    .catch(async (error) => {
+      await db.execute(
+        `
+          UPDATE order_replenishment_records
+          SET status = 'failed',
+              reason_message = ?,
+              updated_at = ?
+          WHERE batch_id = ? AND user_id = ? AND status = 'approved'
+            AND reviewed_at = ?
+        `,
+        [normalizeXhsErrorMessage(error), new Date(), record.batch_id, record.user_id, now],
+      );
+    });
+
+  return {
+    batch_id: Number(record.batch_id),
+    batch_no: record.batch_no,
+    id: targetRequestId,
+    result: { replenished_count: 0, total_replenish_quantity: record.total_replenish_quantity || 0, message: '补单已批准，正在后台执行中…' },
+    status: 'approved',
+  };
 };
 
 // 按批次审批补单请求（需管理员权限）
@@ -6551,15 +6726,24 @@ const retryBatch = async (userId, batchId) => {
   try {
     await connection.beginTransaction();
 
-    const [[batch]] = await connection.execute(
+    // 先按当前用户查，找不到则判断是否管理员，管理员可操作任意批次
+    let [[batch]] = await connection.execute(
       'SELECT id, batch_no, user_id FROM order_batches WHERE id = ? AND user_id = ? FOR UPDATE',
       [targetBatchId, userId],
     );
+    if (!batch) {
+      await assertAdmin(db, userId);
+      [[batch]] = await connection.execute(
+        'SELECT id, batch_no, user_id FROM order_batches WHERE id = ? FOR UPDATE',
+        [targetBatchId],
+      );
+    }
     if (!batch) {
       const error = new Error('Batch not found');
       error.statusCode = 404;
       throw error;
     }
+    const batchOwnerId = batch.user_id;
 
     const [ordersToRetry] = await connection.execute(
       `
@@ -6576,13 +6760,14 @@ const retryBatch = async (userId, batchId) => {
           AND ar.status = 'success'
         WHERE o.batch_id = ?
           AND o.user_id = ?
-          AND o.order_status IN ('failed', 'manual_review', 'repair_review')
+          AND o.order_status = 'failed'
+          AND (o.refund_amount_total IS NULL OR o.refund_amount_total <= 0)
         GROUP BY
           o.id, o.order_no, o.batch_item_id, o.note_id, o.note_url, o.target_type,
           o.ordered_quantity, o.external_task_id, o.author_id, nbc.author_id
         FOR UPDATE
       `,
-      [targetBatchId, userId],
+      [targetBatchId, batchOwnerId],
     );
 
     let retriedCount = 0;
@@ -6610,7 +6795,7 @@ const retryBatch = async (userId, batchId) => {
               source: `goodsAdmin:retry:${order.id}`,
               targetType,
             }),
-            { token: createCurrentUserToken(userId) },
+            { token: createCurrentUserToken(batchOwnerId) },
           );
           externalTaskId = normalizeXhsTaskId(xhsResult?.id);
           if (!externalTaskId) {
@@ -6629,12 +6814,12 @@ const retryBatch = async (userId, batchId) => {
         if (beforeBalance === null) {
           const [[balance]] = await connection.execute(
             'SELECT available_amount FROM balance_accounts WHERE user_id = ? FOR UPDATE',
-            [userId],
+            [batchOwnerId],
           );
           beforeBalance = Number(balance?.available_amount) || 0;
         }
 
-        const context = await getUserOrderContext(connection, userId, targetType);
+        const context = await getUserOrderContext(connection, batchOwnerId, targetType);
         const orderedQuantity = Number(order.ordered_quantity) || 0;
         const { discountAmount, originalAmount, payableAmount } = calculateOrderAmounts(
           context,
@@ -6658,7 +6843,7 @@ const retryBatch = async (userId, batchId) => {
             unit_price: context.unitPrice,
           },
           recordNo: `REC-${Date.now()}-${String(order.id).padStart(3, '0')}`,
-          userId,
+          userId: batchOwnerId,
         });
       }
 
@@ -6684,7 +6869,7 @@ const retryBatch = async (userId, batchId) => {
     if (beforeBalance !== null) {
       await connection.execute(
         'UPDATE balance_accounts SET available_amount = ?, updated_at = ? WHERE user_id = ?',
-        [beforeBalance, now, userId],
+        [beforeBalance, now, batchOwnerId],
       );
     }
 
@@ -6700,7 +6885,7 @@ const retryBatch = async (userId, batchId) => {
         WHERE batch_id = ?
           AND user_id = ?
       `,
-      [targetBatchId, userId],
+      [targetBatchId, batchOwnerId],
     );
 
     const totalCount = Number(stats.total_count) || 0;
@@ -6775,8 +6960,149 @@ const getOrderTypeStatus = async (userId) => {
   };
 };
 
+// 立即重新验证所有 repair_review 且缺少验收快照的订单
+const recheckRepairOrders = async (userId, body = {}) => {
+  const db = getPool();
+  await assertAdmin(db, userId);
+  await ensureOrderSnapshotColumns(db);
+
+  const batchId = Number(body.batch_id);
+  if (!batchId) {
+    const error = new Error('请选择要验收的批次');
+    error.statusCode = 400;
+    throw error;
+  }
+
+  // 查找该批次中"上游完成"但尚未做快照验收的订单
+  // 包括：running+completed 和 repair_review 但缺少验收快照的订单
+  const [orders] = await db.execute(
+    `
+      SELECT o.*, ob.batch_no,
+        COALESCE(o.author_id, nbc.author_id) AS resolved_author_id
+      FROM orders o
+      INNER JOIN order_batches ob ON ob.id = o.batch_id
+      LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+      WHERE o.batch_id = ?
+        AND (
+          (o.order_status = 'running' AND o.external_status = 'completed')
+          OR (o.order_status = 'repair_review'
+              AND o.snapshot_verified_read_count IS NULL
+              AND o.snapshot_verified_like_count IS NULL)
+        )
+        AND o.snapshot_current_read_count IS NOT NULL
+        AND o.target_type IN ('view', 'like')
+      ORDER BY o.id ASC
+    `,
+    [batchId],
+  );
+
+  if (orders.length === 0) {
+    return { total: 0, message: '该批次没有需要验收的订单' };
+  }
+
+  const total = orders.length;
+  const batchOwnerId = orders[0].user_id || userId;
+
+  // 后台异步执行验收，不阻塞 HTTP 响应
+  // 第一轮验收 → 等2分钟 → 第二轮从数据库重新查还没拿到快照的
+  (async () => {
+    const now = new Date();
+    let completed = 0;
+    let replenished = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    // ── 第一轮 ──
+    for (const order of orders) {
+      try {
+        const result = await replenishOrderIfNeeded(db, order.user_id || userId, order, {
+          dispatch: false,
+          now,
+        });
+        if (result.needs_replenish) replenished++;
+        else if (result.checked) completed++;
+        else skipped++;
+      } catch {
+        failed++;
+      }
+    }
+
+    console.log(`[recheckRepairOrders] batch_id=${batchId} 第一轮: 共${total}条, 完成${completed}, 需补单${replenished}, 跳过${skipped}, 失败${failed}`);
+
+    // ── 第二轮：等2分钟后从数据库重新查还没拿到验收快照的 ──
+    if (skipped > 0) {
+      console.log(`[recheckRepairOrders] batch_id=${batchId} 等待120秒后重试未获取到快照的订单...`);
+      await new Promise((r) => setTimeout(r, 120_000));
+
+      const [retryOrders] = await db.execute(
+        `
+          SELECT o.*, ob.batch_no,
+            COALESCE(o.author_id, nbc.author_id) AS resolved_author_id
+          FROM orders o
+          INNER JOIN order_batches ob ON ob.id = o.batch_id
+          LEFT JOIN note_basic_cache nbc ON nbc.note_id = o.note_id
+          WHERE o.batch_id = ?
+            AND (
+              (o.order_status = 'running' AND o.external_status = 'completed')
+              OR (o.order_status = 'repair_review'
+                  AND o.snapshot_verified_read_count IS NULL
+                  AND o.snapshot_verified_like_count IS NULL)
+            )
+            AND o.snapshot_current_read_count IS NOT NULL
+            AND o.target_type IN ('view', 'like')
+          ORDER BY o.id ASC
+        `,
+        [batchId],
+      );
+
+      if (retryOrders.length > 0) {
+        const retryNow = new Date();
+        let r2Completed = 0;
+        let r2Replenished = 0;
+        let r2Skipped = 0;
+        let r2Failed = 0;
+
+        for (const order of retryOrders) {
+          try {
+            const result = await replenishOrderIfNeeded(db, order.user_id || userId, order, {
+              dispatch: false,
+              now: retryNow,
+            });
+            if (result.needs_replenish) r2Replenished++;
+            else if (result.checked) r2Completed++;
+            else r2Skipped++;
+          } catch {
+            r2Failed++;
+          }
+        }
+
+        completed += r2Completed;
+        replenished += r2Replenished;
+        skipped = r2Skipped;
+        failed += r2Failed;
+
+        console.log(`[recheckRepairOrders] batch_id=${batchId} 第二轮重试: ${retryOrders.length}条, 完成${r2Completed}, 需补单${r2Replenished}, 仍失败${r2Skipped + r2Failed}`);
+      }
+    }
+
+    try {
+      await refreshBatchStats(db, batchOwnerId, [batchId]);
+    } catch {}
+
+    console.log(`[recheckRepairOrders] batch_id=${batchId} 全部验收完成: 共${total}条, 完成${completed}, 需补单${replenished}, 跳过${skipped}, 失败${failed}`);
+  })().catch((err) => {
+    console.error('[recheckRepairOrders] 后台验收异常:', err);
+  });
+
+  return {
+    total,
+    message: `已开始后台验收 ${total} 条订单，请稍后刷新查看结果`,
+  };
+};
+
 module.exports = {
   approveReplenishmentBatch,
+  recheckRepairOrders,
   approveReplenishmentRequest,
   batchApproveRefunds,
   batchRejectRefunds,

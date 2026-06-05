@@ -1,6 +1,7 @@
 const express = require('express');
 
 const adminPermissionController = require('../controllers/adminPermission.controller');
+const authController = require('../controllers/auth.controller');
 
 const router = express.Router();
 
@@ -13,5 +14,7 @@ router.put('/users/:userId/discounts', adminPermissionController.updateUserDisco
 router.put('/users/:userId/order-types', adminPermissionController.updateUserOrderTypes);
 router.put('/users/:userId/roles', adminPermissionController.updateUserRoles);
 router.put('/users/:userId/status', adminPermissionController.updateUserStatus);
+router.get('/password-reset-requests', authController.getPasswordResetRequests);
+router.put('/password-reset-requests/:id', authController.handlePasswordResetRequest);
 
 module.exports = router;

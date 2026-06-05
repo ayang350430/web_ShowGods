@@ -1,8 +1,8 @@
 ﻿<script setup lang="ts">
 import type { OrderApi } from '#/api';
 
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
-import { useRouter } from 'vue-router';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 
 import {
   ElButton,
@@ -14,11 +14,14 @@ import {
   ElSelect,
   ElTag,
 } from 'element-plus';
+import { useUserStore } from '@vben/stores';
 
 import {
   getBatchOrderRecordsApi,
   getBatchOrdersApi,
+  recheckRepairOrdersApi,
   requestOrderRefundApi,
+  retryBatchOrderApi,
 } from '#/api';
 
 type OrderStatusFilter = 'all' | 'failed' | 'running' | 'success';
@@ -26,15 +29,35 @@ type OrderStatusFilter = 'all' | 'failed' | 'running' | 'success';
 const loading = ref(false);
 const polling = ref(false);
 const router = useRouter();
+const route = useRoute();
+const highlightOrderNo = ref('');
 const records = ref<OrderApi.BatchOrderRecord[]>([]);
 const selectedBatchId = ref<number>();
 const batchKeyword = ref('');
 const orderKeyword = ref('');
 const orderStatusFilter = ref<OrderStatusFilter>('all');
+// 搜索条件
+const searchBatchNo = ref('');
+const searchOrderNo = ref('');
+const searchNoteUrl = ref('');
+const searchNoteId = ref('');
 const expandedOrderIds = ref(new Set<number>());
 const batchOrders = ref<OrderApi.BatchOrderRecordItem[]>([]);
+const isMobile = ref(false);
+const mobilePane = ref<'batches' | 'orders'>('batches');
+const mobileFilterOpen = ref(false);
+const recordsShellRef = ref<HTMLElement>();
 const batchOrdersLoading = ref(false);
 const refundLoadingId = ref<number>();
+const recheckLoading = ref(false);
+const retryLoading = ref(false);
+
+const userStore = useUserStore();
+const isAdmin = computed(() =>
+  (userStore.userInfo?.roles ?? []).some((role: string) =>
+    ['admin', 'super'].includes(role),
+  ),
+);
 
 function canRequestRefund(order: OrderApi.BatchOrderRecordItem) {
   const blocked = [
@@ -72,13 +95,96 @@ async function handleRequestRefund(order: OrderApi.BatchOrderRecordItem) {
   }
 }
 
-function toggleOrderExpand(id: number) {
-  const set = expandedOrderIds.value;
-  if (set.has(id)) {
-    set.delete(id);
-  } else {
-    set.add(id);
+const hasUncompletedOrders = computed(() =>
+  batchOrders.value.some(
+    (o) => !['cancelled', 'completed'].includes(o.order_status),
+  ),
+);
+
+const hasFailedOrders = computed(() =>
+  batchOrders.value.some(
+    (o) => o.order_status === 'failed' && Number(o.refund_amount || 0) <= 0,
+  ),
+);
+
+async function handleRetryBatch() {
+  if (!selectedBatchId.value) return;
+  const failedCount = batchOrders.value.filter(
+    (o) => o.order_status === 'failed' && Number(o.refund_amount || 0) <= 0,
+  ).length;
+  try {
+    await ElMessageBox.confirm(
+      `确定要重试该批次中 ${failedCount} 条失败订单吗？`,
+      '批次重试',
+      { confirmButtonText: '确定', cancelButtonText: '取消', type: 'warning' },
+    );
+  } catch {
+    return;
   }
+  retryLoading.value = true;
+  try {
+    const result = await retryBatchOrderApi(selectedBatchId.value);
+    ElMessage.success(`重试成功：${result.retried_count ?? 0} 条订单已重新提交`);
+    await loadRecords();
+    if (selectedBatchId.value) {
+      await loadBatchOrders(selectedBatchId.value);
+    }
+  } catch (error: any) {
+    ElMessage.error(error?.message || '重试失败');
+  } finally {
+    retryLoading.value = false;
+  }
+}
+
+async function handleRecheckRepair() {
+  if (!selectedBatchId.value) return;
+  recheckLoading.value = true;
+  try {
+    const result = await recheckRepairOrdersApi(selectedBatchId.value);
+    ElMessage.success(result.message || `已开始验收 ${result.total} 条订单`);
+    // 延迟刷新，给后台一点处理时间
+    setTimeout(async () => {
+      await loadRecords();
+      if (selectedBatchId.value) {
+        await loadBatchOrders(selectedBatchId.value);
+      }
+    }, 3000);
+  } catch (error: any) {
+    ElMessage.error(error?.message || '验收快照失败');
+  } finally {
+    recheckLoading.value = false;
+  }
+}
+
+function toggleOrderExpand(id: number) {
+  const next = new Set(expandedOrderIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  expandedOrderIds.value = next;
+}
+
+function updateMobileLayout() {
+  isMobile.value = window.matchMedia('(max-width: 900px)').matches;
+  if (!isMobile.value) {
+    mobilePane.value = 'batches';
+  }
+}
+
+function selectBatch(batchId: number) {
+  selectedBatchId.value = batchId;
+  if (isMobile.value) {
+    mobilePane.value = 'orders';
+    void nextTick(() => {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    });
+  }
+}
+
+function backToBatchList() {
+  mobilePane.value = 'batches';
+  void nextTick(() => {
+    recordsShellRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
 }
 
 function expandEnter(el: Element) {
@@ -160,7 +266,7 @@ const filteredOrders = computed(() => {
       (orderStatusFilter.value === 'success' && order.order_status === 'completed') ||
       (orderStatusFilter.value === 'failed' && order.order_status === 'failed') ||
       (orderStatusFilter.value === 'running' &&
-        !['completed', 'failed'].includes(order.order_status));
+        !['cancelled', 'completed', 'failed'].includes(order.order_status));
 
     if (!statusMatched) {
       return false;
@@ -277,19 +383,24 @@ function targetTypeLabel(type: string) {
 
 function batchStatusLabel(status: string) {
   const statusMap: Record<string, string> = {
+    cancelled: '已取消',
     completed: '已完成',
     failed: '失败',
     pending: '待处理',
     processing: '处理中',
+    refunded: '已退款',
+    stopping: '停止中',
   };
   return statusMap[status] || status || '-';
 }
 
 function orderStatusLabel(status: string) {
   const statusMap: Record<string, string> = {
+    cancelled: '已终止',
     completed: '订单完成',
     failed: '订单失败',
     manual_review: '人工处理',
+    processing: '处理中',
     repair_review: '需要补单',
     refund_requested: '退款中',
     running: '进行中',
@@ -325,6 +436,31 @@ function orderDisplayStatusLabel(order: OrderApi.BatchOrderRecordItem) {
     return '上游完成';
   }
   return orderStatusLabel(order.order_status);
+}
+
+function orderStatusChipClass(order: OrderApi.BatchOrderRecordItem) {
+  const status = order.order_status;
+  if (status === 'completed') return 'status-chip--success';
+  if (['failed', 'refund_rejected', 'cancelled'].includes(status)) {
+    return 'status-chip--danger';
+  }
+  if (
+    ['refund_requested', 'refund_calculating', 'refund_approved', 'stopping'].includes(
+      status,
+    ) ||
+    isRefundingOrder(order) ||
+    isRefundedOrder(order)
+  ) {
+    return 'status-chip--warning';
+  }
+  if (['running', 'processing', 'repair_review', 'manual_review'].includes(status)) {
+    return 'status-chip--primary';
+  }
+  return 'status-chip--muted';
+}
+
+function orderNoteUrl(order: OrderApi.BatchOrderRecordItem) {
+  return order.source_note_url || order.note_url || '';
 }
 
 function refundLabel(order: OrderApi.BatchOrderRecordItem) {
@@ -417,6 +553,65 @@ function batchDisplayStatusLabel(record: OrderApi.BatchOrderRecord) {
   return batchStatusLabel(record.status);
 }
 
+function formatShortDateTime(value?: string) {
+  if (!value) {
+    return '-';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const pad = (number: number) => String(number).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function shortenBatchNo(batchNo: string) {
+  if (!batchNo || batchNo.length <= 18) {
+    return batchNo || '-';
+  }
+  return `${batchNo.slice(0, 12)}…${batchNo.slice(-4)}`;
+}
+
+function batchStatusPillClass(record: OrderApi.BatchOrderRecord) {
+  if (hasRepairReviewOrder(record)) {
+    return 'rb-badge--warning';
+  }
+  if (hasRefundedOrder(record)) {
+    return 'rb-badge--muted';
+  }
+  if (hasRefundingOrder(record)) {
+    return 'rb-badge--warning';
+  }
+  if (hasRefundRejectedOrder(record)) {
+    return 'rb-badge--danger';
+  }
+  if (record.status === 'completed') {
+    return 'rb-badge--success';
+  }
+  if (record.status === 'failed') {
+    return 'rb-badge--danger';
+  }
+  if (record.status === 'processing') {
+    return 'rb-badge--primary';
+  }
+  return 'rb-badge--muted';
+}
+
+function syncDefaultSelectedBatch() {
+  if (
+    selectedBatchId.value &&
+    records.value.some((record) => record.id === selectedBatchId.value)
+  ) {
+    return;
+  }
+  if (isMobile.value) {
+    selectedBatchId.value = undefined;
+    return;
+  }
+  const first = filteredRecords.value[0] || records.value[0];
+  selectedBatchId.value = first?.id;
+}
+
 function batchProgress(record: OrderApi.BatchOrderRecord) {
   const orders = record.orders ?? [];
   if (orders.length > 0) {
@@ -426,7 +621,8 @@ function batchProgress(record: OrderApi.BatchOrderRecord) {
   const total = Number(record.total_count) || 0;
   if (total <= 0) return 0;
   const done = Number(record.succeeded_count) || 0;
-  return Math.min(100, Math.max(0, (done / total) * 100));
+  const processing = Number(record.processing_count) || 0;
+  return Math.min(100, Math.max(0, ((done + processing * 0.1) / total) * 100));
 }
 
 function orderProgress(order: OrderApi.BatchOrderRecordItem) {
@@ -481,6 +677,26 @@ async function copyField(text: string) {
   }
 }
 
+function handleSearch() {
+  pagination.value.page = 1;
+  selectedBatchId.value = undefined;
+  void loadRecords();
+}
+
+function handleSearchReset() {
+  searchBatchNo.value = '';
+  searchOrderNo.value = '';
+  searchNoteUrl.value = '';
+  searchNoteId.value = '';
+  batchKeyword.value = '';
+  if (route.query.batch_id || route.query.batch_no || route.query.order_no) {
+    router.replace({ query: {} });
+  }
+  pagination.value.page = 1;
+  selectedBatchId.value = undefined;
+  void loadRecords();
+}
+
 async function loadRecords(options: { silent?: boolean } = {}) {
   if (polling.value) {
     return;
@@ -491,10 +707,17 @@ async function loadRecords(options: { silent?: boolean } = {}) {
     loading.value = true;
   }
   try {
-    const orderRecords = await getBatchOrderRecordsApi({
+    const apiParams: Record<string, any> = {
       page: pagination.value.page,
       page_size: pagination.value.page_size,
-    }, { silent });
+    };
+    // 用搜索条件 ref 传参，后端直接过滤
+    if (searchBatchNo.value.trim()) apiParams.batch_no = searchBatchNo.value.trim();
+    if (searchOrderNo.value.trim()) apiParams.order_no = searchOrderNo.value.trim();
+    if (searchNoteUrl.value.trim()) apiParams.note_url = searchNoteUrl.value.trim();
+    if (searchNoteId.value.trim()) apiParams.note_id = searchNoteId.value.trim();
+
+    const orderRecords = await getBatchOrderRecordsApi(apiParams, { silent });
     records.value = orderRecords.items;
     pagination.value.total = orderRecords.total;
     if (orderRecords.summary) {
@@ -505,6 +728,9 @@ async function loadRecords(options: { silent?: boolean } = {}) {
       !records.value.some((record) => record.id === selectedBatchId.value)
     ) {
       selectedBatchId.value = undefined;
+    }
+    if (!route.query.batch_no && !route.query.batch_id) {
+      syncDefaultSelectedBatch();
     }
   } finally {
     if (!silent) {
@@ -543,48 +769,127 @@ function handleVisibilityChange() {
 function handleBatchPageChange(page: number) {
   pagination.value.page = page;
   selectedBatchId.value = undefined;
-  loadRecords();
+  void loadRecords();
 }
 
 function handleBatchPageSizeChange(pageSize: number) {
   pagination.value.page = 1;
   pagination.value.page_size = pageSize;
   selectedBatchId.value = undefined;
-  loadRecords();
+  void loadRecords();
 }
 
-onMounted(() => {
-  void loadRecords();
+async function navigateToQueryBatch() {
+  const qBatchId = route.query.batch_id as string;
+  const qBatchNo = route.query.batch_no as string;
+  const qOrderNo = route.query.order_no as string;
+  if (!qBatchNo && !qBatchId) return;
+
+  // 后端已按 batch_id / batch_no / order_no 过滤返回，直接选中匹配的批次
+  const targetBatchId = qBatchId ? Number(qBatchId) : undefined;
+  const matched = targetBatchId
+    ? records.value.find((r) => r.id === targetBatchId)
+    : records.value[0];
+
+  if (!matched) return;
+
+  selectedBatchId.value = matched.id;
+  if (isMobile.value) {
+    mobilePane.value = 'orders';
+  }
+
+  if (qOrderNo) {
+    highlightOrderNo.value = qOrderNo;
+    const unwatch = watch(batchOrders, (orders) => {
+      if (orders.length > 0) {
+        const target = orders.find((o) => o.order_no === qOrderNo);
+        if (target) {
+          expandedOrderIds.value.add(target.id);
+          setTimeout(() => {
+            const el = document.querySelector(`[data-order-no="${qOrderNo}"]`);
+            el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }, 350);
+        }
+        unwatch();
+      }
+    });
+  }
+}
+
+// 从 URL query 初始化搜索条件
+function applyQueryToSearch() {
+  const qBatchNo = route.query.batch_no as string;
+  const qOrderNo = route.query.order_no as string;
+  if (qBatchNo) searchBatchNo.value = qBatchNo;
+  if (qOrderNo) searchOrderNo.value = qOrderNo;
+}
+
+// 监听路由 query 变化（从补单列表等页面跳转过来时组件可能已挂载，onMounted 不会再触发）
+watch(
+  () => ({ ...route.query }),
+  async (newQuery, oldQuery) => {
+    if (newQuery.batch_no || newQuery.batch_id || newQuery.order_no) {
+      if (
+        newQuery.batch_no !== oldQuery?.batch_no ||
+        newQuery.batch_id !== oldQuery?.batch_id ||
+        newQuery.order_no !== oldQuery?.order_no
+      ) {
+        applyQueryToSearch();
+        await loadRecords();
+        await navigateToQueryBatch();
+      }
+    }
+  },
+);
+
+onMounted(async () => {
+  updateMobileLayout();
+  window.addEventListener('resize', updateMobileLayout);
+  applyQueryToSearch();
+  await loadRecords();
+  await navigateToQueryBatch();
   startPolling();
   document.addEventListener('visibilitychange', handleVisibilityChange);
 });
 
 onUnmounted(() => {
   stopPolling();
+  window.removeEventListener('resize', updateMobileLayout);
   document.removeEventListener('visibilitychange', handleVisibilityChange);
 });
 </script>
 
 <template>
-  <div class="order-record-page">
-    <section class="page-head">
+  <div class="order-record-page" :class="{ 'order-record-page--mobile-orders': isMobile && mobilePane === 'orders' }">
+    <section v-show="!isMobile || mobilePane === 'batches'" class="page-head">
       <div class="head-text">
         <span class="eyebrow">Orders</span>
         <h1>下单记录</h1>
-        <p v-if="!selectedBatch">默认显示批次，点击批次查看订单明细。</p>
-        <p v-else>{{ selectedBatch.batch_no }} 内共有 {{ batchOrdersLoading ? '...' : batchOrders.length }} 条订单。</p>
+        <p>
+          <template v-if="selectedBatch">
+            当前批次 {{ selectedBatch.batch_no }}，共 {{ batchOrdersLoading ? '…' : batchOrders.length }} 条订单
+          </template>
+          <template v-else>点击上方批次查看订单明细</template>
+        </p>
       </div>
       <div class="head-actions">
         <ElButton
-          v-if="selectedBatch"
-          @click="selectedBatchId = undefined"
+          v-if="isAdmin && selectedBatch && hasFailedOrders"
+          type="danger"
+          :loading="retryLoading"
+          @click="handleRetryBatch"
         >
-          返回批次
+          批次重试
         </ElButton>
-        <ElTag
-          v-if="selectedBatchNeedsReplenish"
+        <ElButton
+          v-if="isAdmin && selectedBatch && hasUncompletedOrders"
           type="warning"
+          :loading="recheckLoading"
+          @click="handleRecheckRepair"
         >
+          验收快照
+        </ElButton>
+        <ElTag v-if="selectedBatchNeedsReplenish" type="warning">
           补单已自动申请，等待管理员审批
         </ElTag>
         <button class="head-btn" :disabled="loading || batchOrdersLoading" @click="() => { loadRecords(); if (selectedBatchId) loadBatchOrders(selectedBatchId); }">
@@ -593,7 +898,7 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section v-if="!selectedBatch" class="summary-grid">
+    <section v-show="!isMobile || mobilePane === 'batches'" class="summary-grid">
       <div class="stat-card stat-card--primary">
         <div class="stat-icon"><svg viewBox="0 0 20 20" fill="currentColor" width="18" height="18"><path d="M9 2a1 1 0 000 2h2a1 1 0 100-2H9z" /><path fill-rule="evenodd" d="M4 5a2 2 0 012-2 3 3 0 003 3h2a3 3 0 003-3 2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V5zm3 4a1 1 0 000 2h.01a1 1 0 100-2H7zm3 0a1 1 0 000 2h3a1 1 0 100-2h-3zm-3 4a1 1 0 100 2h.01a1 1 0 100-2H7zm3 0a1 1 0 100 2h3a1 1 0 100-2h-3z" clip-rule="evenodd" /></svg></div>
         <div class="stat-body">
@@ -624,93 +929,241 @@ onUnmounted(() => {
       </div>
     </section>
 
-    <section class="record-panel" v-loading="loading">
-      <div class="filter-bar">
-        <template v-if="!selectedBatch">
+    <section
+      class="record-panel"
+      :class="{ 'record-panel--mobile-orders': isMobile && mobilePane === 'orders' }"
+      v-loading="loading"
+    >
+      <div v-show="!isMobile || mobilePane === 'batches'" class="filter-bar-wrap">
+        <button
+          v-if="isMobile"
+          type="button"
+          class="mobile-filter-toggle"
+          @click="mobileFilterOpen = !mobileFilterOpen"
+        >
+          <span>{{ mobileFilterOpen ? '收起搜索' : '搜索条件' }}</span>
+          <span class="mobile-filter-toggle-arrow" :class="{ open: mobileFilterOpen }">›</span>
+        </button>
+        <div v-show="!isMobile || mobileFilterOpen" class="filter-bar">
+        <ElInput
+          v-model="searchBatchNo"
+          clearable
+          placeholder="批次号"
+          @keyup.enter="handleSearch"
+        />
+        <ElInput
+          v-model="searchOrderNo"
+          clearable
+          placeholder="订单号"
+          @keyup.enter="handleSearch"
+        />
+        <ElInput
+          v-model="searchNoteUrl"
+          clearable
+          placeholder="笔记链接"
+          @keyup.enter="handleSearch"
+        />
+        <ElInput
+          v-model="searchNoteId"
+          clearable
+          placeholder="笔记ID"
+          @keyup.enter="handleSearch"
+        />
+        <ElButton type="primary" @click="handleSearch" :loading="loading">搜索</ElButton>
+        <ElButton @click="handleSearchReset">重置</ElButton>
+        <span class="filter-count">共 {{ pagination.total }} 个批次</span>
+        </div>
+      </div>
+
+      <button
+        v-if="isMobile && mobilePane === 'batches' && filteredRecords.length > 0"
+        type="button"
+        class="mobile-scroll-hint"
+        @click="recordsShellRef?.scrollIntoView({ behavior: 'smooth', block: 'start' })"
+      >
+        <span class="mobile-scroll-hint-arrow">↓</span>
+        <span>向下查看 {{ filteredRecords.length }} 个批次列表</span>
+      </button>
+
+      <div
+        v-if="!loading && filteredRecords.length === 0"
+        class="empty-state empty-state--fill"
+      >
+        暂无匹配的批次记录
+      </div>
+
+      <div v-else ref="recordsShellRef" class="records-shell">
+        <aside
+          v-show="!isMobile || mobilePane === 'batches'"
+          class="records-sidebar"
+        >
+          <div v-if="isMobile" class="mobile-section-label">批次列表</div>
           <ElInput
             v-model="batchKeyword"
             clearable
-            placeholder="搜索批次号、批次ID、时间、状态"
-          />
-          <span class="filter-count">共 {{ pagination.total }} 个批次</span>
-        </template>
-        <template v-else>
-          <ElInput
-            v-model="orderKeyword"
-            clearable
-            placeholder="搜索订单号、笔记ID、链接、状态"
-          />
-          <ElSelect v-model="orderStatusFilter" class="status-select">
-            <ElOption label="全部" value="all" />
-            <ElOption label="成功" value="success" />
-            <ElOption label="失败" value="failed" />
-            <ElOption label="进行中" value="running" />
-          </ElSelect>
-          <span class="filter-count">共 {{ filteredOrders.length }} 条记录</span>
-        </template>
-      </div>
-
-      <div class="record-list">
-      <template v-if="!selectedBatch">
-        <article
-          v-for="record in filteredRecords"
-          :key="record.id"
-          class="batch-row"
-          :class="{
-            refunded: hasRefundedOrder(record),
-            refunding: hasRefundingOrder(record),
-            'refund-rejected': hasRefundRejectedOrder(record),
-          }"
-          :style="{ '--progress': `${batchProgress(record)}%` }"
-          @click="selectedBatchId = record.id"
-        >
-          <div>
-            <div class="batch-title-line">
-              <strong
-                class="batch-no-link"
-                title="查看这批次的消费记录"
-                @click.stop="openConsumptionBatch(record)"
-              >
-                {{ record.batch_no }}
-              </strong>
-              <ElTag size="small" type="success" effect="plain" disable-transitions>{{ batchTargetTypeLabel(record) }}</ElTag>
-              <ElTag size="small" effect="plain" disable-transitions>确认提交</ElTag>
-            </div>
-            <span class="batch-time">提交时间：{{ formatDateTime(record.submitted_at || record.created_at) }}</span>
-          </div>
-          <div class="batch-stat">
-            <span>总数</span>
-            <strong>{{ record.total_count }}</strong>
-          </div>
-          <div class="batch-stat">
-            <span>成功</span>
-            <strong>{{ record.succeeded_count }}</strong>
-          </div>
-          <div class="batch-stat">
-            <span>失败</span>
-            <strong>{{ record.failed_count }}</strong>
-          </div>
-          <div class="batch-money">
-            <span>实际付款金额</span>
-            <strong>{{ formatMoney(batchActualPaidAmount(record)) }}</strong>
-          </div>
-          <ElTag
             size="small"
-            :type="hasRefundedOrder(record) || hasRefundingOrder(record) ? 'warning' : hasRefundRejectedOrder(record) ? 'danger' : 'success'"
-            effect="plain"
-            disable-transitions
-          >
-            {{ batchDisplayStatusLabel(record) }}
-          </ElTag>
-          <span class="row-arrow">›</span>
-        </article>
+            placeholder="筛选当前页批次"
+          />
+          <div class="records-batch-list">
+            <button
+              v-for="record in filteredRecords"
+              :key="record.id"
+              type="button"
+              class="rb-item"
+              :class="{
+                active: selectedBatchId === record.id,
+                'rb-item--refund': hasRefundedOrder(record) || hasRefundingOrder(record),
+                'rb-item--danger': hasRefundRejectedOrder(record),
+              }"
+              @click="selectBatch(record.id)"
+            >
+              <div class="rb-item-row">
+                <span class="rb-kind">{{ batchTargetTypeLabel(record) }}</span>
+                <span class="rb-badge" :class="batchStatusPillClass(record)">
+                  {{ batchDisplayStatusLabel(record) }}
+                </span>
+              </div>
+              <span class="rb-no" :title="record.batch_no">
+                {{ shortenBatchNo(record.batch_no) }}
+              </span>
+              <div class="rb-item-row rb-meta">
+                <span>{{ formatShortDateTime(record.submitted_at || record.created_at) }}</span>
+                <span>{{ formatMoney(batchActualPaidAmount(record)) }}</span>
+              </div>
+              <div class="rb-item-row rb-item-foot">
+                <div class="rb-counts">
+                  <span class="ok">{{ record.succeeded_count }} 成</span>
+                  <span class="bad">{{ record.failed_count }} 败</span>
+                  <span class="total">共 {{ record.total_count }}</span>
+                </div>
+                <span v-if="isMobile" class="rb-item-chevron">›</span>
+              </div>
+            </button>
+            <div v-if="filteredRecords.length === 0" class="records-sidebar-empty">
+              无匹配批次
+            </div>
+          </div>
+          <div class="records-sidebar-footer">
+            <ElPagination
+              v-model:current-page="pagination.page"
+              v-model:page-size="pagination.page_size"
+              :page-sizes="[10, 20, 50, 100]"
+              :total="pagination.total"
+              small
+              background
+              layout="total, prev, pager, next"
+              @current-change="handleBatchPageChange"
+              @size-change="handleBatchPageSizeChange"
+            />
+          </div>
+        </aside>
 
-      </template>
+        <section
+          v-show="!isMobile || mobilePane === 'orders'"
+          class="records-main"
+        >
+          <div v-if="isMobile && selectedBatch" class="mobile-order-header">
+            <div class="mobile-order-header-top">
+              <button type="button" class="mobile-back-btn" @click="backToBatchList">
+                ← 批次列表
+              </button>
+              <span class="rb-badge" :class="batchStatusPillClass(selectedBatch)">
+                {{ batchDisplayStatusLabel(selectedBatch) }}
+              </span>
+            </div>
+            <div class="mobile-order-header-main">
+              <div class="mobile-order-header-copy">
+                <span class="mobile-order-type">{{ batchTargetTypeLabel(selectedBatch) }}</span>
+                <strong class="mobile-order-amount">{{ formatMoney(batchActualPaidAmount(selectedBatch)) }}</strong>
+              </div>
+              <div class="mobile-order-header-actions">
+                <ElButton
+                  v-if="isAdmin && hasFailedOrders"
+                  size="small"
+                  type="danger"
+                  plain
+                  :loading="retryLoading"
+                  @click="handleRetryBatch"
+                >
+                  重试
+                </ElButton>
+                <ElButton
+                  v-if="isAdmin && hasUncompletedOrders"
+                  size="small"
+                  type="warning"
+                  plain
+                  :loading="recheckLoading"
+                  @click="handleRecheckRepair"
+                >
+                  验收
+                </ElButton>
+                <ElButton
+                  size="small"
+                  plain
+                  type="primary"
+                  @click="openConsumptionBatch(selectedBatch)"
+                >
+                  消费记录
+                </ElButton>
+              </div>
+            </div>
+            <code class="mobile-order-batch-no">{{ selectedBatch.batch_no }}</code>
+            <div class="mobile-order-header-meta">
+              <span>{{ selectedBatch.total_count }} 单</span>
+              <span class="ok">{{ selectedBatch.succeeded_count }} 成功</span>
+              <span class="bad">{{ selectedBatch.failed_count }} 失败</span>
+            </div>
+          </div>
+          <template v-if="selectedBatch">
+            <div v-if="!isMobile" class="rm-head">
+              <div class="rm-head-main">
+                <code class="rm-batch-no">{{ selectedBatch.batch_no }}</code>
+                <div class="rm-head-tags">
+                  <span class="rb-badge" :class="batchStatusPillClass(selectedBatch)">
+                    {{ batchDisplayStatusLabel(selectedBatch) }}
+                  </span>
+                  <ElTag size="small" effect="plain" type="primary">
+                    {{ batchTargetTypeLabel(selectedBatch) }}
+                  </ElTag>
+                  <span class="rm-amount">{{ formatMoney(batchActualPaidAmount(selectedBatch)) }}</span>
+                  <ElButton
+                    size="small"
+                    plain
+                    type="primary"
+                    @click="openConsumptionBatch(selectedBatch)"
+                  >
+                    消费记录
+                  </ElButton>
+                </div>
+              </div>
+            </div>
 
-      <template v-else-if="selectedBatch">
-        <div v-if="batchOrdersLoading" class="empty-state">加载订单中...</div>
-        <template v-else>
-        <div v-for="order in filteredOrders" :key="order.id">
+            <div v-if="!isMobile" class="rm-stats">
+              <span>{{ formatDateTime(selectedBatch.submitted_at || selectedBatch.created_at) }}</span>
+              <span>{{ selectedBatch.total_count }} 单</span>
+              <span class="ok">{{ selectedBatch.succeeded_count }} 成功</span>
+              <span class="bad">{{ selectedBatch.failed_count }} 失败</span>
+            </div>
+
+            <div class="rm-toolbar">
+              <ElInput
+                v-model="orderKeyword"
+                clearable
+                size="small"
+                placeholder="搜索订单号、笔记ID、链接、状态"
+              />
+              <ElSelect v-model="orderStatusFilter" class="status-select" size="small">
+                <ElOption label="全部" value="all" />
+                <ElOption label="成功" value="success" />
+                <ElOption label="失败" value="failed" />
+                <ElOption label="进行中" value="running" />
+              </ElSelect>
+              <span class="filter-count">共 {{ filteredOrders.length }} 条</span>
+            </div>
+
+            <div v-loading="batchOrdersLoading" class="records-order-list">
+              <template v-if="!batchOrdersLoading">
+                <div v-for="order in filteredOrders" :key="order.id" class="order-block">
           <article
             class="order-detail-row"
             :class="{
@@ -718,60 +1171,135 @@ onUnmounted(() => {
               refunding: isRefundingOrder(order),
               'refund-rejected': isRefundRejectedOrder(order),
               expanded: expandedOrderIds.has(order.id),
+              highlighted: highlightOrderNo === order.order_no,
             }"
+            :data-order-no="order.order_no"
             :style="{ '--progress': `${orderProgress(order)}%` }"
             @click="toggleOrderExpand(order.id)"
           >
-            <div class="product-cell">
+            <template v-if="isMobile">
+              <div class="m-card-head">
+                <div class="m-avatar">
+                  <img
+                    v-if="order.avatar_url"
+                    :src="order.avatar_url"
+                    alt=""
+                    referrerpolicy="no-referrer"
+                  />
+                  <span v-else>{{ targetTypeLabel(order.target_type).slice(0, 1) }}</span>
+                </div>
+                <div class="m-card-info">
+                  <div class="m-card-title">
+                    <strong>{{ order.title || order.note_id || '未记录笔记' }}</strong>
+                    <span class="status-chip" :class="orderStatusChipClass(order)">
+                      {{ orderDisplayStatusLabel(order) }}
+                    </span>
+                  </div>
+                  <p v-if="order.author_name" class="m-card-author">{{ order.author_name }}</p>
+                  <a
+                    v-if="orderNoteUrl(order)"
+                    class="m-card-link"
+                    :href="orderNoteUrl(order)"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    @click.stop
+                  >
+                    查看笔记链接
+                  </a>
+                </div>
+              </div>
+              <div class="m-card-metrics">
+                <div class="m-metric">
+                  <span class="m-metric-label">数量</span>
+                  <span class="m-metric-value">{{ order.ordered_quantity.toLocaleString('zh-CN') }}</span>
+                </div>
+                <div class="m-metric">
+                  <span class="m-metric-label">实付</span>
+                  <span class="m-metric-value m-metric-value--amount">
+                    {{ formatMoney(order.actual_paid_amount || order.payable_amount) }}
+                  </span>
+                </div>
+                <div class="m-metric">
+                  <span class="m-metric-label">退款</span>
+                  <span
+                    class="m-metric-value"
+                    :class="{ 'm-metric-value--warn': Number(order.refund_amount) > 0 }"
+                  >
+                    {{ refundLabel(order) }}
+                  </span>
+                </div>
+              </div>
+              <div
+                v-if="order.order_status === 'failed' && order.reason_message"
+                class="order-card-alert fail-reason"
+              >
+                失败原因：{{ order.reason_message }}
+              </div>
+              <div v-if="order.stop_response_message" class="order-card-alert stop-reason">
+                停止原因：{{ order.stop_response_message }}
+              </div>
+              <div class="m-card-foot">
+                <div class="m-progress-wrap">
+                  <div class="m-progress-track">
+                    <div
+                      class="m-progress-fill"
+                      :style="{ width: `${orderProgress(order)}%` }"
+                    ></div>
+                  </div>
+                  <span class="m-progress-text">
+                    {{ targetTypeLabel(order.target_type) }} · 已完成
+                    {{ (order.completed_quantity || 0).toLocaleString('zh-CN') }}/{{ order.ordered_quantity.toLocaleString('zh-CN') }}
+                  </span>
+                </div>
+                <span class="row-expand-arrow" :class="{ open: expandedOrderIds.has(order.id) }">›</span>
+              </div>
+            </template>
+            <template v-else>
+            <div class="order-card-main">
               <div class="product-thumb">
-                <img v-if="order.avatar_url" :src="order.avatar_url" alt="" />
+                <img
+                  v-if="order.avatar_url"
+                  :src="order.avatar_url"
+                  alt=""
+                  referrerpolicy="no-referrer"
+                />
                 <span v-else>{{ targetTypeLabel(order.target_type) }}</span>
               </div>
               <div class="product-text">
-                <p>
-                  <span>订单编号：{{ order.order_no }}</span>
-                  <span>订单创建时间：{{ formatDateTime(order.created_at) }}</span>
+                <div class="order-card-title-row">
+                  <strong>{{ order.title || order.note_id || '未记录笔记ID' }}</strong>
+                  <span class="status-text">{{ orderDisplayStatusLabel(order) }}</span>
+                </div>
+                <p class="order-card-meta">
+                  <span>{{ order.order_no }}</span>
+                  <span>{{ formatDateTime(order.created_at) }}</span>
                 </p>
-                <strong>{{ order.title || order.note_id || '未记录笔记ID' }}</strong>
                 <span v-if="order.author_name" class="author-line">
                   {{ order.author_name }} / {{ order.note_id }}
                 </span>
                 <em>{{ order.source_note_url || order.note_url || '-' }}</em>
               </div>
+              <div class="order-card-side">
+                <span class="order-card-qty">{{ order.ordered_quantity.toLocaleString('zh-CN') }}</span>
+                <strong class="amount-text">{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
+                <span class="refund-text" :class="{ 'has-refund': Number(order.refund_amount) > 0 }">
+                  {{ refundLabel(order) }}
+                </span>
+              </div>
             </div>
-            <div class="tag-cell">
-              <span class="tag-head">{{ targetTypeLabel(order.target_type) }}服务</span>
-              <span>订单ID：{{ order.id }}</span>
-              <span>批次：{{ selectedBatch.batch_no }}</span>
-              <span>明细：#{{ order.batch_item_id }}</span>
+            <div v-if="order.order_status === 'failed' && order.reason_message" class="order-card-alert fail-reason">
+              失败原因：{{ order.reason_message }}
             </div>
-            <div class="num-cell">
-              <span class="num-label">单价</span>
-              <strong>{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
+            <div v-if="order.stop_response_message" class="order-card-alert stop-reason">
+              停止原因：{{ order.stop_response_message }}
             </div>
-            <div class="num-cell">
-              <span class="num-label">数量</span>
-              <strong>{{ order.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              <span class="num-sub">{{ (order.completed_quantity || 0).toLocaleString('zh-CN') }} 已完成</span>
+            <div class="order-card-foot">
+              <span class="order-card-foot-meta">
+                {{ targetTypeLabel(order.target_type) }} · 已完成 {{ (order.completed_quantity || 0).toLocaleString('zh-CN') }}/{{ order.ordered_quantity.toLocaleString('zh-CN') }}
+              </span>
+              <span class="row-expand-arrow" :class="{ open: expandedOrderIds.has(order.id) }">›</span>
             </div>
-            <div class="status-cell">
-              <span class="status-text">{{ orderDisplayStatusLabel(order) }}</span>
-              <small v-if="order.order_status === 'failed' && order.reason_message" class="fail-reason">
-                失败原因：{{ order.reason_message }}
-              </small>
-              <small v-if="order.stop_response_message" class="stop-reason">
-                停止原因：{{ order.stop_response_message }}
-              </small>
-            </div>
-            <div class="num-cell">
-              <span class="num-label">售后退款</span>
-              <span class="refund-text" :class="{ 'has-refund': Number(order.refund_amount) > 0 }">{{ refundLabel(order) }}</span>
-            </div>
-            <div class="num-cell num-right">
-              <span class="num-label">实际付款金额</span>
-              <strong class="amount-text">{{ formatMoney(order.actual_paid_amount || order.payable_amount) }}</strong>
-            </div>
-            <span class="row-expand-arrow" :class="{ rotated: expandedOrderIds.has(order.id) }">▾</span>
+            </template>
           </article>
           <Transition @enter="expandEnter" @after-enter="expandAfterEnter" @leave="expandLeave" @after-leave="expandAfterLeave">
           <div v-if="expandedOrderIds.has(order.id)" class="expand-panel">
@@ -952,34 +1480,32 @@ onUnmounted(() => {
 
           </div>
           </Transition>
-        </div>
-        </template>
-      </template>
+                </div>
+                <div
+                  v-if="filteredOrders.length === 0"
+                  class="empty-state empty-state--inline"
+                >
+                  暂无匹配的订单明细
+                </div>
+              </template>
+            </div>
+          </template>
 
-      <div
-        v-if="!loading && !selectedBatch && filteredRecords.length === 0"
-        class="empty-state"
-      >
-        暂无匹配的批次记录
-      </div>
-      <div
-        v-if="!loading && selectedBatch && filteredOrders.length === 0"
-        class="empty-state"
-      >
-        暂无匹配的订单明细
-      </div>
-      </div>
-      <div v-if="!selectedBatch" class="pagination-bar">
-        <ElPagination
-          v-model:current-page="pagination.page"
-          v-model:page-size="pagination.page_size"
-          :page-sizes="[10, 20, 50, 100]"
-          :total="pagination.total"
-          background
-          layout="sizes, prev, pager, next, jumper"
-          @current-change="handleBatchPageChange"
-          @size-change="handleBatchPageSizeChange"
-        />
+          <template v-else-if="isMobile">
+            <div class="records-main-empty records-main-empty--mobile">
+              <p>点击上方批次卡片</p>
+              <small>选择批次后在此查看订单明细</small>
+              <button type="button" class="mobile-back-btn mobile-back-btn--cta" @click="backToBatchList">
+                查看批次列表
+              </button>
+            </div>
+          </template>
+
+          <div v-else class="records-main-empty">
+            <p>请选择左侧批次</p>
+            <small>点击批次卡片查看订单明细</small>
+          </div>
+        </section>
       </div>
     </section>
   </div>
@@ -990,9 +1516,15 @@ onUnmounted(() => {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  min-height: 100%;
+  min-height: calc(100dvh - 88px);
   padding: 20px;
+  box-sizing: border-box;
   color: var(--el-text-color-primary);
+}
+
+.page-head,
+.summary-grid {
+  flex-shrink: 0;
 }
 
 /* ---- header ---- */
@@ -1049,8 +1581,8 @@ onUnmounted(() => {
 .stat-card {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 18px 20px;
+  gap: 12px;
+  padding: 14px 16px;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
   background: var(--el-bg-color);
@@ -1077,7 +1609,7 @@ onUnmounted(() => {
 
 .stat-body { display: flex; flex-direction: column; gap: 4px; }
 .stat-body span { font-size: 12px; color: var(--el-text-color-secondary); }
-.stat-body strong { font-size: 22px; font-weight: 700; line-height: 1.1; }
+.stat-body strong { font-size: 20px; font-weight: 700; line-height: 1.1; }
 
 .stat-card--danger .stat-body strong { color: var(--el-color-danger); }
 
@@ -1100,6 +1632,10 @@ onUnmounted(() => {
 
 /* ---- record panel ---- */
 .record-panel {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   padding: 18px;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
@@ -1111,142 +1647,735 @@ onUnmounted(() => {
   flex-wrap: wrap;
   align-items: center;
   gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 14px;
+  flex-shrink: 0;
 }
 
-.filter-bar > .el-input { width: 280px; flex-shrink: 0; }
+.filter-bar :deep(.el-input) {
+  width: 160px;
+}
 
 .filter-count {
   margin-left: auto;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--el-text-color-secondary);
   white-space: nowrap;
 }
 
 .status-select {
-  width: 120px;
+  width: 110px;
 }
 
-.record-list {
-  display: grid;
-  gap: 10px;
-}
-
-.batch-row {
-  position: relative;
-  display: grid;
-  grid-template-columns: minmax(220px, 1.5fr) repeat(3, minmax(80px, 0.5fr)) minmax(150px, 0.8fr) 110px 28px;
-  gap: 14px;
-  align-items: center;
-  overflow: hidden;
-  padding: 16px 18px;
+.records-shell {
+  flex: 1 1 0;
+  display: flex;
+  min-height: 0;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 10px;
+  overflow: hidden;
+}
+
+.records-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 260px;
+  flex-shrink: 0;
+  min-height: 0;
+  padding: 12px;
+  border-right: 1px solid var(--el-border-color-lighter);
+  background: var(--el-fill-color-light);
+  overflow: hidden;
+}
+
+.records-sidebar > :deep(.el-input) {
+  flex-shrink: 0;
+}
+
+.records-batch-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
+  overscroll-behavior: contain;
+}
+
+.records-sidebar-footer {
+  flex-shrink: 0;
+  padding-top: 4px;
+  border-top: 1px solid var(--el-border-color-extra-light);
+}
+
+.records-sidebar-footer :deep(.el-pagination) {
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.records-sidebar-empty {
+  padding: 24px 8px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.rb-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  flex-shrink: 0;
+  margin-bottom: 8px;
+  padding: 10px 11px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-bg-color);
+  text-align: left;
   cursor: pointer;
   transition: border-color 0.15s, box-shadow 0.15s;
 }
 
-.batch-row::before {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: var(--progress);
-  background: color-mix(in srgb, var(--el-color-success) 8%, transparent);
-  content: '';
-  pointer-events: none;
-  transition: width 1.15s cubic-bezier(0.22, 1, 0.36, 1);
+.rb-item:last-child {
+  margin-bottom: 0;
 }
 
-.batch-row:hover {
+.rb-item:hover {
   border-color: var(--el-color-primary-light-5);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.04);
 }
 
-.batch-row.refunded,
-.batch-row.refunding {
-  border-color: var(--el-color-warning-light-5);
-  background: color-mix(in srgb, var(--el-color-warning) 6%, var(--el-bg-color));
+.rb-item.active {
+  border-color: var(--el-color-primary);
+  box-shadow: 0 0 0 1px var(--el-color-primary-light-7);
 }
 
-.batch-row.refund-rejected {
-  border-color: var(--el-color-danger-light-5);
-  background: color-mix(in srgb, var(--el-color-danger) 4%, var(--el-bg-color));
+.rb-item--refund.active {
+  border-color: var(--el-color-warning);
+  box-shadow: 0 0 0 1px var(--el-color-warning-light-7);
 }
 
-.batch-row.refunded::before,
-.batch-row.refunding::before {
-  background: color-mix(in srgb, var(--el-color-warning) 12%, transparent);
-}
-
-.batch-row.refund-rejected::before {
-  background: color-mix(in srgb, var(--el-color-danger) 8%, transparent);
-}
-
-.batch-row > * {
-  position: relative;
-  z-index: 1;
-}
-
-.batch-no-link {
-  cursor: pointer;
-  font-family: Consolas, 'SF Mono', monospace;
-  font-size: 13px;
-}
-
-.batch-no-link:hover {
-  color: var(--el-color-primary);
-  text-decoration: underline;
-  text-underline-offset: 3px;
-}
-
-.batch-row > div > strong,
-.batch-row > .row-arrow,
-.batch-row .batch-stat span,
-.batch-row .batch-stat strong,
-.batch-row .batch-money span,
-.batch-row .batch-money strong,
-.batch-row .batch-time {
-  display: block;
-}
-
-.batch-time {
-  font-size: 12px;
-}
-
-.batch-title-line {
+.rb-item-row {
   display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.rb-kind {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--el-color-primary);
+}
+
+.rb-no {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.rb-meta {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.rb-counts {
+  display: flex;
   gap: 8px;
-  margin-bottom: 4px;
-}
-
-.batch-stat,
-.batch-money {
-  display: grid;
-  gap: 4px;
-}
-
-.batch-stat strong {
-  font-family: Consolas, 'SF Mono', monospace;
+  font-size: 11px;
   font-weight: 600;
 }
 
-.batch-money strong {
-  font-size: 18px;
-  font-family: Consolas, 'SF Mono', monospace;
+.rb-counts .ok { color: var(--el-color-success); }
+.rb-counts .bad { color: var(--el-color-danger); }
+.rb-counts .total { color: var(--el-text-color-secondary); font-weight: 500; }
+
+.rb-item-foot {
+  align-items: center;
+}
+
+.rb-item-chevron {
+  display: none;
+  flex-shrink: 0;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--el-text-color-placeholder);
+}
+
+.rb-badge {
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.rb-badge--primary {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+}
+
+.rb-badge--success {
+  background: var(--el-color-success-light-9);
+  color: var(--el-color-success);
+}
+
+.rb-badge--warning {
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+
+.rb-badge--danger {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.rb-badge--muted {
+  background: var(--el-fill-color);
+  color: var(--el-text-color-secondary);
+}
+
+.records-main {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px 16px;
+  background: var(--el-bg-color);
+  overflow: hidden;
+}
+
+.records-main-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--el-text-color-secondary);
+}
+
+.records-main-empty p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.records-main-empty small {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.records-main-empty--mobile {
+  flex: none;
+  min-height: 160px;
+  padding: 24px 16px;
+  border: 1px dashed var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-fill-color-light);
+}
+
+.mobile-back-btn--cta {
+  margin-top: 8px;
+  padding: 8px 16px;
+  border: 1px solid var(--el-color-primary-light-5);
+  border-radius: 8px;
+  background: var(--el-color-primary-light-9);
+}
+
+.mobile-filter-toggle {
+  display: none;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  background: var(--el-fill-color-blank);
+  color: var(--el-text-color-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mobile-filter-toggle-arrow {
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  transform: rotate(90deg);
+  transition: transform 0.2s;
+}
+
+.mobile-filter-toggle-arrow.open {
+  transform: rotate(-90deg);
+}
+
+.mobile-order-header {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 14px;
+  background: linear-gradient(
+    180deg,
+    var(--el-bg-color) 0%,
+    color-mix(in srgb, var(--el-color-primary) 4%, var(--el-bg-color)) 100%
+  );
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06);
+}
+
+.mobile-order-header-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.mobile-order-header-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mobile-order-header-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mobile-order-type {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-color-primary);
+}
+
+.mobile-order-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.mobile-order-batch-no {
+  display: block;
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-secondary);
+  word-break: break-all;
+}
+
+.mobile-order-header-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.mobile-order-header-meta .ok {
+  color: var(--el-color-success);
+  font-weight: 600;
+}
+
+.mobile-order-header-meta .bad {
+  color: var(--el-color-danger);
+  font-weight: 600;
+}
+
+.mobile-order-amount {
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+  color: var(--el-text-color-primary);
+}
+
+.status-chip {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  white-space: nowrap;
+}
+
+.status-chip--primary {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+}
+
+.status-chip--success {
+  background: var(--el-color-success-light-9);
+  color: var(--el-color-success);
+}
+
+.status-chip--warning {
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+
+.status-chip--danger {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.status-chip--muted {
+  background: var(--el-fill-color);
+  color: var(--el-text-color-secondary);
+}
+
+.m-card-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.m-avatar {
+  display: grid;
+  place-items: center;
+  width: 48px;
+  height: 48px;
+  border-radius: 12px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: var(--el-fill-color-light);
+  color: var(--el-color-primary);
+  font-size: 16px;
   font-weight: 700;
 }
 
-.order-detail-row {
+.m-avatar img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.m-card-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.m-card-title {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.m-card-title strong {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.45;
+  color: var(--el-text-color-primary);
+}
+
+.m-card-author {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+
+.m-card-link {
+  display: inline-flex;
+  margin-top: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-color-primary);
+  text-decoration: none;
+}
+
+.m-card-metrics {
   display: grid;
-  grid-template-columns: minmax(320px, 2fr) minmax(160px, 1fr) 90px 90px 90px 90px 120px 28px;
-  gap: 14px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--el-border-color-extra-light);
+}
+
+.m-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--el-fill-color-light);
+}
+
+.m-metric-label {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.m-metric-value {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--el-text-color-primary);
+}
+
+.m-metric-value--amount {
+  color: var(--el-color-primary);
+}
+
+.m-metric-value--warn {
+  color: var(--el-color-warning);
+}
+
+.m-card-foot {
+  display: flex;
   align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--el-border-color-lighter);
+}
+
+.m-progress-wrap {
+  flex: 1;
+  min-width: 0;
+}
+
+.m-progress-track {
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: var(--el-fill-color);
+}
+
+.m-progress-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(
+    90deg,
+    var(--el-color-primary-light-3),
+    var(--el-color-primary)
+  );
+  transition: width 0.35s ease;
+}
+
+.m-progress-text {
+  display: block;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.rm-head {
+  flex-shrink: 0;
+  margin-bottom: 10px;
+}
+
+.rm-batch-no {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-primary);
+  word-break: break-all;
+}
+
+.rm-head-tags {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.rm-amount {
+  font-size: 16px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--el-text-color-primary);
+}
+
+.rm-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  flex-shrink: 0;
+}
+
+.rm-stats .ok { color: var(--el-color-success); font-weight: 600; }
+.rm-stats .bad { color: var(--el-color-danger); font-weight: 600; }
+
+.rm-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
+.rm-toolbar :deep(.el-input) {
+  flex: 1;
+  min-width: 180px;
+}
+
+.records-order-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 4px;
+}
+
+.order-block {
+  flex-shrink: 0;
+}
+
+.empty-state--inline {
+  margin: 24px 0;
+  text-align: center;
+}
+
+.order-detail-row {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
   position: relative;
   overflow: hidden;
-  padding: 16px 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--el-border-color-light);
+  border-radius: 10px;
+  cursor: pointer;
   transition:
     background-color 0.35s ease,
     border-color 0.35s ease;
+}
+
+.order-card-main {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+.order-card-title-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.order-card-title-row strong {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.order-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.order-card-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  flex-shrink: 0;
+  min-width: 88px;
+}
+
+.order-card-qty {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--el-text-color-primary);
+}
+
+.order-card-side .amount-text {
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.order-card-side .refund-text {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.order-card-alert {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.order-card-alert.fail-reason {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.order-card-alert.stop-reason {
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+
+.order-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 6px;
+  border-top: 1px solid var(--el-border-color-extra-light);
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.order-card-foot-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.product-text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
 }
 
 .order-detail-row::before {
@@ -1262,7 +2391,6 @@ onUnmounted(() => {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .batch-row::before,
   .order-detail-row::before {
     transition: none;
   }
@@ -1318,22 +2446,6 @@ onUnmounted(() => {
   width: 100%;
   height: 100%;
   object-fit: cover;
-}
-
-.product-text {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-}
-
-.product-text p {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 14px;
-  margin: 0;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
 }
 
 .product-text > strong {
@@ -1429,8 +2541,13 @@ onUnmounted(() => {
 }
 
 .status-text {
-  font-size: 13px;
-  font-weight: 500;
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--el-fill-color);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .status-cell .fail-reason {
@@ -1467,39 +2584,48 @@ onUnmounted(() => {
   border-color: var(--el-color-primary-light-5);
 }
 
-.row-arrow {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: var(--el-text-color-placeholder);
-  font-size: 22px;
-  font-weight: 300;
-  line-height: 1;
-  transition: color 0.2s;
+.order-detail-row.highlighted {
+  border-color: var(--el-color-primary);
+  box-shadow: 0 0 0 2px var(--el-color-primary-light-7);
+  animation: highlight-pulse 1.5s ease-in-out 2;
 }
 
-.batch-row:hover .row-arrow {
-  color: var(--el-color-primary);
+@keyframes highlight-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--el-color-primary-light-7); }
+  50% { box-shadow: 0 0 0 4px var(--el-color-primary-light-5); }
+}
+
+.records-main .product-thumb {
+  width: 52px;
+  height: 52px;
+  font-size: 14px;
+}
+
+.order-card-main .product-thumb {
+  width: 52px;
+  height: 52px;
+  font-size: 13px;
 }
 
 .row-expand-arrow {
   position: relative;
   z-index: 1;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: center;
+  width: 20px;
+  height: 20px;
   color: var(--el-text-color-placeholder);
   font-size: 18px;
+  font-weight: 700;
   line-height: 1;
-  transition:
-    transform 0.25s ease,
-    color 0.2s;
+  transform: rotate(0deg);
+  transform-origin: center center;
+  transition: transform 0.25s ease, color 0.2s;
 }
 
-.row-expand-arrow.rotated {
-  transform: rotate(180deg);
+.row-expand-arrow.open {
+  transform: rotate(90deg);
   color: var(--el-color-primary);
 }
 
@@ -1720,52 +2846,356 @@ onUnmounted(() => {
   text-align: center;
 }
 
+.empty-state--fill {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+}
+
 .pagination-bar {
   display: flex;
   justify-content: flex-end;
   padding-top: 16px;
 }
 
-@media (max-width: 1200px) {
-  .batch-row,
-  .order-detail-row {
-    grid-template-columns: 1fr;
+@media (min-width: 901px) and (max-width: 1200px) {
+  .records-shell {
+    flex-direction: column;
   }
 
-  .row-arrow,
-  .row-expand-arrow {
-    display: none;
+  .records-sidebar {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--el-border-color-lighter);
   }
 
-  .num-right {
-    text-align: left;
+  .records-main {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: hidden;
+  }
+
+  .records-order-list {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+  }
+
+  .order-card-main {
+    flex-wrap: wrap;
+  }
+
+  .order-card-side {
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+    width: 100%;
+    gap: 10px;
   }
 }
 
 @media (max-width: 900px) {
-  .order-record-page { padding: 12px; }
+  .order-record-page {
+    width: 100%;
+    max-width: 100%;
+    min-height: auto;
+    padding: 12px;
+    gap: 12px;
+    overflow-x: hidden;
+    box-sizing: border-box;
+  }
+
+  .order-record-page--mobile-orders {
+    padding: 8px;
+    gap: 0;
+  }
 
   .page-head {
     align-items: flex-start;
     flex-direction: column;
+    padding: 14px 16px;
+  }
+
+  .head-actions {
+    flex-wrap: wrap;
+    width: 100%;
   }
 
   .summary-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
   }
 
-  .status-select {
+  .stat-card {
+    padding: 10px 12px;
+    gap: 10px;
+  }
+
+  .stat-icon {
+    width: 34px;
+    height: 34px;
+  }
+
+  .stat-body strong {
+    font-size: 18px;
+  }
+
+  .record-panel {
+    flex: none;
+    width: 100%;
+    max-width: 100%;
+    min-height: auto;
+    padding: 12px;
+    box-sizing: border-box;
+  }
+
+  .filter-bar-wrap {
     width: 100%;
   }
 
-  .product-cell {
-    flex-direction: column;
-    align-items: flex-start;
+  .record-panel--mobile-orders {
+    padding: 8px;
+    border: none;
+    background: transparent;
   }
 
-  .product-thumb {
-    width: 60px;
-    height: 60px;
+  .mobile-filter-toggle {
+    display: flex;
+  }
+
+  .filter-bar {
+    padding: 10px;
+    margin-bottom: 10px;
+    border: 1px solid var(--el-border-color-lighter);
+    border-radius: 10px;
+    background: var(--el-fill-color-blank);
+  }
+
+  .filter-bar :deep(.el-input) {
+    width: 100%;
+  }
+
+  .filter-count {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .mobile-scroll-hint {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    margin-bottom: 10px;
+    padding: 10px 12px;
+    border: 1px dashed var(--el-color-primary-light-5);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--el-color-primary) 6%, var(--el-bg-color));
+    color: var(--el-color-primary);
+    font-size: 13px;
+    cursor: pointer;
+  }
+
+  .mobile-scroll-hint-arrow {
+    animation: records-hint-bounce 1.5s ease-in-out infinite;
+  }
+
+  @keyframes records-hint-bounce {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+
+    50% {
+      transform: translateY(3px);
+    }
+  }
+
+  .records-shell {
+    flex: none;
+    width: 100%;
+    max-width: 100%;
+    min-height: auto;
+    display: block;
+    overflow: visible;
+    border: none;
+    border-radius: 0;
+    box-sizing: border-box;
+  }
+
+  .records-batch-list {
+    flex: none;
+    min-height: auto;
+    overflow: visible;
+    max-height: none;
+    padding-right: 0;
+  }
+
+  .records-sidebar {
+    display: block;
+    width: 100%;
+    max-width: 100%;
+    max-height: none;
+    padding: 0;
+    border-right: none;
+    background: transparent;
+    border-bottom: none;
+    box-sizing: border-box;
+  }
+
+  .records-main {
+    flex: none;
+    width: 100%;
+    max-width: 100%;
+    min-height: auto;
+    overflow: visible;
+    padding: 0;
+    box-sizing: border-box;
+  }
+
+  .records-order-list {
+    flex: none;
+    min-height: auto;
+    overflow: visible;
+    max-height: none;
+  }
+
+  .rm-toolbar {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    padding: 0;
+    border: none;
+    background: transparent;
+  }
+
+  .rm-toolbar :deep(.el-input) {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
+  }
+
+  .rm-toolbar .status-select {
+    width: 88px;
+    flex-shrink: 0;
+  }
+
+  .rm-toolbar .filter-count {
+    width: auto;
+    margin-left: auto;
+    text-align: right;
+  }
+
+  .mobile-section-label {
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--el-text-color-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .mobile-back-btn {
+    display: inline-flex;
+    align-items: center;
+    margin-bottom: 0;
+    padding: 4px 0;
+    border: none;
+    background: transparent;
+    color: var(--el-color-primary);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .records-sidebar > :deep(.el-input) {
+    width: 100%;
+    margin-bottom: 8px;
+  }
+
+  .records-sidebar-footer {
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px solid var(--el-border-color-lighter);
+  }
+
+  .rb-item {
+    margin-bottom: 10px;
+    padding: 14px 14px;
+  }
+
+  .rb-item.active .rb-item-chevron {
+    color: var(--el-color-primary);
+  }
+
+  .rb-item-chevron {
+    display: inline-flex;
+  }
+
+  .records-main-empty {
+    flex: none;
+  }
+
+  .order-detail-row::before {
+    display: none;
+  }
+
+  .order-detail-row {
+    padding: 14px;
+    border-radius: 14px;
+    background: var(--el-bg-color);
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05);
+  }
+
+  .order-detail-row.expanded {
+    border-color: var(--el-color-primary-light-5);
+    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+  }
+
+  .order-detail-row.refunded,
+  .order-detail-row.refunding,
+  .order-detail-row.refund-rejected {
+    background: var(--el-bg-color);
+  }
+
+  .records-order-list {
+    gap: 12px;
+  }
+
+  .expand-panel {
+    margin-top: -4px;
+    padding: 0 12px 14px;
+    border-radius: 0 0 14px 14px;
+  }
+}
+
+@media (min-width: 901px) {
+  .mobile-scroll-hint,
+  .mobile-section-label,
+  .mobile-back-btn,
+  .mobile-order-header,
+  .mobile-filter-toggle {
+    display: none;
+  }
+
+  .record-panel {
+    min-height: calc(100dvh - 300px);
+  }
+}
+
+@media (max-width: 640px) {
+  .summary-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .rm-head-tags {
+    flex-direction: column;
+    align-items: flex-start;
   }
 }
 </style>

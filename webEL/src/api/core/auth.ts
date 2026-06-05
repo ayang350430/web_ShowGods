@@ -49,3 +49,7 @@ export async function registerApi(data: AuthApi.RegisterParams) {
 export async function getAccessCodesApi() {
   return requestClient.get<string[]>('/auth/codes');
 }
+
+export async function requestPasswordResetApi(data: { username: string }) {
+  return baseRequestClient.post('/auth/password-reset-request', data);
+}

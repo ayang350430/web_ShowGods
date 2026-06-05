@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import type { UserApi } from '#/api';
 
-import { computed, onMounted, reactive, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue';
 
 import {
+  ElAvatar,
   ElButton,
   ElDialog,
   ElInput,
@@ -20,6 +21,8 @@ import {
   getAdminOrderSwitchesApi,
   getAdminPermissionRolesApi,
   getAdminPermissionUsersApi,
+  getPasswordResetRequestsApi,
+  handlePasswordResetRequestApi,
   updateAdminOrderSwitchesApi,
   updateAdminUserBalanceApi,
   updateAdminUserDiscountsApi,
@@ -27,7 +30,7 @@ import {
   updateAdminUserRolesApi,
   updateAdminUserStatusApi,
 } from '#/api';
-import type { OrderSwitches } from '#/api/core/user';
+import type { OrderSwitches, PasswordResetRequest } from '#/api/core/user';
 
 interface EditableDiscounts {
   discount_rate: number;
@@ -60,6 +63,8 @@ const savingUserId = ref<number>();
 const statusSavingUserId = ref<number>();
 const discountSavingUserId = ref<number>();
 const batchDiscountSaving = ref(false);
+const userPanelRef = ref<HTMLElement>();
+const userListInView = ref(false);
 const balanceDialogVisible = ref(false);
 const balanceSaving = ref(false);
 const balanceTargetUser = ref<UserApi.AdminUserPermission>();
@@ -244,12 +249,28 @@ function formatMoney(value: number) {
   return `￥ ${Number(value || 0).toFixed(2)}`;
 }
 
+function userInitial(user: UserApi.AdminUserPermission) {
+  const name = user.display_name?.trim() || user.username?.trim() || '?';
+  return name[0]?.toUpperCase() || '?';
+}
+
+function userAvatarColor(userId: number) {
+  const palette = ['#409eff', '#67c23a', '#e6a23c', '#f56c6c', '#626aef', '#909399'];
+  return palette[userId % palette.length];
+}
+
 function openBalanceDialog(user: UserApi.AdminUserPermission) {
   balanceTargetUser.value = user;
-  balanceForm.amount = Number(user.available_amount) || 0;
+  balanceForm.amount = 0;
   balanceForm.reason = '';
   balanceDialogVisible.value = true;
 }
+
+const balancePreview = computed(() => {
+  const current = Number(balanceTargetUser.value?.available_amount) || 0;
+  const delta = Number(balanceForm.amount) || 0;
+  return Math.round((current + delta) * 100) / 100;
+});
 
 function openDiscountDialog(user: UserApi.AdminUserPermission) {
   discountTargetUser.value = user;
@@ -304,16 +325,22 @@ async function saveUserBalance() {
   if (!targetUser) {
     return;
   }
-  if (!Number.isFinite(amount) || amount < 0) {
-    ElMessage.warning('请输入正确的余额');
+  if (!Number.isFinite(amount) || amount === 0) {
+    ElMessage.warning('请输入调整金额（正数增加，负数减少）');
+    return;
+  }
+  const currentBalance = Number(targetUser.available_amount) || 0;
+  const newBalance = Math.round((currentBalance + amount) * 100) / 100;
+  if (newBalance < 0) {
+    ElMessage.warning(`余额不足，当前 ${currentBalance}，调整后为 ${newBalance}`);
     return;
   }
 
   balanceSaving.value = true;
   try {
     await updateAdminUserBalanceApi(targetUser.id, {
-      amount,
-      reason: balanceForm.reason || '管理员修改余额',
+      amount: newBalance,
+      reason: balanceForm.reason || `管理员调整余额 ${amount > 0 ? '+' : ''}${amount}`,
     });
     ElMessage.success('余额已更新');
     balanceDialogVisible.value = false;
@@ -481,9 +508,116 @@ async function toggleUserStatus(user: UserApi.AdminUserPermission) {
   }
 }
 
+// ---- 密码重置申请管理 ----
+const resetRequestsRaw = ref<PasswordResetRequest[]>([]);
+const resetRequests = computed(() => resetRequestsRaw.value.filter((r) => r.status === 'pending'));
+const resetLoading = ref(false);
+const resetDialogVisible = ref(false);
+const resetHandlingId = ref<number>();
+const resetTargetRequest = ref<PasswordResetRequest>();
+const resetNewPassword = ref('');
+
+async function loadResetRequests() {
+  resetLoading.value = true;
+  try {
+    resetRequestsRaw.value = await getPasswordResetRequestsApi();
+  } catch {
+    // silent
+  } finally {
+    resetLoading.value = false;
+  }
+}
+
+function openResetDialog(req: PasswordResetRequest) {
+  resetTargetRequest.value = req;
+  resetNewPassword.value = '';
+  resetDialogVisible.value = true;
+}
+
+async function approveReset() {
+  if (!resetTargetRequest.value) return;
+  if (!resetNewPassword.value || resetNewPassword.value.length < 6) {
+    ElMessage.warning('新密码至少 6 位');
+    return;
+  }
+  resetHandlingId.value = resetTargetRequest.value.id;
+  try {
+    await handlePasswordResetRequestApi(resetTargetRequest.value.id, {
+      action: 'approve',
+      newPassword: resetNewPassword.value,
+    });
+    ElMessage.success('密码已重置');
+    resetDialogVisible.value = false;
+    await loadResetRequests();
+  } catch (error: any) {
+    ElMessage.error(error?.message || '操作失败');
+  } finally {
+    resetHandlingId.value = undefined;
+  }
+}
+
+async function rejectReset(req: PasswordResetRequest) {
+  resetHandlingId.value = req.id;
+  try {
+    await handlePasswordResetRequestApi(req.id, { action: 'reject' });
+    ElMessage.success('已拒绝');
+    await loadResetRequests();
+  } catch (error: any) {
+    ElMessage.error(error?.message || '操作失败');
+  } finally {
+    resetHandlingId.value = undefined;
+  }
+}
+
+function resetStatusLabel(status: string) {
+  const map: Record<string, string> = { approved: '已重置', pending: '待处理', rejected: '已拒绝' };
+  return map[status] || status;
+}
+
+function resetStatusType(status: string) {
+  if (status === 'approved') return 'success';
+  if (status === 'rejected') return 'info';
+  return 'warning';
+}
+
+function formatTime(value?: null | string) {
+  if (!value) return '-';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value;
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+const showScrollHint = computed(
+  () => pagination.total > 0 && !userListInView.value,
+);
+
+function scrollToUserList() {
+  userPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+let userListObserver: IntersectionObserver | undefined;
+
 onMounted(() => {
   loadData();
   loadOrderSwitches();
+  loadResetRequests();
+
+  void nextTick(() => {
+    userListObserver = new IntersectionObserver(
+      ([entry]) => {
+        userListInView.value = Boolean(entry?.isIntersecting);
+      },
+      { root: null, rootMargin: '-80px 0px 0px 0px', threshold: 0.08 },
+    );
+    if (userPanelRef.value) {
+      userListObserver.observe(userPanelRef.value);
+    }
+  });
+});
+
+onUnmounted(() => {
+  userListObserver?.disconnect();
 });
 </script>
 
@@ -508,265 +642,356 @@ onMounted(() => {
       </div>
     </section>
 
-    <section class="global-switch-panel">
-      <div class="gs-head">
-        <div class="gs-desc">
+    <section class="control-deck">
+      <div class="deck-row deck-row--switches">
+        <div class="deck-title">
           <strong>全局下单开关</strong>
-          <span>关闭后，所有用户将无法提交对应类型的订单。</span>
+          <span>关闭后所有用户无法提交对应类型订单</span>
+        </div>
+        <div class="switch-pills">
+          <div class="switch-pill">
+            <span class="pill-tag pill-tag--view">阅读</span>
+            <span class="pill-state" :class="{ 'pill-state--off': !orderSwitches.view_submit_enabled }">
+              {{ orderSwitches.view_submit_enabled ? '开' : '关' }}
+            </span>
+            <ElSwitch
+              :model-value="orderSwitches.view_submit_enabled"
+              :loading="!!switchLoading['view_submit_enabled']"
+              size="small"
+              @change="toggleGlobalSwitch('view_submit_enabled')"
+            />
+          </div>
+          <div class="switch-pill">
+            <span class="pill-tag pill-tag--like">点赞</span>
+            <span class="pill-state" :class="{ 'pill-state--off': !orderSwitches.like_submit_enabled }">
+              {{ orderSwitches.like_submit_enabled ? '开' : '关' }}
+            </span>
+            <ElSwitch
+              :model-value="orderSwitches.like_submit_enabled"
+              :loading="!!switchLoading['like_submit_enabled']"
+              size="small"
+              @change="toggleGlobalSwitch('like_submit_enabled')"
+            />
+          </div>
+          <div class="switch-pill">
+            <span class="pill-tag pill-tag--impression">曝光</span>
+            <span class="pill-state" :class="{ 'pill-state--off': !orderSwitches.impression_submit_enabled }">
+              {{ orderSwitches.impression_submit_enabled ? '开' : '关' }}
+            </span>
+            <ElSwitch
+              :model-value="orderSwitches.impression_submit_enabled"
+              :loading="!!switchLoading['impression_submit_enabled']"
+              size="small"
+              @change="toggleGlobalSwitch('impression_submit_enabled')"
+            />
+          </div>
         </div>
       </div>
-      <div class="gs-switches">
-        <div class="gs-item">
-          <div class="gs-label">
-            <span class="gs-tag gs-tag--view">阅读</span>
-            <span class="gs-status" :class="{ 'gs-status--off': !orderSwitches.view_submit_enabled }">
-              {{ orderSwitches.view_submit_enabled ? '已开启' : '已关闭' }}
-            </span>
+
+      <details class="batch-details">
+        <summary class="batch-details-summary">
+          <div class="deck-title">
+            <strong>批量填入折扣设置</strong>
+            <span>选择模式和数值后，一键填入当前列表所有用户</span>
           </div>
-          <ElSwitch
-            :model-value="orderSwitches.view_submit_enabled"
-            :loading="!!switchLoading['view_submit_enabled']"
-            @change="toggleGlobalSwitch('view_submit_enabled')"
-          />
-        </div>
-        <div class="gs-item">
-          <div class="gs-label">
-            <span class="gs-tag gs-tag--like">点赞</span>
-            <span class="gs-status" :class="{ 'gs-status--off': !orderSwitches.like_submit_enabled }">
-              {{ orderSwitches.like_submit_enabled ? '已开启' : '已关闭' }}
-            </span>
+          <div class="batch-btns" @click.stop>
+            <button class="bd-btn bd-btn--primary" @click="applyBatchDiscounts">一键填入</button>
+            <button class="bd-btn bd-btn--warning" :disabled="batchDiscountSaving" @click="saveAllDiscounts">
+              {{ batchDiscountSaving ? '保存中…' : '一键保存' }}
+            </button>
           </div>
-          <ElSwitch
-            :model-value="orderSwitches.like_submit_enabled"
-            :loading="!!switchLoading['like_submit_enabled']"
-            @change="toggleGlobalSwitch('like_submit_enabled')"
-          />
-        </div>
-        <div class="gs-item">
-          <div class="gs-label">
-            <span class="gs-tag gs-tag--impression">曝光</span>
-            <span class="gs-status" :class="{ 'gs-status--off': !orderSwitches.impression_submit_enabled }">
-              {{ orderSwitches.impression_submit_enabled ? '已开启' : '已关闭' }}
-            </span>
+        </summary>
+        <div class="batch-cards">
+          <div class="batch-card">
+            <div class="bc-head"><span class="bc-tag">阅读</span><em>{{ viewPriceLabel(batchDiscounts) }}</em></div>
+            <ElSelect v-model="batchDiscounts.price_mode" class="price-mode-select">
+              <ElOption label="默认价格" value="default" />
+              <ElOption label="折扣价格" value="discount" />
+              <ElOption label="固定金额" value="fixed" />
+              <ElOption label="按数量计价" value="quantity" />
+            </ElSelect>
+            <ElInputNumber
+              v-if="batchDiscounts.price_mode === 'default'"
+              v-model="batchDiscounts.fixed_unit_price"
+              :min="0.0001" :precision="4" :step="0.01" controls-position="right"
+            />
+            <ElInputNumber
+              v-else-if="batchDiscounts.price_mode === 'discount'"
+              v-model="batchDiscounts.discount_rate"
+              :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
+            />
+            <ElInputNumber
+              v-else-if="batchDiscounts.price_mode === 'fixed'"
+              v-model="batchDiscounts.fixed_unit_price"
+              :min="0.0001" :precision="4" :step="0.001" controls-position="right"
+            />
+            <div v-else-if="batchDiscounts.price_mode === 'quantity'" class="quantity-mini-inputs">
+              <ElInputNumber v-model="batchDiscounts.quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
+              <ElInputNumber v-model="batchDiscounts.quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
+            </div>
           </div>
-          <ElSwitch
-            :model-value="orderSwitches.impression_submit_enabled"
-            :loading="!!switchLoading['impression_submit_enabled']"
-            @change="toggleGlobalSwitch('impression_submit_enabled')"
-          />
+          <div class="batch-card">
+            <div class="bc-head"><span class="bc-tag">点赞</span><em>{{ likePriceLabel(batchDiscounts) }}</em></div>
+            <ElSelect v-model="batchDiscounts.like_price_mode" class="price-mode-select">
+              <ElOption label="默认价格" value="default" />
+              <ElOption label="折扣价格" value="discount" />
+              <ElOption label="固定金额" value="fixed" />
+              <ElOption label="按数量计价" value="quantity" />
+            </ElSelect>
+            <ElInputNumber
+              v-if="batchDiscounts.like_price_mode === 'default'"
+              v-model="batchDiscounts.like_fixed_unit_price"
+              :min="0.0001" :precision="4" :step="0.01" controls-position="right"
+            />
+            <ElInputNumber
+              v-else-if="batchDiscounts.like_price_mode === 'discount'"
+              v-model="batchDiscounts.like_discount_rate"
+              :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
+            />
+            <ElInputNumber
+              v-else-if="batchDiscounts.like_price_mode === 'fixed'"
+              v-model="batchDiscounts.like_fixed_unit_price"
+              :min="0.0001" :precision="4" :step="0.001" controls-position="right"
+            />
+            <div v-else-if="batchDiscounts.like_price_mode === 'quantity'" class="quantity-mini-inputs">
+              <ElInputNumber v-model="batchDiscounts.like_quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
+              <ElInputNumber v-model="batchDiscounts.like_quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
+            </div>
+          </div>
+          <div class="batch-card">
+            <div class="bc-head"><span class="bc-tag">曝光</span><em>{{ impressionPriceLabel(batchDiscounts) }}</em></div>
+            <ElSelect v-model="batchDiscounts.impression_price_mode" class="price-mode-select">
+              <ElOption label="默认价格" value="default" />
+              <ElOption label="折扣价格" value="discount" />
+              <ElOption label="固定金额" value="fixed" />
+              <ElOption label="按数量计价" value="quantity" />
+            </ElSelect>
+            <ElInputNumber
+              v-if="batchDiscounts.impression_price_mode === 'default'"
+              v-model="batchDiscounts.impression_fixed_unit_price"
+              :min="0.0001" :precision="4" :step="0.01" controls-position="right"
+            />
+            <ElInputNumber
+              v-else-if="batchDiscounts.impression_price_mode === 'discount'"
+              v-model="batchDiscounts.impression_discount_rate"
+              :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
+            />
+            <ElInputNumber
+              v-else-if="batchDiscounts.impression_price_mode === 'fixed'"
+              v-model="batchDiscounts.impression_fixed_unit_price"
+              :min="0.0001" :precision="4" :step="0.001" controls-position="right"
+            />
+            <div v-else-if="batchDiscounts.impression_price_mode === 'quantity'" class="quantity-mini-inputs">
+              <ElInputNumber v-model="batchDiscounts.impression_quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
+              <ElInputNumber v-model="batchDiscounts.impression_quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
+            </div>
+          </div>
         </div>
-      </div>
+        <p class="batch-scroll-tip">设置完成后，请向下滚动管理各用户的权限与折扣</p>
+      </details>
     </section>
 
-    <section class="batch-discount-panel">
-      <div class="batch-top">
-        <div class="batch-desc">
-          <strong>批量填入折扣设置</strong>
-          <span>选择模式和数值后，一键填入当前列表所有用户。</span>
-        </div>
-        <div class="batch-btns">
-          <button class="bd-btn bd-btn--primary" @click="applyBatchDiscounts">一键填入</button>
-          <button class="bd-btn bd-btn--warning" :disabled="batchDiscountSaving" @click="saveAllDiscounts">
-            {{ batchDiscountSaving ? '保存中…' : '一键保存' }}
-          </button>
-        </div>
-      </div>
-      <div class="batch-cards">
-        <div class="batch-card">
-          <div class="bc-head"><span class="bc-tag">阅读</span><em>{{ viewPriceLabel(batchDiscounts) }}</em></div>
-          <ElSelect v-model="batchDiscounts.price_mode" class="price-mode-select">
-            <ElOption label="默认价格" value="default" />
-            <ElOption label="折扣价格" value="discount" />
-            <ElOption label="固定金额" value="fixed" />
-            <ElOption label="按数量计价" value="quantity" />
-          </ElSelect>
-          <ElInputNumber
-            v-if="batchDiscounts.price_mode === 'default'"
-            v-model="batchDiscounts.fixed_unit_price"
-            :min="0.0001" :precision="4" :step="0.01" controls-position="right"
-          />
-          <ElInputNumber
-            v-else-if="batchDiscounts.price_mode === 'discount'"
-            v-model="batchDiscounts.discount_rate"
-            :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
-          />
-          <ElInputNumber
-            v-else-if="batchDiscounts.price_mode === 'fixed'"
-            v-model="batchDiscounts.fixed_unit_price"
-            :min="0.0001" :precision="4" :step="0.001" controls-position="right"
-          />
-          <div v-else-if="batchDiscounts.price_mode === 'quantity'" class="quantity-mini-inputs">
-            <ElInputNumber v-model="batchDiscounts.quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
-            <ElInputNumber v-model="batchDiscounts.quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
-          </div>
-        </div>
-        <div class="batch-card">
-          <div class="bc-head"><span class="bc-tag">点赞</span><em>{{ likePriceLabel(batchDiscounts) }}</em></div>
-          <ElSelect v-model="batchDiscounts.like_price_mode" class="price-mode-select">
-            <ElOption label="默认价格" value="default" />
-            <ElOption label="折扣价格" value="discount" />
-            <ElOption label="固定金额" value="fixed" />
-            <ElOption label="按数量计价" value="quantity" />
-          </ElSelect>
-          <ElInputNumber
-            v-if="batchDiscounts.like_price_mode === 'default'"
-            v-model="batchDiscounts.like_fixed_unit_price"
-            :min="0.0001" :precision="4" :step="0.01" controls-position="right"
-          />
-          <ElInputNumber
-            v-else-if="batchDiscounts.like_price_mode === 'discount'"
-            v-model="batchDiscounts.like_discount_rate"
-            :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
-          />
-          <ElInputNumber
-            v-else-if="batchDiscounts.like_price_mode === 'fixed'"
-            v-model="batchDiscounts.like_fixed_unit_price"
-            :min="0.0001" :precision="4" :step="0.001" controls-position="right"
-          />
-          <div v-else-if="batchDiscounts.like_price_mode === 'quantity'" class="quantity-mini-inputs">
-            <ElInputNumber v-model="batchDiscounts.like_quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
-            <ElInputNumber v-model="batchDiscounts.like_quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
-          </div>
-        </div>
-        <div class="batch-card">
-          <div class="bc-head"><span class="bc-tag">曝光</span><em>{{ impressionPriceLabel(batchDiscounts) }}</em></div>
-          <ElSelect v-model="batchDiscounts.impression_price_mode" class="price-mode-select">
-            <ElOption label="默认价格" value="default" />
-            <ElOption label="折扣价格" value="discount" />
-            <ElOption label="固定金额" value="fixed" />
-            <ElOption label="按数量计价" value="quantity" />
-          </ElSelect>
-          <ElInputNumber
-            v-if="batchDiscounts.impression_price_mode === 'default'"
-            v-model="batchDiscounts.impression_fixed_unit_price"
-            :min="0.0001" :precision="4" :step="0.01" controls-position="right"
-          />
-          <ElInputNumber
-            v-else-if="batchDiscounts.impression_price_mode === 'discount'"
-            v-model="batchDiscounts.impression_discount_rate"
-            :max="1" :min="0.0001" :precision="4" :step="0.1" controls-position="right"
-          />
-          <ElInputNumber
-            v-else-if="batchDiscounts.impression_price_mode === 'fixed'"
-            v-model="batchDiscounts.impression_fixed_unit_price"
-            :min="0.0001" :precision="4" :step="0.001" controls-position="right"
-          />
-          <div v-else-if="batchDiscounts.impression_price_mode === 'quantity'" class="quantity-mini-inputs">
-            <ElInputNumber v-model="batchDiscounts.impression_quantity_price_base" :min="1" :precision="0" :step="100" controls-position="right" />
-            <ElInputNumber v-model="batchDiscounts.impression_quantity_price_amount" :min="0.0001" :precision="4" :step="1" controls-position="right" />
-          </div>
-        </div>
-      </div>
-    </section>
+    <button
+      v-if="showScrollHint"
+      type="button"
+      class="list-scroll-hint"
+      @click="scrollToUserList"
+    >
+      <span class="list-scroll-hint-arrow" aria-hidden="true">↓</span>
+      <span class="list-scroll-hint-text">
+        下方还有 <strong>{{ pagination.total }}</strong> 位用户，点击查看权限与折扣列表
+      </span>
+    </button>
 
-    <section class="permission-table" v-loading="loading">
-      <div class="table-row table-header">
-        <span>用户</span>
-        <span>账号编号</span>
-        <span>状态</span>
-        <span>余额</span>
-        <span>当前角色 / 权限修改</span>
-        <span>折扣设置</span>
-        <span>下单权限</span>
-        <span>操作</span>
-      </div>
-
-      <div v-for="user in filteredUsers" :key="user.id" class="table-row">
-        <div class="user-cell">
-          <strong>{{ user.display_name }}</strong>
-          <span>{{ user.username }}</span>
+    <section v-if="resetRequests.length > 0" class="reset-panel">
+      <div class="reset-head">
+        <div class="reset-desc">
+          <strong>密码重置申请</strong>
+          <span>用户通过「忘记密码」提交的重置申请，审核后可设置新密码。</span>
         </div>
-        <span>{{ user.user_no || '-' }}</span>
-        <ElTag size="small" :type="statusTagType(user.status)">
-          {{ statusLabel(user.status) }}
-        </ElTag>
-        <strong class="balance-text">{{ formatMoney(user.available_amount) }}</strong>
-        <ElSelect
-          :model-value="getEditedRoles(user)"
-          multiple
-          @update:model-value="editedRoles[user.id] = $event"
+        <button class="head-btn head-btn--sm" :disabled="resetLoading" @click="loadResetRequests">
+          刷新
+        </button>
+      </div>
+      <div class="reset-list">
+        <div
+          v-for="req in resetRequests"
+          :key="req.id"
+          class="reset-item"
         >
-          <ElOption
-            v-for="role in roles"
-            :key="role.code"
-            :label="role.name"
-            :value="role.code"
-          />
-        </ElSelect>
-        <div class="discount-summary">
-          <span>
-            <b>阅读</b>
-            {{ viewPriceLabel(getEditedDiscounts(user)) }}
-          </span>
-          <span>
-            <b>点赞</b>
-            {{ likePriceLabel(getEditedDiscounts(user)) }}
-          </span>
-          <span>
-            <b>曝光</b>
-            {{ impressionPriceLabel(getEditedDiscounts(user)) }}
-          </span>
-        </div>
-        <div class="order-type-switches">
-          <label>
-            <span>阅读</span>
-            <ElSwitch
-              :model-value="user.order_view_enabled"
-              :loading="orderTypeSavingUserId === user.id"
+          <div class="reset-user">
+            <strong>{{ req.real_name || req.username }}</strong>
+            <span>{{ req.username }}</span>
+          </div>
+          <div class="reset-time">{{ formatTime(req.created_at) }}</div>
+          <ElTag :type="resetStatusType(req.status)" size="small" effect="plain">
+            {{ resetStatusLabel(req.status) }}
+          </ElTag>
+          <div v-if="req.status === 'pending'" class="reset-actions">
+            <ElButton
               size="small"
-              @change="toggleOrderType(user, 'order_view_enabled')"
-            />
-          </label>
-          <label>
-            <span>点赞</span>
-            <ElSwitch
-              :model-value="user.order_like_enabled"
-              :loading="orderTypeSavingUserId === user.id"
+              type="primary"
+              :loading="resetHandlingId === req.id"
+              @click="openResetDialog(req)"
+            >
+              重置密码
+            </ElButton>
+            <ElButton
               size="small"
-              @change="toggleOrderType(user, 'order_like_enabled')"
-            />
-          </label>
-          <label>
-            <span>曝光</span>
-            <ElSwitch
-              :model-value="user.order_impression_enabled"
-              :loading="orderTypeSavingUserId === user.id"
-              size="small"
-              @change="toggleOrderType(user, 'order_impression_enabled')"
-            />
-          </label>
-        </div>
-        <div class="row-actions">
-          <ElButton
-            :loading="savingUserId === user.id"
-            size="small"
-            type="primary"
-            @click="saveUserRoles(user)"
-          >
-            权限
-          </ElButton>
-          <ElButton
-            :loading="discountSavingUserId === user.id"
-            size="small"
-            type="warning"
-            @click="openDiscountDialog(user)"
-          >
-            折扣
-          </ElButton>
-          <ElButton size="small" type="primary" plain @click="openBalanceDialog(user)">
-            余额
-          </ElButton>
-          <ElButton
-            :loading="statusSavingUserId === user.id"
-            :type="user.status === 'disabled' ? 'success' : 'danger'"
-            plain
-            size="small"
-            @click="toggleUserStatus(user)"
-          >
-            {{ user.status === 'disabled' ? '启用' : '停用' }}
-          </ElButton>
+              :loading="resetHandlingId === req.id"
+              @click="rejectReset(req)"
+            >
+              拒绝
+            </ElButton>
+          </div>
+          <div v-else class="reset-handled">
+            {{ formatTime(req.handled_at) }}
+          </div>
         </div>
       </div>
+    </section>
+
+    <ElDialog
+      v-model="resetDialogVisible"
+      title="重置用户密码"
+      width="420px"
+      :close-on-click-modal="false"
+    >
+      <div class="reset-dialog-body">
+        <p>为用户 <strong>{{ resetTargetRequest?.real_name || resetTargetRequest?.username }}</strong>（{{ resetTargetRequest?.username }}）设置新密码：</p>
+        <ElInput
+          v-model="resetNewPassword"
+          placeholder="输入新密码（至少 6 位）"
+          show-password
+          @keyup.enter="approveReset"
+        />
+      </div>
+      <template #footer>
+        <ElButton @click="resetDialogVisible = false">取消</ElButton>
+        <ElButton :loading="!!resetHandlingId" type="primary" @click="approveReset">
+          确认重置
+        </ElButton>
+      </template>
+    </ElDialog>
+
+    <section ref="userPanelRef" class="user-panel" v-loading="loading">
+      <div class="user-list-head">
+        <span>共 {{ pagination.total }} 位用户</span>
+      </div>
+
+      <article v-for="user in filteredUsers" :key="user.id" class="user-card">
+        <div class="user-card-top">
+          <div class="user-identity">
+            <ElAvatar :size="40" :style="{ background: userAvatarColor(user.id) }">
+              {{ userInitial(user) }}
+            </ElAvatar>
+            <div class="user-text">
+              <strong>{{ user.display_name }}</strong>
+              <span>{{ user.username }}</span>
+            </div>
+          </div>
+          <span class="user-no-cell">{{ user.user_no || '-' }}</span>
+          <ElTag size="small" effect="plain" :type="statusTagType(user.status)">
+            {{ statusLabel(user.status) }}
+          </ElTag>
+          <strong class="balance-text">{{ formatMoney(user.available_amount) }}</strong>
+          <div class="card-actions">
+            <ElButton
+              :loading="savingUserId === user.id"
+              size="small"
+              type="primary"
+              @click="saveUserRoles(user)"
+            >
+              权限
+            </ElButton>
+            <ElButton
+              :loading="discountSavingUserId === user.id"
+              size="small"
+              type="warning"
+              @click="openDiscountDialog(user)"
+            >
+              折扣
+            </ElButton>
+            <ElButton size="small" plain @click="openBalanceDialog(user)">余额</ElButton>
+            <ElButton
+              :loading="statusSavingUserId === user.id"
+              :type="user.status === 'disabled' ? 'success' : 'danger'"
+              plain
+              size="small"
+              @click="toggleUserStatus(user)"
+            >
+              {{ user.status === 'disabled' ? '启用' : '停用' }}
+            </ElButton>
+          </div>
+        </div>
+
+        <div class="user-card-body">
+          <div class="body-col body-col--roles">
+            <label>角色权限</label>
+            <ElSelect
+              :model-value="getEditedRoles(user)"
+              class="role-select"
+              collapse-tags
+              collapse-tags-tooltip
+              multiple
+              @update:model-value="editedRoles[user.id] = $event"
+            >
+              <ElOption
+                v-for="role in roles"
+                :key="role.code"
+                :label="role.name"
+                :value="role.code"
+              />
+            </ElSelect>
+          </div>
+          <div class="body-col body-col--discount">
+            <label>折扣设置</label>
+            <div class="discount-chips">
+              <span class="d-chip d-chip--view" :title="viewPriceLabel(getEditedDiscounts(user))">
+                阅 {{ viewPriceLabel(getEditedDiscounts(user)) }}
+              </span>
+              <span class="d-chip d-chip--like" :title="likePriceLabel(getEditedDiscounts(user))">
+                赞 {{ likePriceLabel(getEditedDiscounts(user)) }}
+              </span>
+              <span class="d-chip d-chip--impression" :title="impressionPriceLabel(getEditedDiscounts(user))">
+                曝 {{ impressionPriceLabel(getEditedDiscounts(user)) }}
+              </span>
+            </div>
+          </div>
+          <div class="body-col body-col--orders">
+            <label>下单权限</label>
+            <div class="order-toggle-row">
+              <label class="toggle-chip">
+                <span>阅读</span>
+                <ElSwitch
+                  :model-value="user.order_view_enabled"
+                  :loading="orderTypeSavingUserId === user.id"
+                  size="small"
+                  @change="toggleOrderType(user, 'order_view_enabled')"
+                />
+              </label>
+              <label class="toggle-chip">
+                <span>点赞</span>
+                <ElSwitch
+                  :model-value="user.order_like_enabled"
+                  :loading="orderTypeSavingUserId === user.id"
+                  size="small"
+                  @change="toggleOrderType(user, 'order_like_enabled')"
+                />
+              </label>
+              <label class="toggle-chip">
+                <span>曝光</span>
+                <ElSwitch
+                  :model-value="user.order_impression_enabled"
+                  :loading="orderTypeSavingUserId === user.id"
+                  size="small"
+                  @change="toggleOrderType(user, 'order_impression_enabled')"
+                />
+              </label>
+            </div>
+          </div>
+        </div>
+      </article>
 
       <div v-if="!loading && filteredUsers.length === 0" class="empty-state">
         暂无用户
@@ -1019,7 +1244,7 @@ onMounted(() => {
       </template>
     </ElDialog>
 
-    <ElDialog v-model="balanceDialogVisible" title="修改余额" width="420px">
+    <ElDialog v-model="balanceDialogVisible" title="调整余额" width="420px">
       <div class="balance-dialog-body">
         <div class="balance-user">
           <strong>{{ balanceTargetUser?.display_name }}</strong>
@@ -1029,19 +1254,22 @@ onMounted(() => {
           </span>
         </div>
         <label>
-          <span>新余额</span>
+          <span>调整金额</span>
           <ElInputNumber
             v-model="balanceForm.amount"
-            :min="0"
             :precision="2"
             :step="10"
             class="balance-input"
             controls-position="right"
           />
         </label>
+        <div class="balance-preview">
+          <span>调整后余额：</span>
+          <strong :style="{ color: balancePreview < 0 ? '#f56c6c' : '#409eff' }">{{ formatMoney(balancePreview) }}</strong>
+        </div>
         <label>
           <span>备注</span>
-          <ElInput v-model="balanceForm.reason" placeholder="管理员修改余额" />
+          <ElInput v-model="balanceForm.reason" placeholder="管理员调整余额" />
         </label>
       </div>
       <template #footer>
@@ -1059,8 +1287,9 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  min-height: 100%;
+  min-height: calc(100dvh - 88px);
   padding: 20px;
+  box-sizing: border-box;
   color: var(--el-text-color-primary);
 }
 
@@ -1128,124 +1357,173 @@ onMounted(() => {
   cursor: not-allowed;
 }
 
-/* ---- global switch ---- */
-.global-switch-panel {
+/* ---- control deck ---- */
+.control-deck {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 18px 20px;
+  gap: 10px;
+  padding: 14px 16px;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
   background: var(--el-bg-color);
 }
 
-.gs-head {
+.deck-row--switches {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+  flex-wrap: wrap;
 }
 
-.gs-desc strong {
-  font-size: 15px;
+.deck-title strong {
+  font-size: 14px;
 }
 
-.gs-desc span {
+.deck-title span {
   display: block;
-  margin-top: 3px;
+  margin-top: 2px;
   color: var(--el-text-color-secondary);
   font-size: 12px;
 }
 
-.gs-switches {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 12px;
+.switch-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 
-.gs-item {
+.switch-pill {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 14px 16px;
+  gap: 8px;
+  padding: 6px 10px;
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
-  background: var(--el-fill-color-lighter);
-  transition: border-color 0.2s;
+  border-radius: 999px;
+  background: var(--el-fill-color-blank);
 }
 
-.gs-item:hover {
-  border-color: var(--el-color-primary-light-5);
-}
-
-.gs-label {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.gs-tag {
-  padding: 3px 12px;
-  border-radius: 6px;
-  font-size: 13px;
+.pill-tag {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
   font-weight: 600;
 }
 
-.gs-tag--view {
+.pill-tag--view {
   background: var(--el-color-primary-light-8);
   color: var(--el-color-primary);
 }
 
-.gs-tag--like {
+.pill-tag--like {
   background: var(--el-color-danger-light-8);
   color: var(--el-color-danger);
 }
 
-.gs-tag--impression {
+.pill-tag--impression {
   background: var(--el-color-warning-light-8);
   color: var(--el-color-warning);
 }
 
-.gs-status {
+.pill-state {
+  min-width: 18px;
   font-size: 12px;
+  font-weight: 600;
   color: var(--el-color-success);
-  font-weight: 500;
 }
 
-.gs-status--off {
+.pill-state--off {
   color: var(--el-color-danger);
 }
 
-/* ---- batch discount ---- */
-.batch-discount-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 18px 20px;
-  border: 1px solid var(--el-border-color);
-  border-radius: 12px;
-  background: var(--el-bg-color);
+.batch-details {
+  border-top: 1px solid var(--el-border-color-lighter);
+  padding-top: 10px;
 }
 
-.batch-top {
+.batch-details-summary {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 12px;
+  cursor: pointer;
+  list-style: none;
 }
 
-.batch-desc strong {
-  font-size: 15px;
+.batch-details-summary::-webkit-details-marker {
+  display: none;
 }
 
-.batch-desc span {
-  display: block;
-  margin-top: 3px;
+.batch-details[open] .batch-cards {
+  margin-top: 12px;
+}
+
+.batch-scroll-tip {
+  margin: 10px 0 0;
+  padding: 8px 12px;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--el-color-primary) 6%, var(--el-fill-color-blank));
   color: var(--el-text-color-secondary);
   font-size: 12px;
+  text-align: center;
 }
 
+.list-scroll-hint {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 16px;
+  border: 1px dashed var(--el-color-primary-light-5);
+  border-radius: 10px;
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--el-color-primary) 8%, var(--el-bg-color)) 0%,
+    var(--el-bg-color) 100%
+  );
+  color: var(--el-color-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+}
+
+.list-scroll-hint:hover {
+  border-color: var(--el-color-primary-light-3);
+  box-shadow: 0 4px 14px rgb(64 158 255 / 12%);
+  transform: translateY(1px);
+}
+
+.list-scroll-hint-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--el-color-primary-light-8);
+  font-size: 14px;
+  font-weight: 700;
+  animation: scroll-hint-bounce 1.6s ease-in-out infinite;
+}
+
+.list-scroll-hint-text strong {
+  color: var(--el-color-primary);
+  font-weight: 700;
+}
+
+@keyframes scroll-hint-bounce {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(3px);
+  }
+}
+
+/* ---- batch discount ---- */
 .batch-btns {
   display: flex;
   gap: 8px;
@@ -1336,60 +1614,78 @@ onMounted(() => {
   text-align: center;
 }
 
-/* ---- user table ---- */
-.permission-table {
+/* ---- user list ---- */
+.user-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
   background: var(--el-bg-color);
   overflow: hidden;
 }
 
-.table-row {
-  display: grid;
-  grid-template-columns: minmax(110px, 0.7fr) 96px 72px 100px minmax(220px, 1.05fr) minmax(180px, 0.8fr) 160px 184px;
-  gap: 10px;
-  align-items: center;
-  padding: 14px 18px;
+.user-list-head {
+  padding: 12px 16px;
   border-bottom: 1px solid var(--el-border-color-lighter);
-  transition: background 0.15s;
+  background: var(--el-fill-color-light);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-secondary);
 }
 
-.table-row:not(.table-header):hover {
+.user-card {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  transition: background 0.12s;
+}
+
+.user-card:hover {
   background: var(--el-fill-color-lighter);
 }
 
-.table-row > * {
+.user-card-top {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) 96px 72px 110px 1fr;
+  gap: 12px;
+  align-items: center;
+}
+
+.user-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
 
-.table-header {
-  background: var(--el-fill-color-light);
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.user-cell {
+.user-text {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
 }
 
-.user-cell strong {
+.user-text strong {
   font-size: 14px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.user-cell span {
-  color: var(--el-text-color-secondary);
+.user-text span {
   font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.user-no-cell {
+  font-size: 12px;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-secondary);
 }
 
 .balance-text {
@@ -1399,63 +1695,93 @@ onMounted(() => {
   white-space: nowrap;
 }
 
-/* ---- row actions ---- */
-.row-actions {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
+.card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
   gap: 6px;
-  justify-content: start;
 }
 
-.row-actions :deep(.el-button) {
+.card-actions :deep(.el-button) {
   margin-left: 0;
-  width: 100%;
-  padding-inline: 0;
-  font-size: 12px;
 }
 
-/* ---- switches ---- */
-.order-type-switches {
+.user-card-body {
   display: grid;
-  gap: 4px;
+  grid-template-columns: minmax(220px, 1.2fr) minmax(240px, 1fr) minmax(280px, 1.1fr);
+  gap: 12px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--el-border-color-lighter);
 }
 
-.order-type-switches label {
+.body-col {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 3px 8px;
-  border: 1px solid var(--el-border-color-lighter);
-  border-radius: 6px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-
-/* ---- discount summary ---- */
-.discount-summary {
-  display: grid;
-  gap: 4px;
-}
-
-.discount-summary span {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+  flex-direction: column;
   gap: 6px;
   min-width: 0;
-  padding: 4px 8px;
-  border-radius: 6px;
-  background: var(--el-fill-color-light);
-  color: var(--el-color-primary);
-  font-size: 12px;
-  font-family: Consolas, monospace;
 }
 
-.discount-summary b {
+.body-col > label {
+  font-size: 11px;
+  font-weight: 600;
   color: var(--el-text-color-secondary);
-  font-weight: 500;
-  font-family: inherit;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.role-select {
+  width: 100%;
+}
+
+.discount-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.d-chip {
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-family: ui-monospace, Consolas, monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+
+.d-chip--view {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+}
+
+.d-chip--like {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.d-chip--impression {
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+
+.order-toggle-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.toggle-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  cursor: pointer;
 }
 
 /* ---- batch discount editor ---- */
@@ -1617,6 +1943,24 @@ onMounted(() => {
   width: 100%;
 }
 
+.balance-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--el-fill-color-light);
+  font-size: 13px;
+}
+
+.balance-preview span {
+  color: var(--el-text-color-secondary);
+}
+
+.balance-preview strong {
+  font-size: 16px;
+}
+
 /* ---- responsive ---- */
 @media (max-width: 1280px) {
   .permission-head {
@@ -1632,26 +1976,122 @@ onMounted(() => {
     width: 100%;
   }
 
-  .gs-switches {
-    grid-template-columns: 1fr;
+  .deck-row--switches {
+    flex-direction: column;
+    align-items: stretch;
   }
 
   .batch-cards {
     grid-template-columns: 1fr;
   }
 
-  .batch-top {
+  .batch-details-summary {
     flex-direction: column;
     align-items: stretch;
   }
 
-  .table-row {
+  .user-card-top {
     grid-template-columns: 1fr;
-    gap: 8px;
   }
 
-  .table-header {
-    display: none;
+  .user-card-body {
+    grid-template-columns: 1fr;
   }
+
+  .card-actions {
+    justify-content: flex-start;
+  }
+}
+
+/* ---- 密码重置申请面板 ---- */
+.reset-panel {
+  padding: 18px 20px;
+  border: 1px solid var(--el-border-color);
+  border-radius: 12px;
+  background: var(--el-bg-color);
+}
+
+.reset-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.reset-desc strong {
+  font-size: 15px;
+}
+
+.reset-desc span {
+  display: block;
+  margin-top: 3px;
+  color: var(--el-text-color-secondary);
+  font-size: 12px;
+}
+
+.head-btn--sm {
+  padding: 5px 14px;
+  font-size: 13px;
+}
+
+.reset-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.reset-item {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) 160px 80px 180px;
+  gap: 14px;
+  align-items: center;
+  padding: 12px 16px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-blank);
+}
+
+.reset-user {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.reset-user strong {
+  font-size: 14px;
+}
+
+.reset-user span {
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  font-family: Consolas, 'SF Mono', monospace;
+}
+
+.reset-time {
+  font-size: 13px;
+  color: var(--el-text-color-secondary);
+}
+
+.reset-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.reset-handled {
+  font-size: 12px;
+  color: var(--el-text-color-placeholder);
+}
+
+.reset-dialog-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.reset-dialog-body p {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.6;
 }
 </style>

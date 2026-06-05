@@ -16,8 +16,6 @@ import {
   ElPagination,
   ElPopconfirm,
   ElSelect,
-  ElTable,
-  ElTableColumn,
   ElTag,
 } from 'element-plus';
 
@@ -28,9 +26,9 @@ import {
 } from '#/api';
 
 const loading = ref(false);
-const tableRef = ref<InstanceType<typeof ElTable>>();
 const route = useRoute();
 const records = ref<OrderApi.ConsumptionRecord[]>([]);
+const expandedRecordIds = ref(new Set<number>());
 const userStore = useUserStore();
 const summary = ref<OrderApi.ConsumptionRecordSummary>({
   expense_amount: 0,
@@ -162,6 +160,86 @@ function statusTagType(status: string) {
     return 'danger';
   }
   return 'warning';
+}
+
+function formatShortDateTime(value?: string) {
+  if (!value) {
+    return '-';
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  const pad = (number: number) => String(number).padStart(2, '0');
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function shortenFlowNo(value?: string) {
+  if (!value || value.length <= 22) {
+    return value || '-';
+  }
+  return `${value.slice(0, 14)}…${value.slice(-6)}`;
+}
+
+function recordTypePillClass(type: string) {
+  if (type === 'refund') {
+    return 'flow-badge--success';
+  }
+  if (type === 'order_charge') {
+    return 'flow-badge--danger';
+  }
+  if (type === 'recharge') {
+    return 'flow-badge--primary';
+  }
+  return 'flow-badge--muted';
+}
+
+function toggleRecordExpand(id: number) {
+  const next = new Set(expandedRecordIds.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  expandedRecordIds.value = next;
+}
+
+function collapseEnter(el: Element) {
+  const h = el as HTMLElement;
+  h.style.overflow = 'hidden';
+  h.style.height = '0';
+  h.style.opacity = '0';
+  void h.offsetHeight;
+  h.style.transition = 'height 0.3s ease-out, opacity 0.25s ease-out';
+  h.style.height = `${h.scrollHeight}px`;
+  h.style.opacity = '1';
+}
+function collapseAfterEnter(el: Element) {
+  const h = el as HTMLElement;
+  h.style.height = '';
+  h.style.overflow = '';
+  h.style.transition = '';
+}
+function collapseLeave(el: Element) {
+  const h = el as HTMLElement;
+  h.style.overflow = 'hidden';
+  h.style.height = `${h.scrollHeight}px`;
+  void h.offsetHeight;
+  h.style.transition = 'height 0.25s ease-in, opacity 0.2s ease-in';
+  h.style.height = '0';
+  h.style.opacity = '0';
+}
+function collapseAfterLeave(el: Element) {
+  const h = el as HTMLElement;
+  h.style.height = '';
+  h.style.overflow = '';
+  h.style.transition = '';
+  h.style.opacity = '';
+}
+
+function flowAmountText(row: OrderApi.ConsumptionRecord) {
+  const amount = recordMainAmount(row);
+  if (row.direction === 'credit' || row.record_type === 'refund') {
+    return `+${formatMoney(amount)}`;
+  }
+  return formatMoney(amount);
 }
 
 function targetTypeLabel(type: string) {
@@ -399,7 +477,7 @@ watch(
       </div>
     </section>
 
-    <section class="record-panel">
+    <section class="record-panel" v-loading="loading">
       <div class="filter-bar">
         <ElInput
           v-model="filters.keyword"
@@ -432,70 +510,154 @@ watch(
           start-placeholder="开始日期"
           end-placeholder="结束日期"
           value-format="YYYY-MM-DD"
-          style="width: 260px"
           clearable
         />
         <ElButton type="primary" @click="searchRecords">查询</ElButton>
         <ElButton @click="resetFilters">重置</ElButton>
+        <span class="filter-count">共 {{ pagination.total.toLocaleString('zh-CN') }} 条</span>
       </div>
 
-      <ElTable
-        ref="tableRef"
-        v-loading="loading"
-        :data="records"
-        row-key="id"
-        class="record-table"
-        empty-text="暂无消费记录"
-        @row-click="(row: OrderApi.ConsumptionRecord) => tableRef?.toggleRowExpansion(row)"
-      >
-        <ElTableColumn type="expand" width="44">
-          <template #default="{ row }">
+      <div v-if="!loading && records.length === 0" class="empty-state">
+        <p>暂无消费记录</p>
+        <small>调整筛选条件后重试</small>
+      </div>
+
+      <div v-else class="flow-list-wrap">
+        <div class="flow-list-head">
+          <span />
+          <span>类型</span>
+          <span>关联信息</span>
+          <span>状态</span>
+          <span class="col-amount">金额</span>
+        </div>
+        <div class="flow-list">
+        <article
+          v-for="row in records"
+          :key="row.id"
+          class="flow-card"
+          :class="{ 'flow-card--expanded': expandedRecordIds.has(row.id) }"
+        >
+          <div class="flow-head" @click="toggleRecordExpand(row.id)">
+            <span class="expand-arrow" :class="{ open: expandedRecordIds.has(row.id) }">›</span>
+            <div class="flow-type-col">
+              <span class="flow-dot" :class="recordTypePillClass(row.record_type)" />
+              <span class="flow-type-text">{{ recordTypeLabel(row.record_type) }}</span>
+            </div>
+            <div class="flow-center">
+              <span class="flow-ref-main" :title="isBalanceAdjustment(row) ? (row.reason_message || row.remark) : (row.batch_no || row.order_no || row.record_no)">
+                {{
+                  isBalanceAdjustment(row)
+                    ? (row.reason_message || row.remark || '余额调整')
+                    : (row.batch_no || row.order_no || shortenFlowNo(row.record_no))
+                }}
+              </span>
+              <span class="flow-meta-inline">
+                {{ formatShortDateTime(row.created_at) }}
+                <i>·</i>
+                {{ row.display_name || row.username || '-' }}
+                <i>·</i>
+                <em :class="`is-${row.direction}`">{{ directionLabel(row.direction) }}</em>
+                <template v-if="!isBalanceAdjustment(row)">
+                  <i>·</i>{{ row.ordered_quantity.toLocaleString('zh-CN') }} 个
+                </template>
+              </span>
+            </div>
+            <span class="status-pill" :class="`status-pill--${row.status}`">{{ statusLabel(row.status) }}</span>
+            <div class="flow-amount-col">
+              <strong
+                class="flow-amount"
+                :class="{
+                  'flow-amount--credit': row.direction === 'credit' || row.record_type === 'refund',
+                  'flow-amount--debit': row.direction === 'debit' && row.record_type !== 'refund',
+                }"
+              >
+                {{ flowAmountText(row) }}
+              </strong>
+              <span class="flow-sub">余 {{ formatMoney(row.after_available_amount) }}</span>
+            </div>
+          </div>
+
+          <Transition
+            @enter="collapseEnter"
+            @after-enter="collapseAfterEnter"
+            @leave="collapseLeave"
+            @after-leave="collapseAfterLeave"
+          >
+            <div v-if="expandedRecordIds.has(row.id)" class="flow-body">
+            <div class="flow-stats">
+              <div class="flow-stat">
+                <span>流水号</span>
+                <strong>{{ row.record_no }}</strong>
+              </div>
+              <div class="flow-stat">
+                <span>关联</span>
+                <strong>{{ isBalanceAdjustment(row) ? '余额调整' : row.order_no || row.batch_no || '-' }}</strong>
+              </div>
+              <div class="flow-stat">
+                <span>单价</span>
+                <strong>{{ isBalanceAdjustment(row) ? '-' : formatUnitPrice(recordDisplayPrice(row)) }}</strong>
+              </div>
+              <div class="flow-stat">
+                <span>净额</span>
+                <strong>{{ formatMoney(row.net_amount) }}</strong>
+              </div>
+              <div class="flow-stat">
+                <span>退款</span>
+                <strong>{{ formatMoney(row.refund_amount) }}</strong>
+              </div>
+              <div class="flow-stat flow-stat--wide">
+                <span>余额</span>
+                <strong>{{ formatMoney(row.before_available_amount) }} → {{ formatMoney(row.after_available_amount) }}</strong>
+              </div>
+            </div>
+
             <div v-if="row.order_items?.length" class="order-items">
-              <div v-if="canManageRefund && batchRefundableOrders(row).length > 0" class="batch-refund-bar">
-                <span>该批次共 {{ row.order_items.length }} 条订单，{{ batchRefundableOrders(row).length }} 条可退款</span>
+              <div v-if="canManageRefund && batchRefundableOrders(row).length > 0" class="batch-action-bar">
+                <span>{{ row.order_items.length }} 条订单 · {{ batchRefundableOrders(row).length }} 条可退</span>
                 <ElButton
                   type="danger"
                   size="small"
+                  plain
                   :loading="batchRefundLoading"
                   @click.stop="handleBatchRefund(row)"
                 >
                   批次全部退款
                 </ElButton>
               </div>
-              <div
+              <article
                 v-for="item in row.order_items"
                 :key="item.order_id"
-                class="order-item-card"
+                class="order-row"
               >
-                <div class="oic-left">
-                  <div class="oic-no">{{ item.order_no }}</div>
-                  <div class="oic-meta">
-                    <span class="oic-chip">{{ item.ordered_quantity.toLocaleString('zh-CN') }} 个</span>
+                <div class="order-row-main">
+                  <code class="order-row-no">{{ item.order_no }}</code>
+                  <div class="order-row-tags">
+                    <span class="order-chip">{{ item.ordered_quantity.toLocaleString('zh-CN') }} 个</span>
                     <ElTag :type="orderStatusTagType(item.order_status)" effect="plain" size="small">
                       {{ orderStatusLabel(item.order_status) }}
                     </ElTag>
-                  </div>
-                  <div v-if="item.note_id || item.target_type" class="oic-note-row">
-                    <span v-if="item.note_id" class="oic-note">
-                      <span class="oic-note-label">笔记</span>
-                      <a
-                        v-if="item.note_url"
-                        :href="item.note_url"
-                        target="_blank"
-                        rel="noopener"
-                        class="oic-note-id"
-                      >{{ item.note_id }}</a>
-                      <span v-else class="oic-note-id">{{ item.note_id }}</span>
+                    <span v-if="item.target_type" class="order-chip order-chip--type">
+                      {{ targetTypeLabel(item.target_type) }}
                     </span>
-                    <span v-if="item.target_type" class="oic-target-tag">{{ targetTypeLabel(item.target_type) }}</span>
-                    <span class="oic-progress">完成 <strong>{{ item.completed_quantity ?? 0 }}</strong> / {{ item.ordered_quantity }}</span>
+                    <span class="order-progress">
+                      完成 {{ item.completed_quantity ?? 0 }}/{{ item.ordered_quantity }}
+                    </span>
                   </div>
+                  <p v-if="item.note_id" class="order-note">
+                    笔记
+                    <a
+                      v-if="item.note_url"
+                      :href="item.note_url"
+                      target="_blank"
+                      rel="noopener"
+                      @click.stop
+                    >{{ item.note_id }}</a>
+                    <span v-else>{{ item.note_id }}</span>
+                  </p>
                 </div>
-                <div class="oic-right">
-                  <div class="oic-money">
-                    <strong>{{ formatMoney(item.actual_paid_amount) }}</strong>
-                    <span v-if="item.refund_amount" class="oic-refunded">已退 {{ formatMoney(item.refund_amount) }}</span>
-                  </div>
+                <div class="order-row-side">
+                  <strong>{{ formatMoney(item.actual_paid_amount) }}</strong>
+                  <span v-if="item.refund_amount" class="order-refunded">已退 {{ formatMoney(item.refund_amount) }}</span>
                   <ElPopconfirm
                     v-if="canManageRefund && canRequestRefund(item)"
                     title="确认申请这条订单退款？申请后需要管理员审核。"
@@ -504,100 +666,21 @@ watch(
                     @confirm="requestRefund(item.order_id)"
                   >
                     <template #reference>
-                      <button class="oic-btn oic-btn--refund" @click.stop>申请退款</button>
+                      <button class="order-btn order-btn--refund" @click.stop>申请退款</button>
                     </template>
                   </ElPopconfirm>
-                  <button v-else-if="canManageRefund" class="oic-btn oic-btn--disabled" disabled>
+                  <button v-else-if="canManageRefund" class="order-btn order-btn--disabled" disabled>
                     {{ disabledRefundLabel(item) }}
                   </button>
                 </div>
-              </div>
+              </article>
             </div>
-            <span v-else class="empty-detail">这条记录没有可申请退款的订单明细</span>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="流水信息" min-width="230">
-          <template #default="{ row }">
-            <div class="main-cell">
-              <strong>{{ row.record_no }}</strong>
-              <span>{{ formatDateTime(row.created_at) }}</span>
-              <small>{{ row.display_name }} / {{ row.username }}</small>
+            <p v-else class="empty-detail">这条记录没有关联订单明细</p>
             </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="类型" min-width="112">
-          <template #default="{ row }">
-            <div class="type-cell">
-              <span class="type-badge">{{ recordTypeLabel(row.record_type) }}</span>
-              <span class="direction-text" :class="`is-${row.direction}`">
-                {{ directionLabel(row.direction) }}
-              </span>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="关联订单" min-width="190">
-          <template #default="{ row }">
-            <div class="muted-cell">
-              <strong>{{ isBalanceAdjustment(row) ? '余额调整' : row.order_no || '-' }}</strong>
-              <span>{{ row.reason_message || row.remark || '-' }}</span>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="数量" min-width="100">
-          <template #default="{ row }">
-            <div class="number-cell">
-              <strong>{{ isBalanceAdjustment(row) ? '-' : row.ordered_quantity.toLocaleString('zh-CN') }}</strong>
-              <span v-if="!isBalanceAdjustment(row) && row.refunded_quantity">
-                退 {{ row.refunded_quantity }}
-              </span>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="价格" min-width="140">
-          <template #default="{ row }">
-            <div class="muted-cell">
-              <template v-if="isBalanceAdjustment(row)">
-                <strong>-</strong>
-                <span>不涉及单价</span>
-              </template>
-              <template v-else>
-                <strong>{{ formatUnitPrice(recordDisplayPrice(row)) }}</strong>
-                <span>原价 {{ formatUnitPrice(recordOriginalPrice(row)) }}</span>
-              </template>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="金额" min-width="170">
-          <template #default="{ row }">
-            <div class="amount-cell">
-              <template v-if="row.record_type === 'refund'">
-                <strong class="text-success">+{{ formatMoney(row.refund_amount) }}</strong>
-                <span>净额 {{ formatMoney(row.net_amount) }}</span>
-              </template>
-              <template v-else>
-                <strong>{{ formatMoney(row.actual_paid_amount) }}</strong>
-                <span>退款 {{ formatMoney(row.refund_amount) }}</span>
-                <span>净额 {{ formatMoney(row.net_amount) }}</span>
-              </template>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="余额变化" min-width="180">
-          <template #default="{ row }">
-            <div class="muted-cell">
-              <strong>{{ formatMoney(row.after_available_amount) }}</strong>
-              <span>之前 {{ formatMoney(row.before_available_amount) }}</span>
-            </div>
-          </template>
-        </ElTableColumn>
-        <ElTableColumn label="状态" width="110" align="center">
-          <template #default="{ row }">
-            <ElTag :type="statusTagType(row.status)" effect="plain" size="small">
-              {{ statusLabel(row.status) }}
-            </ElTag>
-          </template>
-        </ElTableColumn>
-      </ElTable>
+          </Transition>
+        </article>
+        </div>
+      </div>
 
       <div class="pagination-bar">
         <ElPagination
@@ -620,9 +703,15 @@ watch(
   display: flex;
   flex-direction: column;
   gap: 16px;
-  min-height: 100%;
+  min-height: calc(100dvh - 88px);
   padding: 20px;
+  box-sizing: border-box;
   color: var(--el-text-color-primary);
+}
+
+.page-head,
+.summary-grid {
+  flex-shrink: 0;
 }
 
 /* ---- header ---- */
@@ -672,15 +761,17 @@ watch(
 .stat-card {
   display: flex;
   align-items: center;
-  gap: 14px;
-  padding: 18px 20px;
-  border: 1px solid var(--el-border-color);
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--el-border-color-lighter);
   border-radius: 12px;
   background: var(--el-bg-color);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 3%);
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .stat-card:hover {
-  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+  border-color: var(--el-color-primary-light-7);
+  box-shadow: 0 4px 12px rgb(15 23 42 / 6%);
 }
 
 .stat-icon {
@@ -700,7 +791,7 @@ watch(
 
 .stat-body { display: flex; flex-direction: column; gap: 4px; }
 .stat-body span { font-size: 12px; color: var(--el-text-color-secondary); }
-.stat-body strong { font-size: 22px; font-weight: 700; line-height: 1.1; }
+.stat-body strong { font-size: 20px; font-weight: 700; line-height: 1.1; }
 
 .stat-card--danger .stat-body strong { color: var(--el-color-danger); }
 .stat-card--success .stat-body strong { color: var(--el-color-success); }
@@ -708,6 +799,11 @@ watch(
 
 /* ---- record panel ---- */
 .record-panel {
+  flex: 1 1 0;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
   padding: 18px;
   border: 1px solid var(--el-border-color);
   border-radius: 12px;
@@ -718,261 +814,532 @@ watch(
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.filter-bar > .el-input {
-  width: 260px;
-  flex-shrink: 0;
-}
-
-.filter-bar > .el-select {
-  width: 130px;
-  flex-shrink: 0;
-}
-
-/* ---- table ---- */
-.record-table { width: 100%; }
-.record-table :deep(.el-table__row) { cursor: pointer; }
-
-:deep(.el-table) {
-  --el-table-bg-color: transparent;
-  --el-table-tr-bg-color: transparent;
-  --el-table-header-bg-color: var(--el-fill-color-light);
-}
-:deep(.el-table th.el-table__cell) { background: var(--el-fill-color-light); }
-
-.main-cell,
-.muted-cell,
-.amount-cell,
-.number-cell,
-.type-cell {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  line-height: 1.3;
-}
-
-.type-cell { align-items: flex-start; }
-
-.main-cell strong { font-size: 13px; font-family: Consolas, monospace; }
-.main-cell span,
-.main-cell small,
-.muted-cell span,
-.amount-cell span,
-.number-cell span {
-  color: var(--el-text-color-secondary);
-  font-size: 12px;
-}
-
-.type-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 68px;
-  height: 24px;
-  padding: 0 10px;
-  border: 1px solid var(--el-color-primary-light-5);
-  border-radius: 6px;
-  color: var(--el-color-primary);
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1;
-  background: var(--el-color-primary-light-9);
-}
-
-.direction-text {
-  padding-left: 2px;
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--el-text-color-secondary);
-}
-.direction-text.is-debit { color: var(--el-color-danger); }
-.direction-text.is-credit { color: var(--el-color-success); }
-
-.amount-cell strong,
-.number-cell strong {
-  font-size: 14px;
-  font-family: Consolas, monospace;
-}
-
-.amount-cell .text-success { color: var(--el-color-success); }
-
-.muted-cell strong {
-  font-family: Consolas, monospace;
-  font-size: 13px;
-}
-
-/* ---- expand section ---- */
-.order-items {
-  display: flex;
-  flex-direction: column;
   gap: 8px;
-  padding: 10px 16px 12px 64px;
-}
-
-.batch-refund-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 10px 14px;
-  border: 1px dashed var(--el-color-danger-light-3);
-  border-radius: 8px;
-  background: var(--el-color-danger-light-9);
-}
-.batch-refund-bar > span { color: var(--el-text-color-secondary); font-size: 13px; }
-
-.order-item-card {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 12px 16px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+  padding: 10px 12px;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 10px;
-  transition: border-color 0.15s, box-shadow 0.15s;
-}
-.order-item-card:hover {
-  border-color: var(--el-color-primary-light-5);
-  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.04);
+  background: var(--el-fill-color-lighter);
 }
 
-.oic-left {
+.filter-bar :deep(.el-input) {
+  width: 220px;
+}
+
+.filter-bar :deep(.el-select) {
+  width: 120px;
+}
+
+.filter-bar :deep(.el-date-editor) {
+  width: 240px;
+}
+
+.filter-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--el-text-color-secondary);
+}
+
+.empty-state p {
+  margin: 0;
+  font-size: 14px;
+}
+
+.empty-state small {
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.flow-list-wrap {
+  flex: 1 1 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--el-fill-color-lighter);
+}
+
+.flow-list-head {
+  display: grid;
+  grid-template-columns: 28px 88px minmax(0, 1fr) 64px 120px;
+  gap: 10px;
+  align-items: center;
+  padding: 9px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--el-text-color-secondary);
+  background: color-mix(in srgb, var(--el-bg-color) 88%, var(--el-fill-color));
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  flex-shrink: 0;
+}
+
+.flow-list-head .col-amount {
+  text-align: right;
+}
+
+.flow-list {
+  flex: 1 1 0;
+  min-height: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: 8px;
+}
+
+.flow-card {
+  flex-shrink: 0;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--el-bg-color);
+  box-shadow: 0 1px 2px rgb(15 23 42 / 4%);
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.flow-card:hover {
+  border-color: var(--el-color-primary-light-5);
+  box-shadow: 0 2px 8px rgb(15 23 42 / 6%);
+}
+
+.flow-card--expanded {
+  border-color: var(--el-color-primary-light-5);
+  box-shadow: 0 4px 14px rgb(15 23 42 / 8%);
+}
+
+.flow-head {
+  display: grid;
+  grid-template-columns: 28px 88px minmax(0, 1fr) 64px 120px;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 12px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.flow-head:hover {
+  background: var(--el-fill-color-lighter);
+}
+
+.expand-arrow {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--el-text-color-placeholder);
+  transform: rotate(0deg);
+  transform-origin: center center;
+  transition: transform 0.25s ease, color 0.2s;
+  user-select: none;
+}
+
+.expand-arrow.open {
+  transform: rotate(90deg);
+  color: var(--el-color-primary);
+}
+
+.flow-type-col {
+  display: flex;
+  align-items: center;
+  gap: 7px;
   min-width: 0;
 }
-.oic-no {
-  font-family: Consolas, monospace;
+
+.flow-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.flow-dot.flow-badge--danger { background: var(--el-color-danger); }
+.flow-dot.flow-badge--success { background: var(--el-color-success); }
+.flow-dot.flow-badge--primary { background: var(--el-color-primary); }
+.flow-dot.flow-badge--muted { background: var(--el-text-color-placeholder); }
+
+.flow-type-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--el-text-color-regular);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.flow-center {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.flow-ref-main {
   font-size: 13px;
   font-weight: 600;
+  font-family: ui-monospace, Consolas, monospace;
+  color: var(--el-text-color-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.oic-meta {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.oic-chip {
-  padding: 1px 8px;
-  border-radius: 4px;
-  background: var(--el-fill-color-light);
+
+.flow-meta-inline {
   font-size: 11px;
   color: var(--el-text-color-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.oic-note-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-.oic-note {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.oic-note-label {
-  color: var(--el-text-color-secondary);
-}
-.oic-note-id {
-  font-family: Consolas, monospace;
-  font-size: 12px;
-  color: var(--el-text-color-primary);
-}
-a.oic-note-id {
-  color: var(--el-color-primary);
-  text-decoration: none;
-}
-a.oic-note-id:hover {
-  text-decoration: underline;
-}
-.oic-target-tag {
-  padding: 1px 8px;
-  border-radius: 4px;
-  background: var(--el-color-primary-light-9);
-  color: var(--el-color-primary);
-  font-size: 11px;
-  font-weight: 600;
-}
-.oic-progress {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-}
-.oic-progress strong {
-  font-family: Consolas, monospace;
-  font-weight: 600;
-  color: var(--el-text-color-primary);
+.flow-meta-inline i {
+  font-style: normal;
+  margin: 0 2px;
+  opacity: 0.55;
 }
 
-.oic-right {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  flex-shrink: 0;
+.flow-meta-inline em {
+  font-style: normal;
+  font-weight: 600;
 }
-.oic-money {
+
+.flow-meta-inline em.is-debit { color: var(--el-color-danger); }
+.flow-meta-inline em.is-credit { color: var(--el-color-success); }
+
+.status-pill {
+  justify-self: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-pill--success {
+  background: var(--el-color-success-light-9);
+  color: var(--el-color-success);
+}
+
+.status-pill--failed {
+  background: var(--el-color-danger-light-9);
+  color: var(--el-color-danger);
+}
+
+.status-pill--pending {
+  background: var(--el-color-warning-light-9);
+  color: var(--el-color-warning);
+}
+
+.flow-amount-col {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
   gap: 2px;
-}
-.oic-money strong {
-  font-family: Consolas, monospace;
-  font-size: 14px;
-  font-weight: 700;
-}
-.oic-refunded {
-  font-size: 11px;
-  color: var(--el-color-warning);
+  min-width: 0;
 }
 
-.oic-btn {
-  padding: 5px 14px;
+.flow-amount {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.flow-amount--debit { color: var(--el-color-danger); }
+.flow-amount--credit { color: var(--el-color-success); }
+
+.flow-sub {
+  font-size: 10px;
+  color: var(--el-text-color-placeholder);
+  white-space: nowrap;
+}
+
+.flow-body {
+  border-top: 1px solid var(--el-border-color-extra-light);
+  padding: 12px 14px 14px;
+  background: color-mix(in srgb, var(--el-fill-color-lighter) 50%, var(--el-bg-color));
+}
+
+.flow-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  margin-bottom: 12px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--el-border-color-extra-light);
+}
+
+.flow-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
   border-radius: 6px;
+  background: var(--el-fill-color-lighter);
+  min-width: 0;
+}
+
+.flow-stat--wide {
+  flex: 1 1 100%;
+}
+
+.flow-stat span {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+  white-space: nowrap;
+}
+
+.flow-stat strong {
   font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+
+.order-items {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.batch-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-fill-color-lighter);
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
+
+.order-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 8px;
+  background: var(--el-bg-color);
+  transition: border-color 0.12s;
+}
+
+.order-row:hover {
+  border-color: var(--el-color-primary-light-5);
+}
+
+.order-row-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.order-row-no {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: ui-monospace, Consolas, monospace;
+  word-break: break-all;
+}
+
+.order-row-tags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.order-chip {
+  padding: 1px 7px;
+  border-radius: 4px;
+  background: var(--el-fill-color);
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.order-chip--type {
+  background: var(--el-color-primary-light-9);
+  color: var(--el-color-primary);
+  font-weight: 600;
+}
+
+.order-progress {
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.order-note {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: var(--el-text-color-secondary);
+}
+
+.order-note a {
+  margin-left: 4px;
+  color: var(--el-color-primary);
+  text-decoration: none;
+}
+
+.order-note a:hover {
+  text-decoration: underline;
+}
+
+.order-row-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.order-row-side strong {
+  font-size: 14px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.order-refunded {
+  font-size: 11px;
+  color: var(--el-color-warning);
+  white-space: nowrap;
+}
+
+.order-btn {
+  padding: 4px 10px;
+  border-radius: 6px;
+  font-size: 11px;
   font-weight: 600;
   cursor: pointer;
   border: 1px solid;
   transition: all 0.15s;
   white-space: nowrap;
 }
-.oic-btn--refund {
+
+.order-btn--refund {
   border-color: var(--el-color-warning-light-5);
   background: var(--el-color-warning-light-9);
   color: var(--el-color-warning);
 }
-.oic-btn--refund:hover { background: var(--el-color-warning); color: #fff; }
-.oic-btn--disabled {
+
+.order-btn--refund:hover {
+  background: var(--el-color-warning);
+  color: #fff;
+}
+
+.order-btn--disabled {
   border-color: var(--el-border-color-lighter);
   background: var(--el-fill-color-light);
   color: var(--el-text-color-disabled);
   cursor: not-allowed;
 }
 
-.empty-detail { display: block; padding: 12px 16px 12px 64px; }
+.empty-detail {
+  margin: 0;
+  padding: 8px 0;
+  font-size: 12px;
+  color: var(--el-text-color-secondary);
+}
 
-.pagination-bar { display: flex; justify-content: flex-end; padding-top: 16px; }
+.pagination-bar {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 14px;
+  flex-shrink: 0;
+}
 
 /* ---- responsive ---- */
 @media (max-width: 1100px) {
   .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .filter-bar { grid-template-columns: 1fr 1fr; }
-  .order-item-card { flex-wrap: wrap; }
+
+  .flow-list-head {
+    display: none;
+  }
+
+  .flow-head {
+    grid-template-columns: 24px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .flow-type-col,
+  .status-pill,
+  .flow-amount-col {
+    grid-column: 2;
+  }
+
+  .flow-type-col {
+    margin-bottom: 2px;
+  }
+
+  .flow-amount-col {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    margin-top: 4px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--el-border-color-extra-light);
+  }
+
+  .order-row {
+    flex-direction: column;
+  }
+
+  .order-row-side {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+  }
 }
 
 @media (max-width: 640px) {
-  .consumption-page { padding: 12px; }
+  .consumption-page {
+    padding: 12px;
+    min-height: calc(100dvh - 72px);
+  }
   .page-head { align-items: flex-start; flex-direction: column; }
-  .summary-grid, .filter-bar { grid-template-columns: 1fr; }
+  .summary-grid { grid-template-columns: 1fr; }
+  .filter-bar :deep(.el-input),
+  .filter-bar :deep(.el-select),
+  .filter-bar :deep(.el-date-editor) {
+    width: 100%;
+  }
+  .filter-count {
+    width: 100%;
+    margin-left: 0;
+  }
   .pagination-bar { justify-content: flex-start; overflow-x: auto; }
-  .order-items, .empty-detail { padding-left: 12px; }
-  .order-item-row { grid-template-columns: 1fr; }
+  .flow-stats { grid-template-columns: 1fr; }
+  .batch-action-bar {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 </style>
 

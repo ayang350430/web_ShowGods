@@ -397,8 +397,18 @@ const getOrderTypeStatus = async (req, res, next) => {
   }
 };
 
+const recheckRepairOrders = async (req, res, next) => {
+  try {
+    const data = await batchOrderService.recheckRepairOrders(getCurrentUserId(req), req.body);
+    return res.json({ code: 0, data, message: 'ok' });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 module.exports = {
   batchApproveRefunds,
+  recheckRepairOrders,
   batchRejectRefunds,
   fullRefundBatch,
   fullRefundOrder,
