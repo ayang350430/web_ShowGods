@@ -148,6 +148,7 @@ function copyTextFallback(text: string) {
   try { return document.execCommand('copy'); } finally { ta.remove(); }
 }
 
+// 复制全部链接 按钮点击事件
 async function copyBatchLinks(records: OrderApi.ProblemLinkRecord[]) {
   if (records.length === 0) return;
   const text = records.map((r) => r.raw).join('\n');
@@ -167,6 +168,7 @@ async function copyBatchLinks(records: OrderApi.ProblemLinkRecord[]) {
   }
 }
 
+// 加载检测记录
 async function loadRecords() {
   loading.value = true;
   try {
